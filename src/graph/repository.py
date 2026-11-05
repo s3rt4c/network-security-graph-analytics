@@ -2,7 +2,8 @@
 Neo4j Graph Persistence Repository.
 
 Implements batched UNWIND write operations using managed transactions
-(session.execute_write) for normalized TrafficRecord and AlertRecord models.
+(session.execute_write) for normalized TrafficRecord and AlertRecord models,
+supporting V2 scoped IP identities and RoutingDomain associations.
 """
 
 import hashlib
@@ -12,6 +13,7 @@ import logging
 from typing import List, Dict, Any, Iterator, TypeVar, Optional, Tuple
 
 from src.ingestion.models import TrafficRecord, AlertRecord
+from src.ingestion.v2_models import scoped_ip_id
 
 logger = logging.getLogger(__name__)
 
@@ -20,15 +22,31 @@ T = TypeVar("T")
 # Scoped deletion of all application-owned graph entities
 CYPHER_SCOPED_CLEANUP = """
 MATCH (n)
-WHERE n:IPAddress OR n:Layer2Identifier OR n:AlertFact
+WHERE n:IPAddress OR n:Layer2Identifier OR n:AlertFact OR n:RoutingDomain
 DETACH DELETE n
 """
 
 # Cypher statements for batched parameter ingestion
 CYPHER_WRITE_TRAFFIC_BATCH = """
 UNWIND $batch AS row
-MERGE (src_ip:IPAddress {address: row.ip_src})
-MERGE (dst_ip:IPAddress {address: row.ip_dst})
+MERGE (rd:RoutingDomain {domain_id: row.routing_domain_id})
+MERGE (src_ip:IPAddress {scoped_id: row.src_scoped_id})
+ON CREATE SET
+    src_ip.address = row.ip_src,
+    src_ip.routing_domain_id = row.routing_domain_id
+ON MATCH SET
+    src_ip.address = coalesce(src_ip.address, row.ip_src),
+    src_ip.routing_domain_id = coalesce(src_ip.routing_domain_id, row.routing_domain_id)
+MERGE (src_ip)-[:IN_DOMAIN]->(rd)
+
+MERGE (dst_ip:IPAddress {scoped_id: row.dst_scoped_id})
+ON CREATE SET
+    dst_ip.address = row.ip_dst,
+    dst_ip.routing_domain_id = row.routing_domain_id
+ON MATCH SET
+    dst_ip.address = coalesce(dst_ip.address, row.ip_dst),
+    dst_ip.routing_domain_id = coalesce(dst_ip.routing_domain_id, row.routing_domain_id)
+MERGE (dst_ip)-[:IN_DOMAIN]->(rd)
 
 MERGE (src_ip)-[c:COMMUNICATED_TO {flow_key: row.flow_key}]->(dst_ip)
 SET
@@ -52,8 +70,25 @@ FOREACH (pair IN row.l2_pairs |
 
 CYPHER_WRITE_ALERT_BATCH = """
 UNWIND $batch AS row
-MERGE (src:IPAddress {address: row.src_ip})
-MERGE (dst:IPAddress {address: row.dst_ip})
+MERGE (rd:RoutingDomain {domain_id: row.routing_domain_id})
+MERGE (src:IPAddress {scoped_id: row.src_scoped_id})
+ON CREATE SET
+    src.address = row.src_ip,
+    src.routing_domain_id = row.routing_domain_id
+ON MATCH SET
+    src.address = coalesce(src.address, row.src_ip),
+    src.routing_domain_id = coalesce(src.routing_domain_id, row.routing_domain_id)
+MERGE (src)-[:IN_DOMAIN]->(rd)
+
+MERGE (dst:IPAddress {scoped_id: row.dst_scoped_id})
+ON CREATE SET
+    dst.address = row.dst_ip,
+    dst.routing_domain_id = row.routing_domain_id
+ON MATCH SET
+    dst.address = coalesce(dst.address, row.dst_ip),
+    dst.routing_domain_id = coalesce(dst.routing_domain_id, row.routing_domain_id)
+MERGE (dst)-[:IN_DOMAIN]->(rd)
+
 MERGE (fact:AlertFact {fact_key: row.fact_key})
 ON CREATE SET
     fact.sid = row.sid,
@@ -82,20 +117,28 @@ def canonicalize_ip(ip_str: str) -> str:
         return cleaned
 
 
-def _traffic_record_to_payload(record: TrafficRecord) -> Dict[str, Any]:
+def _traffic_record_to_payload(record: TrafficRecord, domain_id: str = "default") -> Dict[str, Any]:
     """Transform a TrafficRecord domain model into a Cypher parameter dictionary.
 
     Supports both enriched aggregates (with observed_l2_pairs) and legacy records
     (falling back to scalar eth_src_resolved / eth_dst_resolved).
+    Generates deterministic scoped IP identifiers based on domain_id (default 'default').
     """
     if record.observed_l2_pairs:
         l2_pairs = [{"src": p[0], "dst": p[1]} for p in record.observed_l2_pairs]
     else:
         l2_pairs = [{"src": record.eth_src_resolved, "dst": record.eth_dst_resolved}]
 
+    ip_src_canon = canonicalize_ip(record.ip_src)
+    ip_dst_canon = canonicalize_ip(record.ip_dst)
+    norm_domain = domain_id.strip().lower() if domain_id and domain_id.strip() else "default"
+
     return {
-        "ip_src": canonicalize_ip(record.ip_src),
-        "ip_dst": canonicalize_ip(record.ip_dst),
+        "ip_src": ip_src_canon,
+        "ip_dst": ip_dst_canon,
+        "src_scoped_id": scoped_ip_id(norm_domain, ip_src_canon),
+        "dst_scoped_id": scoped_ip_id(norm_domain, ip_dst_canon),
+        "routing_domain_id": norm_domain,
         "flow_key": record.flow_key,
         "protocol": record.protocol,
         "src_port": record.src_port,
@@ -151,7 +194,7 @@ class Neo4jRepository:
         self.driver = driver
         self.batch_size = max(1, batch_size)
 
-    def write_traffic_records(self, records: List[TrafficRecord]) -> int:
+    def write_traffic_records(self, records: List[TrafficRecord], domain_id: str = "default") -> int:
         """Persist a list of TrafficRecord instances in batched UNWIND transactions.
 
         Returns the count of records processed.
@@ -161,7 +204,7 @@ class Neo4jRepository:
             return 0
 
         # Transform to parameter dictionaries using centralized payload builder
-        payload = [_traffic_record_to_payload(r) for r in records]
+        payload = [_traffic_record_to_payload(r, domain_id=domain_id) for r in records]
 
         total_batches = (len(payload) + self.batch_size - 1) // self.batch_size
         logger.info(
@@ -179,7 +222,7 @@ class Neo4jRepository:
         logger.info("Traffic persistence complete: %d records processed.", len(payload))
         return len(payload)
 
-    def write_alert_records(self, records: List[AlertRecord]) -> int:
+    def write_alert_records(self, records: List[AlertRecord], domain_id: str = "default") -> int:
         """Persist a list of AlertRecord instances as :AlertFact nodes in batched UNWIND transactions.
 
         Returns the count of records processed.
@@ -188,11 +231,16 @@ class Neo4jRepository:
             logger.info("No alert records to persist.")
             return 0
 
-        # Transform to parameter dictionaries with fact_key and canonicalized IPs
+        norm_domain = domain_id.strip().lower() if domain_id and domain_id.strip() else "default"
+
+        # Transform to parameter dictionaries with fact_key, canonicalized IPs, and scoped IDs
         payload = [
             {
                 "src_ip": canonicalize_ip(a.src_ip),
                 "dst_ip": canonicalize_ip(a.dst_ip),
+                "src_scoped_id": scoped_ip_id(norm_domain, a.src_ip),
+                "dst_scoped_id": scoped_ip_id(norm_domain, a.dst_ip),
+                "routing_domain_id": norm_domain,
                 "fact_key": compute_alert_fact_key(a),
                 "sid": a.sid,
                 "gid": a.gid,
@@ -238,12 +286,15 @@ class Neo4jRepository:
         self,
         traffic_records: Optional[List[TrafficRecord]] = None,
         alert_records: Optional[List[AlertRecord]] = None,
+        domain_id: str = "default",
     ) -> Tuple[int, int]:
         """Atomically replace the current analysis workspace in a single managed write transaction.
 
-        1. Executes scoped deletion of all application-owned graph entities (:IPAddress, :Layer2Identifier, :AlertFact).
-        2. Writes all provided traffic records in batched UNWIND calls within the transaction.
-        3. Writes all provided alert records in batched UNWIND calls within the transaction.
+        1. Executes scoped deletion of all application-owned graph entities
+           (:IPAddress, :Layer2Identifier, :AlertFact, :RoutingDomain).
+        2. Recreates the default :RoutingDomain {domain_id: 'default'}.
+        3. Writes all provided traffic records in batched UNWIND calls within the transaction.
+        4. Writes all provided alert records in batched UNWIND calls within the transaction.
 
         If any error occurs during cleanup or write execution, the transaction is automatically
         rolled back by the driver, leaving the previous analysis workspace completely intact.
@@ -251,9 +302,11 @@ class Neo4jRepository:
         Returns:
             Tuple of (traffic_records_persisted_count, alert_facts_persisted_count)
         """
+        norm_domain = domain_id.strip().lower() if domain_id and domain_id.strip() else "default"
+
         traffic_payload: List[Dict[str, Any]] = []
         if traffic_records:
-            traffic_payload = [_traffic_record_to_payload(r) for r in traffic_records]
+            traffic_payload = [_traffic_record_to_payload(r, domain_id=norm_domain) for r in traffic_records]
 
         alert_payload: List[Dict[str, Any]] = []
         if alert_records:
@@ -261,6 +314,9 @@ class Neo4jRepository:
                 {
                     "src_ip": canonicalize_ip(a.src_ip),
                     "dst_ip": canonicalize_ip(a.dst_ip),
+                    "src_scoped_id": scoped_ip_id(norm_domain, a.src_ip),
+                    "dst_scoped_id": scoped_ip_id(norm_domain, a.dst_ip),
+                    "routing_domain_id": norm_domain,
                     "fact_key": compute_alert_fact_key(a),
                     "sid": a.sid,
                     "gid": a.gid,
@@ -275,16 +331,24 @@ class Neo4jRepository:
             ]
 
         logger.info(
-            "Executing atomic workspace replacement (%d traffic records, %d alert records)...",
+            "Executing atomic workspace replacement (%d traffic records, %d alert records, domain=%s)...",
             len(traffic_payload),
             len(alert_payload),
+            norm_domain,
         )
 
         def _work(tx) -> Tuple[int, int]:
-            # Step 1: Scoped graph cleanup
+            # Step 1: Scoped graph cleanup (application-owned entities)
             logger.debug("Executing scoped graph cleanup Cypher...")
             del_result = tx.run(CYPHER_SCOPED_CLEANUP)
             del_result.consume()
+
+            # Step 1b: Recreate default RoutingDomain
+            tx.run(
+                "MERGE (rd:RoutingDomain {domain_id: $domain_id}) "
+                "ON CREATE SET rd.name = 'Default Routing Domain'",
+                domain_id=norm_domain,
+            ).consume()
 
             # Step 2: Ingest traffic batches if provided
             if traffic_payload:

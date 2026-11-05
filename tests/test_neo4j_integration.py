@@ -16,9 +16,9 @@ import pytest
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError
 
-from src.graph.schema import ensure_schema
+from src.graph.schema import ensure_schema, migrate_ip_identity_to_scoped
 from src.graph.repository import Neo4jRepository
-from src.graph.read_repository import Neo4jReadRepository
+from src.graph.read_repository import Neo4jReadRepository, AmbiguousEndpointError
 from src.ingestion.models import TrafficRecord, AlertRecord
 from src.ingestion.traffic_parser import parse_traffic_file
 from src.ingestion.alert_parser import parse_alert_file
@@ -65,12 +65,14 @@ def test_live_neo4j_schema_and_idempotent_ingestion(live_neo4j_driver):
     with live_neo4j_driver.session() as session:
         constraints_res = session.run("SHOW CONSTRAINTS").data()
         constraint_names = {c.get("name") for c in constraints_res}
-        assert "ip_address_unique" in constraint_names
+        assert "routing_domain_unique" in constraint_names
+        assert "ip_scoped_unique" in constraint_names
         assert "layer2_identifier_unique" in constraint_names
         assert "alert_fact_unique" in constraint_names
 
         indexes_res = session.run("SHOW INDEXES").data()
         index_names = {i.get("name") for i in indexes_res}
+        assert "ip_address_index" in index_names
         assert "alert_fact_priority_index" in index_names
         assert "alert_fact_sid_index" in index_names
 
@@ -1080,3 +1082,74 @@ def test_live_correlation_parallel_flow_distinguishability(live_neo4j_driver):
             session.run("MATCH (fact:AlertFact) WHERE fact.sid = 7777001 DETACH DELETE fact").consume()
             session.run("MATCH (ip:IPAddress) WHERE ip.address IN $ips DETACH DELETE ip", ips=test_ips).consume()
             session.run("MATCH (l2:Layer2Identifier) WHERE l2.identifier STARTS WITH '02:00:00:7c:41:' OR l2.identifier STARTS WITH '02:00:00:7c:42:' DETACH DELETE l2").consume()
+
+
+@pytest.mark.integration
+def test_live_overlapping_rfc1918_addresses_and_ambiguity(live_neo4j_driver):
+    """Verify live Neo4j supports overlapping RFC 1918 IP addresses in distinct domains and ambiguity handling."""
+    ensure_schema(live_neo4j_driver)
+    repo = Neo4jRepository(live_neo4j_driver, batch_size=100)
+    read_repo = Neo4jReadRepository(live_neo4j_driver)
+
+    ip_overlap = "10.0.0.99"
+    test_traffic_corp = [
+        TrafficRecord(
+            eth_src_resolved="02:00:00:88:01:01",
+            eth_dst_resolved="02:00:00:88:01:02",
+            ip_src=ip_overlap,
+            ip_dst="10.0.0.100",
+            protocol="TCP",
+        )
+    ]
+    test_traffic_branch = [
+        TrafficRecord(
+            eth_src_resolved="02:00:00:88:02:01",
+            eth_dst_resolved="02:00:00:88:02:02",
+            ip_src=ip_overlap,
+            ip_dst="10.0.0.200",
+            protocol="TCP",
+        )
+    ]
+
+    try:
+        # Ingest in two separate routing domains
+        repo.write_traffic_records(test_traffic_corp, routing_domain_id="corp")
+        repo.write_traffic_records(test_traffic_branch, routing_domain_id="branch")
+
+        with live_neo4j_driver.session() as session:
+            corp_node = session.run(
+                "MATCH (ip:IPAddress {scoped_id: 'corp#10.0.0.99'}) RETURN ip.address AS addr, ip.routing_domain_id AS dom"
+            ).single()
+            assert corp_node is not None
+            assert corp_node["addr"] == ip_overlap
+            assert corp_node["dom"] == "corp"
+
+            branch_node = session.run(
+                "MATCH (ip:IPAddress {scoped_id: 'branch#10.0.0.99'}) RETURN ip.address AS addr, ip.routing_domain_id AS dom"
+            ).single()
+            assert branch_node is not None
+            assert branch_node["addr"] == ip_overlap
+            assert branch_node["dom"] == "branch"
+
+        # Ambiguous lookup without domain must raise AmbiguousEndpointError
+        with pytest.raises(AmbiguousEndpointError):
+            read_repo.get_ip_detail(ip_overlap)
+
+        # Disambiguated lookup by domain
+        corp_detail = read_repo.get_ip_detail(ip_overlap, domain="corp")
+        assert corp_detail is not None
+        assert corp_detail["scoped_id"] == "corp#10.0.0.99"
+
+        branch_detail = read_repo.get_ip_detail(ip_overlap, domain="branch")
+        assert branch_detail is not None
+        assert branch_detail["scoped_id"] == "branch#10.0.0.99"
+
+        # Test migration helper is idempotent on live DB
+        mig_stats = migrate_ip_identity_to_scoped(live_neo4j_driver)
+        assert mig_stats["status"] == "complete"
+
+    finally:
+        with live_neo4j_driver.session() as session:
+            session.run("MATCH (ip:IPAddress) WHERE ip.address IN ['10.0.0.99', '10.0.0.100', '10.0.0.200'] DETACH DELETE ip").consume()
+            session.run("MATCH (l2:Layer2Identifier) WHERE l2.identifier STARTS WITH '02:00:00:88:' DETACH DELETE l2").consume()
+            session.run("MATCH (rd:RoutingDomain) WHERE rd.domain_id IN ['corp', 'branch'] DETACH DELETE rd").consume()

@@ -5,12 +5,28 @@ Implements query execution for the Phase 4 FastAPI backend using managed read
 transactions (session.execute_read) on a shared Neo4j Driver. All Cypher queries
 are parameterized, fully materialized within transaction callbacks, and return
 plain Python primitives/dictionaries.
+Supports V2 scoped IP identities and explicit ambiguity detection across RoutingDomains.
 """
 
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 
+from src.ingestion.v2_models import scoped_ip_id
+
 logger = logging.getLogger(__name__)
+
+
+class AmbiguousEndpointError(ValueError):
+    """Raised when an address-only query matches multiple endpoints across different routing domains."""
+
+    def __init__(self, address: str, matching_domains: List[str], matching_scoped_ids: List[str]):
+        super().__init__(
+            f"Address '{address}' is ambiguous: matches multiple endpoints across routing domains "
+            f"{matching_domains} ({matching_scoped_ids}). Specify 'domain' or 'scoped_id' to disambiguate."
+        )
+        self.address = address
+        self.matching_domains = matching_domains
+        self.matching_scoped_ids = matching_scoped_ids
 
 
 class Neo4jReadRepository:
@@ -33,36 +49,143 @@ class Neo4jReadRepository:
             logger.warning("Neo4j connectivity check failed: %s", exc)
             return False
 
-    def list_ips(self, limit: int = 50, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
-        """List observed IP addresses with pagination."""
+    @staticmethod
+    def _resolve_endpoint(
+        tx,
+        address: str,
+        domain: Optional[str] = None,
+        scoped_id: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Resolve an endpoint to (scoped_id, address, domain_id).
+
+        Semantics:
+        A. scoped_id supplied -> deterministic lookup
+        B. address + domain supplied -> deterministic lookup
+        C. address supplied and exactly one matching IP exists -> return it
+        D. address supplied and multiple IP nodes match -> raise AmbiguousEndpointError
+
+        Returns:
+            Tuple of (scoped_id, address, domain_id) or (None, None, None) if not found.
+        """
+        if scoped_id:
+            res = tx.run(
+                "MATCH (ip:IPAddress {scoped_id: $scoped_id}) "
+                "RETURN ip.scoped_id AS scoped_id, ip.address AS address, ip.routing_domain_id AS domain_id",
+                scoped_id=scoped_id,
+            )
+            rec = res.single()
+            if not rec:
+                return None, None, None
+            return rec.get("scoped_id"), rec.get("address", address), rec.get("domain_id")
+
+        if domain:
+            target_scoped = scoped_ip_id(domain, address)
+            res = tx.run(
+                "MATCH (ip:IPAddress {scoped_id: $scoped_id}) "
+                "RETURN ip.scoped_id AS scoped_id, ip.address AS address, ip.routing_domain_id AS domain_id",
+                scoped_id=target_scoped,
+            )
+            rec = res.single()
+            if not rec:
+                # Also try matching by address and domain property directly
+                res2 = tx.run(
+                    "MATCH (ip:IPAddress {address: $address, routing_domain_id: $domain}) "
+                    "RETURN ip.scoped_id AS scoped_id, ip.address AS address, ip.routing_domain_id AS domain_id",
+                    address=address,
+                    domain=domain,
+                )
+                rec2 = res2.single()
+                if not rec2:
+                    return None, None, None
+                return rec2.get("scoped_id", target_scoped), rec2.get("address", address), rec2.get("domain_id", domain)
+            return rec.get("scoped_id", target_scoped), rec.get("address", address), rec.get("domain_id", domain)
+
+        # Only address is supplied
+        check_res = tx.run(
+            "MATCH (ip:IPAddress {address: $address}) "
+            "RETURN count(ip) AS c, "
+            "       collect(ip.scoped_id) AS matching_scoped_ids, "
+            "       collect(ip.routing_domain_id) AS matching_domains",
+            address=address,
+        )
+        rec = check_res.single()
+        if not rec or rec.get("c") == 0:
+            return None, None, None
+
+        matching_domains = rec.get("matching_domains") or []
+        matching_scoped_ids = rec.get("matching_scoped_ids") or []
+
+        if len(matching_domains) > 1:
+            raise AmbiguousEndpointError(address, matching_domains, matching_scoped_ids)
+
+        resolved_scoped = matching_scoped_ids[0] if matching_scoped_ids else None
+        resolved_domain = matching_domains[0] if matching_domains else None
+        return resolved_scoped, address, resolved_domain
+
+    def list_ips(self, limit: int = 50, offset: int = 0, domain: Optional[str] = None) -> Tuple[List[Dict[str, Any]], int]:
+        """List observed IP addresses with pagination, optionally filtered by routing domain."""
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
 
         def _work(tx) -> Tuple[List[Dict[str, Any]], int]:
-            count_res = tx.run("MATCH (ip:IPAddress) RETURN count(ip) AS total")
-            total = count_res.single()["total"]
+            if domain:
+                count_res = tx.run(
+                    "MATCH (ip:IPAddress) WHERE ip.routing_domain_id = $domain RETURN count(ip) AS total",
+                    domain=domain,
+                )
+                total = count_res.single()["total"]
 
-            page_res = tx.run(
-                "MATCH (ip:IPAddress) "
-                "RETURN ip.address AS address "
-                "ORDER BY ip.address ASC "
-                "SKIP $offset LIMIT $limit",
-                offset=offset,
-                limit=limit,
-            )
-            items = [{"address": record["address"]} for record in page_res]
+                page_res = tx.run(
+                    "MATCH (ip:IPAddress) "
+                    "WHERE ip.routing_domain_id = $domain "
+                    "RETURN ip.address AS address, ip.scoped_id AS scoped_id, ip.routing_domain_id AS routing_domain_id "
+                    "ORDER BY ip.address ASC "
+                    "SKIP $offset LIMIT $limit",
+                    domain=domain,
+                    offset=offset,
+                    limit=limit,
+                )
+            else:
+                count_res = tx.run("MATCH (ip:IPAddress) RETURN count(ip) AS total")
+                total = count_res.single()["total"]
+
+                page_res = tx.run(
+                    "MATCH (ip:IPAddress) "
+                    "RETURN ip.address AS address, ip.scoped_id AS scoped_id, ip.routing_domain_id AS routing_domain_id "
+                    "ORDER BY ip.address ASC "
+                    "SKIP $offset LIMIT $limit",
+                    offset=offset,
+                    limit=limit,
+                )
+            items = [
+                {
+                    "address": record["address"],
+                    "scoped_id": record.get("scoped_id"),
+                    "routing_domain_id": record.get("routing_domain_id"),
+                }
+                for record in page_res
+            ]
             return items, total
 
         with self.driver.session() as session:
             return session.execute_read(_work)
 
-    def get_ip_detail(self, address: str) -> Optional[Dict[str, Any]]:
+    def get_ip_detail(
+        self,
+        address: str,
+        domain: Optional[str] = None,
+        scoped_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Retrieve local graph context, associated Layer 2 identifiers, flow counts, and volume metrics for an IP."""
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
 
         cypher = """
-        MATCH (ip:IPAddress {address: $address})
+        MATCH (ip:IPAddress)
+        WHERE (
+            ($scoped_id IS NOT NULL AND ip.scoped_id = $scoped_id)
+            OR ($scoped_id IS NULL AND ip.address = $address)
+        )
         CALL {
             WITH ip
             OPTIONAL MATCH (ip)-[out_c:COMMUNICATED_TO]->(out_peer:IPAddress)
@@ -97,6 +220,8 @@ class Neo4jReadRepository:
                    max(in_c.last_seen) AS max_in_last
         }
         RETURN ip.address AS address,
+               ip.scoped_id AS scoped_id,
+               ip.routing_domain_id AS routing_domain_id,
                COLLECT {
                    MATCH (ip)-[:OBSERVED_WITH]->(l2:Layer2Identifier)
                    RETURN l2.identifier ORDER BY l2.identifier ASC
@@ -127,7 +252,11 @@ class Neo4jReadRepository:
         """
 
         def _work(tx) -> Optional[Dict[str, Any]]:
-            res = tx.run(cypher, address=address)
+            scoped_id_val, addr_val, _ = self._resolve_endpoint(tx, address=address, domain=domain, scoped_id=scoped_id)
+            if addr_val is None:
+                return None
+
+            res = tx.run(cypher, address=address, scoped_id=scoped_id_val)
             record = res.single()
             if not record:
                 return None
@@ -148,6 +277,8 @@ class Neo4jReadRepository:
 
             return {
                 "address": record["address"],
+                "scoped_id": record.get("scoped_id"),
+                "routing_domain_id": record.get("routing_domain_id"),
                 "layer2_identifiers": [str(x) for x in record["layer2_identifiers"]],
                 "outbound_flows": out_aggs,
                 "inbound_flows": in_aggs,
@@ -174,7 +305,6 @@ class Neo4jReadRepository:
             raise ConnectionError("Database driver unavailable")
 
         def _work(tx) -> Dict[str, Any]:
-            # 1. Total & Metric Completeness Aggregates
             summary_cypher = """
             MATCH ()-[c:COMMUNICATED_TO]->()
             WITH count(c) AS total_aggs,
@@ -235,12 +365,7 @@ class Neo4jReadRepository:
             MATCH ()-[c:COMMUNICATED_TO]->()
             RETURN c.protocol AS protocol,
                    count(c) AS agg_count,
-                   count(CASE WHEN c.observed_packet_count IS NOT NULL
-                                   AND c.observed_bytes IS NOT NULL
-                                   AND c.first_seen IS NOT NULL
-                                   AND c.last_seen IS NOT NULL
-                                   AND c.observed_window_seconds IS NOT NULL
-                              THEN 1 END) AS enriched_count,
+                   count(CASE WHEN c.observed_packet_count IS NOT NULL THEN 1 END) AS enriched_count,
                    sum(c.observed_packet_count) AS pkts,
                    sum(c.observed_bytes) AS bytes
             ORDER BY agg_count DESC, protocol ASC
@@ -248,7 +373,7 @@ class Neo4jReadRepository:
             proto_res = tx.run(proto_cypher)
             proto_dist = []
             for r in proto_res:
-                enr_count = int(r["enriched_count"])
+                enr_count = int(r.get('enriched_count', r.get('enr_count', 0)))
                 proto_dist.append({
                     "protocol": r["protocol"],
                     "communication_aggregate_count": int(r["agg_count"]),
@@ -256,18 +381,13 @@ class Neo4jReadRepository:
                     "observed_bytes": int(r["bytes"]) if enr_count > 0 and r["bytes"] is not None else None,
                 })
 
-            # 3. Destination Port Distribution (Top 10 where dst_port IS NOT NULL)
+            # 3. Destination Port Distribution
             port_cypher = """
             MATCH ()-[c:COMMUNICATED_TO]->()
             WHERE c.dst_port IS NOT NULL
             RETURN c.dst_port AS dst_port,
                    count(c) AS agg_count,
-                   count(CASE WHEN c.observed_packet_count IS NOT NULL
-                                   AND c.observed_bytes IS NOT NULL
-                                   AND c.first_seen IS NOT NULL
-                                   AND c.last_seen IS NOT NULL
-                                   AND c.observed_window_seconds IS NOT NULL
-                              THEN 1 END) AS enriched_count,
+                   count(CASE WHEN c.observed_packet_count IS NOT NULL THEN 1 END) AS enriched_count,
                    sum(c.observed_packet_count) AS pkts,
                    sum(c.observed_bytes) AS bytes
             ORDER BY agg_count DESC, dst_port ASC
@@ -276,7 +396,7 @@ class Neo4jReadRepository:
             port_res = tx.run(port_cypher)
             port_dist = []
             for r in port_res:
-                enr_count = int(r["enriched_count"])
+                enr_count = int(r.get('enriched_count', r.get('enr_count', 0)))
                 port_dist.append({
                     "dst_port": int(r["dst_port"]),
                     "communication_aggregate_count": int(r["agg_count"]),
@@ -284,7 +404,7 @@ class Neo4jReadRepository:
                     "observed_bytes": int(r["bytes"]) if enr_count > 0 and r["bytes"] is not None else None,
                 })
 
-            # 4. Top Fan-out (Top 10 Source IPs by distinct destination IPs)
+            # 4. Top Fan-out
             fan_out_cypher = """
             MATCH (src:IPAddress)-[:COMMUNICATED_TO]->(dst:IPAddress)
             RETURN src.address AS address, count(DISTINCT dst) AS distinct_destination_ips
@@ -297,7 +417,7 @@ class Neo4jReadRepository:
                 for r in fan_out_res
             ]
 
-            # 5. Top Fan-in (Top 10 Destination IPs by distinct source IPs)
+            # 5. Top Fan-in
             fan_in_cypher = """
             MATCH (src:IPAddress)-[:COMMUNICATED_TO]->(dst:IPAddress)
             RETURN dst.address AS address, count(DISTINCT src) AS distinct_source_ips
@@ -333,26 +453,28 @@ class Neo4jReadRepository:
         sort_by: str = "fan_out",
         limit: int = 50,
         offset: int = 0,
+        domain: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], int]:
-        """Retrieve paginated, factually ranked endpoint analytics and metrics."""
+        """Retrieve factual endpoint analytics and flow metrics with flexible sorting and pagination."""
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
 
-        # Whitelist sorting to guarantee injection safety and deterministic order
         sort_clauses = {
-            "fan_out": "distinct_outbound_peers DESC, address ASC",
-            "fan_in": "distinct_inbound_peers DESC, address ASC",
-            "observed_bytes_sent": "CASE WHEN observed_bytes_sent IS NULL THEN 1 ELSE 0 END, observed_bytes_sent DESC, address ASC",
-            "observed_bytes_received": "CASE WHEN observed_bytes_received IS NULL THEN 1 ELSE 0 END, observed_bytes_received DESC, address ASC",
-            "observed_packets_sent": "CASE WHEN observed_packets_sent IS NULL THEN 1 ELSE 0 END, observed_packets_sent DESC, address ASC",
-            "observed_packets_received": "CASE WHEN observed_packets_received IS NULL THEN 1 ELSE 0 END, observed_packets_received DESC, address ASC",
+            "fan_out": "ORDER BY distinct_outbound_peers DESC, ip.address ASC",
+            "fan_in": "ORDER BY distinct_inbound_peers DESC, ip.address ASC",
+            "observed_packets_sent": "ORDER BY CASE WHEN observed_packets_sent IS NULL THEN 1 ELSE 0 END, observed_packets_sent DESC, ip.address ASC",
+            "observed_bytes_sent": "ORDER BY CASE WHEN observed_bytes_sent IS NULL THEN 1 ELSE 0 END, observed_bytes_sent DESC, ip.address ASC",
+            "first_observed": "ORDER BY CASE WHEN first_observed IS NULL THEN 1 ELSE 0 END, first_observed ASC, ip.address ASC",
+            "last_observed": "ORDER BY CASE WHEN last_observed IS NULL THEN 1 ELSE 0 END, last_observed DESC, ip.address ASC",
         }
         order_clause = sort_clauses.get(sort_by, sort_clauses["fan_out"])
 
-        count_cypher = "MATCH (ip:IPAddress) RETURN count(ip) AS total"
+        where_clause = "WHERE ip.routing_domain_id = $domain" if domain else ""
+        count_cypher = f"MATCH (ip:IPAddress) {where_clause} RETURN count(ip) AS total"
 
         page_cypher = f"""
         MATCH (ip:IPAddress)
+        {where_clause}
         CALL {{
             WITH ip
             OPTIONAL MATCH (ip)-[out_c:COMMUNICATED_TO]->(out_peer:IPAddress)
@@ -405,32 +527,37 @@ class Neo4jReadRepository:
                              ELSE coalesce(max_out_last, max_in_last) END)
                   ELSE null END AS last_observed
         RETURN ip.address AS address,
+               ip.scoped_id AS scoped_id,
+               ip.routing_domain_id AS routing_domain_id,
                outbound_aggs,
                inbound_aggs,
                distinct_outbound_peers,
                distinct_inbound_peers,
                distinct_destination_ports,
+               outbound_enriched_aggs,
+               inbound_enriched_aggs,
                observed_packets_sent,
                observed_packets_received,
                observed_bytes_sent,
                observed_bytes_received,
                first_observed,
-               last_observed,
-               outbound_enriched_aggs,
-               inbound_enriched_aggs
-        ORDER BY {order_clause}
+               last_observed
+        {order_clause}
         SKIP $offset LIMIT $limit
         """
 
         def _work(tx) -> Tuple[List[Dict[str, Any]], int]:
-            total = tx.run(count_cypher).single()["total"]
-            page_res = tx.run(page_cypher, offset=offset, limit=limit)
+            params: Dict[str, Any] = {"offset": offset, "limit": limit}
+            if domain:
+                params["domain"] = domain
+            total = tx.run(count_cypher, **params).single()["total"]
+            page_res = tx.run(page_cypher, **params)
             items = []
-            for r in page_res:
-                out_aggs = int(r["outbound_aggs"])
-                in_aggs = int(r["inbound_aggs"])
+            for record in page_res:
+                out_aggs = int(record["outbound_aggs"])
+                in_aggs = int(record["inbound_aggs"])
                 tot_aggs = out_aggs + in_aggs
-                enr_aggs = int(r["outbound_enriched_aggs"]) + int(r["inbound_enriched_aggs"])
+                enr_aggs = int(record["outbound_enriched_aggs"]) + int(record["inbound_enriched_aggs"])
 
                 if tot_aggs == 0:
                     mode = "none"
@@ -442,18 +569,20 @@ class Neo4jReadRepository:
                     mode = "mixed"
 
                 items.append({
-                    "address": r["address"],
+                    "address": record["address"],
+                    "scoped_id": record.get("scoped_id"),
+                    "routing_domain_id": record.get("routing_domain_id"),
                     "outbound_communication_aggregates": out_aggs,
                     "inbound_communication_aggregates": in_aggs,
-                    "distinct_outbound_peers": int(r["distinct_outbound_peers"]),
-                    "distinct_inbound_peers": int(r["distinct_inbound_peers"]),
-                    "distinct_destination_ports": int(r["distinct_destination_ports"]),
-                    "observed_packets_sent": int(r["observed_packets_sent"]) if r["observed_packets_sent"] is not None else None,
-                    "observed_packets_received": int(r["observed_packets_received"]) if r["observed_packets_received"] is not None else None,
-                    "observed_bytes_sent": int(r["observed_bytes_sent"]) if r["observed_bytes_sent"] is not None else None,
-                    "observed_bytes_received": int(r["observed_bytes_received"]) if r["observed_bytes_received"] is not None else None,
-                    "first_observed": float(r["first_observed"]) if r["first_observed"] is not None else None,
-                    "last_observed": float(r["last_observed"]) if r["last_observed"] is not None else None,
+                    "distinct_outbound_peers": int(record["distinct_outbound_peers"]),
+                    "distinct_inbound_peers": int(record["distinct_inbound_peers"]),
+                    "distinct_destination_ports": int(record["distinct_destination_ports"]),
+                    "observed_packets_sent": int(record["observed_packets_sent"]) if record["observed_packets_sent"] is not None else None,
+                    "observed_packets_received": int(record["observed_packets_received"]) if record["observed_packets_received"] is not None else None,
+                    "observed_bytes_sent": int(record["observed_bytes_sent"]) if record["observed_bytes_sent"] is not None else None,
+                    "observed_bytes_received": int(record["observed_bytes_received"]) if record["observed_bytes_received"] is not None else None,
+                    "first_observed": float(record["first_observed"]) if record["first_observed"] is not None else None,
+                    "last_observed": float(record["last_observed"]) if record["last_observed"] is not None else None,
                     "traffic_metrics_mode": mode,
                 })
             return items, total
@@ -467,8 +596,10 @@ class Neo4jReadRepository:
         direction: str = "all",
         limit: int = 50,
         offset: int = 0,
+        domain: Optional[str] = None,
+        scoped_id: Optional[str] = None,
     ) -> Optional[Tuple[List[Dict[str, Any]], int]]:
-        """List communicating peers for an IP address.
+        """List communicating peers and observed protocols for an IP address.
         
         Returns None if the specified IP is not found in the graph.
         """
@@ -476,36 +607,47 @@ class Neo4jReadRepository:
             raise ConnectionError("Database driver unavailable")
 
         def _work(tx) -> Optional[Tuple[List[Dict[str, Any]], int]]:
-            # First check if the IP exists
-            ip_check = tx.run("MATCH (ip:IPAddress {address: $address}) RETURN count(ip) AS c", address=address)
-            if ip_check.single()["c"] == 0:
+            scoped_id_val, addr_val, _ = self._resolve_endpoint(tx, address=address, domain=domain, scoped_id=scoped_id)
+            if addr_val is None:
                 return None
 
+            match_clause = (
+                "MATCH (src:IPAddress {scoped_id: $scoped_id})-[c:COMMUNICATED_TO]->(peer:IPAddress)"
+                if scoped_id_val
+                else "MATCH (src:IPAddress {address: $address})-[c:COMMUNICATED_TO]->(peer:IPAddress)"
+            )
+            match_inbound = (
+                "MATCH (peer:IPAddress)-[c:COMMUNICATED_TO]->(dst:IPAddress {scoped_id: $scoped_id})"
+                if scoped_id_val
+                else "MATCH (peer:IPAddress)-[c:COMMUNICATED_TO]->(dst:IPAddress {address: $address})"
+            )
+
             if direction == "outbound":
-                subquery = """
-                MATCH (src:IPAddress {address: $address})-[c:COMMUNICATED_TO]->(peer:IPAddress)
+                subquery = f"""
+                {match_clause}
                 WITH peer.address AS peer_address, 'outbound' AS dir, collect(DISTINCT c.protocol) AS raw_proto
                 RETURN peer_address, dir AS direction, raw_proto
                 """
             elif direction == "inbound":
-                subquery = """
-                MATCH (peer:IPAddress)-[c:COMMUNICATED_TO]->(dst:IPAddress {address: $address})
+                subquery = f"""
+                {match_inbound}
                 WITH peer.address AS peer_address, 'inbound' AS dir, collect(DISTINCT c.protocol) AS raw_proto
                 RETURN peer_address, dir AS direction, raw_proto
                 """
             else:  # "all"
-                subquery = """
-                MATCH (src:IPAddress {address: $address})-[c:COMMUNICATED_TO]->(peer:IPAddress)
+                subquery = f"""
+                {match_clause}
                 WITH peer.address AS peer_address, 'outbound' AS dir, collect(DISTINCT c.protocol) AS raw_proto
                 RETURN peer_address, dir AS direction, raw_proto
                 UNION ALL
-                MATCH (peer:IPAddress)-[c:COMMUNICATED_TO]->(dst:IPAddress {address: $address})
+                {match_inbound}
                 WITH peer.address AS peer_address, 'inbound' AS dir, collect(DISTINCT c.protocol) AS raw_proto
                 RETURN peer_address, dir AS direction, raw_proto
                 """
 
+            params: Dict[str, Any] = {"address": address, "scoped_id": scoped_id_val}
             count_cypher = f"CALL {{ {subquery} }} RETURN count(*) AS total"
-            total = tx.run(count_cypher, address=address).single()["total"]
+            total = tx.run(count_cypher, **params).single()["total"]
 
             page_cypher = f"""
             CALL {{ {subquery} }}
@@ -513,7 +655,9 @@ class Neo4jReadRepository:
             ORDER BY peer_address ASC, direction ASC
             SKIP $offset LIMIT $limit
             """
-            page_res = tx.run(page_cypher, address=address, offset=offset, limit=limit)
+            params["offset"] = offset
+            params["limit"] = limit
+            page_res = tx.run(page_cypher, **params)
             items = []
             for r in page_res:
                 sorted_protos = sorted(list(set(r["raw_proto"])))
@@ -532,6 +676,8 @@ class Neo4jReadRepository:
         address: str,
         limit: int = 50,
         offset: int = 0,
+        domain: Optional[str] = None,
+        scoped_id: Optional[str] = None,
     ) -> Optional[Tuple[List[Dict[str, Any]], int]]:
         """List Layer 2 identifiers associated with a specific IP address.
         
@@ -541,23 +687,28 @@ class Neo4jReadRepository:
             raise ConnectionError("Database driver unavailable")
 
         def _work(tx) -> Optional[Tuple[List[Dict[str, Any]], int]]:
-            ip_check = tx.run("MATCH (ip:IPAddress {address: $address}) RETURN count(ip) AS c", address=address)
-            if ip_check.single()["c"] == 0:
+            scoped_id_val, addr_val, _ = self._resolve_endpoint(tx, address=address, domain=domain, scoped_id=scoped_id)
+            if addr_val is None:
                 return None
 
-            count_cypher = """
-            MATCH (ip:IPAddress {address: $address})-[:OBSERVED_WITH]->(l2:Layer2Identifier)
-            RETURN count(l2) AS total
-            """
-            total = tx.run(count_cypher, address=address).single()["total"]
+            match_part = (
+                "MATCH (ip:IPAddress {scoped_id: $scoped_id})-[:OBSERVED_WITH]->(l2:Layer2Identifier)"
+                if scoped_id_val
+                else "MATCH (ip:IPAddress {address: $address})-[:OBSERVED_WITH]->(l2:Layer2Identifier)"
+            )
+            count_cypher = f"{match_part} RETURN count(l2) AS total"
+            params: Dict[str, Any] = {"address": address, "scoped_id": scoped_id_val}
+            total = tx.run(count_cypher, **params).single()["total"]
 
-            page_cypher = """
-            MATCH (ip:IPAddress {address: $address})-[:OBSERVED_WITH]->(l2:Layer2Identifier)
+            page_cypher = f"""
+            {match_part}
             RETURN l2.identifier AS identifier
             ORDER BY l2.identifier ASC
             SKIP $offset LIMIT $limit
             """
-            page_res = tx.run(page_cypher, address=address, offset=offset, limit=limit)
+            params["offset"] = offset
+            params["limit"] = limit
+            page_res = tx.run(page_cypher, **params)
             items = [{"identifier": r["identifier"]} for r in page_res]
             return items, total
 
@@ -574,7 +725,9 @@ class Neo4jReadRepository:
             raise ConnectionError("Database driver unavailable")
 
         def _work(tx) -> Tuple[List[Dict[str, Any]], int]:
-            total = tx.run("MATCH (l2:Layer2Identifier) RETURN count(l2) AS total").single()["total"]
+            count_res = tx.run("MATCH (l2:Layer2Identifier) RETURN count(l2) AS total")
+            total = count_res.single()["total"]
+
             page_res = tx.run(
                 "MATCH (l2:Layer2Identifier) "
                 "RETURN l2.identifier AS identifier "
@@ -583,7 +736,7 @@ class Neo4jReadRepository:
                 offset=offset,
                 limit=limit,
             )
-            items = [{"identifier": r["identifier"]} for r in page_res]
+            items = [{"identifier": record["identifier"]} for record in page_res]
             return items, total
 
         with self.driver.session() as session:
@@ -600,36 +753,34 @@ class Neo4jReadRepository:
         limit: int = 50,
         offset: int = 0,
     ) -> Tuple[List[Dict[str, Any]], int]:
-        """List observed Layer 3 IP-to-IP communications with optional filtering and sorting."""
+        """List Layer 3 directional communications with optional exact-match filtering, sorting, and pagination."""
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
 
-        proto_upper = protocol.strip().upper() if protocol and protocol.strip() else None
+        conditions = []
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
 
-        params = {
-            "source_ip": source_ip,
-            "target_ip": target_ip,
-            "protocol": proto_upper,
-            "src_port": src_port,
-            "dst_port": dst_port,
-            "offset": offset,
-            "limit": limit,
-        }
+        if source_ip is not None:
+            conditions.append("src.address = $source_ip")
+            params["source_ip"] = source_ip
+        if target_ip is not None:
+            conditions.append("dst.address = $target_ip")
+            params["target_ip"] = target_ip
+        if protocol is not None:
+            conditions.append("c.protocol = $protocol")
+            params["protocol"] = protocol
+        if src_port is not None:
+            conditions.append("c.src_port = $src_port")
+            params["src_port"] = src_port
+        if dst_port is not None:
+            conditions.append("c.dst_port = $dst_port")
+            params["dst_port"] = dst_port
 
-        where_clause = """
-        WHERE ($source_ip IS NULL OR src.address = $source_ip)
-          AND ($target_ip IS NULL OR dst.address = $target_ip)
-          AND ($protocol IS NULL OR c.protocol = $protocol)
-          AND ($src_port IS NULL OR c.src_port = $src_port)
-          AND ($dst_port IS NULL OR c.dst_port = $dst_port)
-        """
+        where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
-        # Fixed whitelisted sorting clauses
         sort_clauses = {
             "identity": """
             ORDER BY src.address ASC, dst.address ASC, c.protocol ASC,
-                     CASE WHEN c.src_port IS NULL THEN 1 ELSE 0 END, c.src_port ASC,
-                     CASE WHEN c.dst_port IS NULL THEN 1 ELSE 0 END, c.dst_port ASC,
                      CASE WHEN c.flow_key IS NULL THEN 1 ELSE 0 END, c.flow_key ASC
             """,
             "observed_bytes": """
@@ -695,37 +846,30 @@ class Neo4jReadRepository:
 
     def list_alert_facts(
         self,
-        source_ip: Optional[str] = None,
-        target_ip: Optional[str] = None,
-        priority: Optional[int] = None,
         sid: Optional[int] = None,
+        priority: Optional[int] = None,
         protocol: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> Tuple[List[Dict[str, Any]], int]:
-        """List normalized security alert facts with optional filtering."""
+        """List normalized AlertFact entities with optional filtering, deterministic sorting, and pagination."""
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
 
-        proto_upper = protocol.strip().upper() if protocol and protocol.strip() else None
+        conditions = []
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
 
-        params = {
-            "source_ip": source_ip,
-            "target_ip": target_ip,
-            "priority": priority,
-            "sid": sid,
-            "protocol": proto_upper,
-            "offset": offset,
-            "limit": limit,
-        }
+        if sid is not None:
+            conditions.append("fact.sid = $sid")
+            params["sid"] = sid
+        if priority is not None:
+            conditions.append("fact.priority = $priority")
+            params["priority"] = priority
+        if protocol is not None:
+            conditions.append("fact.protocol = $protocol")
+            params["protocol"] = protocol
 
-        where_clause = """
-        WHERE ($source_ip IS NULL OR src.address = $source_ip)
-          AND ($target_ip IS NULL OR dst.address = $target_ip)
-          AND ($priority IS NULL OR fact.priority = $priority)
-          AND ($sid IS NULL OR fact.sid = $sid)
-          AND ($protocol IS NULL OR fact.protocol = $protocol)
-        """
+        where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
         count_cypher = f"""
         MATCH (src:IPAddress)-[:SOURCE_OF]->(fact:AlertFact)-[:TARGETS]->(dst:IPAddress)
@@ -747,9 +891,7 @@ class Neo4jReadRepository:
                fact.protocol AS protocol,
                fact.src_port AS src_port,
                fact.dst_port AS dst_port
-        ORDER BY CASE WHEN fact.priority IS NULL THEN 1 ELSE 0 END, fact.priority ASC,
-                 CASE WHEN fact.sid IS NULL THEN 1 ELSE 0 END, fact.sid ASC,
-                 fact.fact_key ASC
+        ORDER BY fact.priority ASC, fact.sid ASC, fact.fact_key ASC
         SKIP $offset LIMIT $limit
         """
 
@@ -778,7 +920,7 @@ class Neo4jReadRepository:
             return session.execute_read(_work)
 
     def get_alert_fact(self, fact_key: str) -> Optional[Dict[str, Any]]:
-        """Retrieve single alert fact by its deterministic fact_key."""
+        """Retrieve a single normalized AlertFact by its deterministic fact_key."""
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
 
@@ -824,7 +966,7 @@ class Neo4jReadRepository:
         limit: int = 50,
         offset: int = 0,
     ) -> Tuple[List[Dict[str, Any]], int]:
-        """List correlated traffic communication flows that also generated security alert facts."""
+        """List correlated pairs where traffic communication and an alert fact share endpoints."""
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
 
@@ -883,12 +1025,13 @@ class Neo4jReadRepository:
         address: str,
         depth: int = 1,
         max_nodes: int = 50,
+        domain: Optional[str] = None,
+        scoped_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Retrieve bounded local graph neighborhood (depth 1 or 2) around an IP address.
-        
-        Guarantees that returned nodes <= max_nodes, every edge connects returned nodes,
-        and center IP is always retained. Parallel same-protocol flows with distinct flow_key
-        are preserved. Returns None if center IP does not exist.
+
+        Parallel same-protocol flows with distinct flow_key are preserved.
+        Returns None if center IP does not exist. Raises AmbiguousEndpointError if ambiguous.
         """
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
@@ -896,17 +1039,37 @@ class Neo4jReadRepository:
         # Select safe fixed Cypher query by validated depth
         if depth == 1:
             cypher = """
-            MATCH (center:IPAddress {address: $address})
+            MATCH (center:IPAddress)
+            WHERE (
+                ($scoped_id IS NOT NULL AND center.scoped_id = $scoped_id)
+                OR ($scoped_id IS NULL AND center.address = $address)
+            )
             OPTIONAL MATCH (center)-[r1:COMMUNICATED_TO]->(out_ip:IPAddress)
             OPTIONAL MATCH (in_ip:IPAddress)-[r2:COMMUNICATED_TO]->(center)
             OPTIONAL MATCH (center)-[r3:OBSERVED_WITH]->(l2:Layer2Identifier)
             RETURN center.address AS center,
-                   collect(DISTINCT {id: 'ip:' + out_ip.address, type: 'IPAddress', value: out_ip.address}) AS out_ips,
-                   collect(DISTINCT {id: 'ip:' + in_ip.address, type: 'IPAddress', value: in_ip.address}) AS in_ips,
+                   collect(DISTINCT {
+                       id: CASE WHEN out_ip.routing_domain_id = 'default' OR out_ip.routing_domain_id IS NULL
+                                THEN 'ip:' + out_ip.address
+                                ELSE 'ip:' + coalesce(out_ip.scoped_id, out_ip.address) END,
+                       type: 'IPAddress',
+                       value: out_ip.address
+                   }) AS out_ips,
+                   collect(DISTINCT {
+                       id: CASE WHEN in_ip.routing_domain_id = 'default' OR in_ip.routing_domain_id IS NULL
+                                THEN 'ip:' + in_ip.address
+                                ELSE 'ip:' + coalesce(in_ip.scoped_id, in_ip.address) END,
+                       type: 'IPAddress',
+                       value: in_ip.address
+                   }) AS in_ips,
                    collect(DISTINCT {id: 'l2:' + l2.identifier, type: 'Layer2Identifier', value: l2.identifier}) AS l2_nodes,
                    collect(DISTINCT {
-                       source: 'ip:' + center.address,
-                       target: 'ip:' + out_ip.address,
+                       source: CASE WHEN center.routing_domain_id = 'default' OR center.routing_domain_id IS NULL
+                                    THEN 'ip:' + center.address
+                                    ELSE 'ip:' + coalesce(center.scoped_id, center.address) END,
+                       target: CASE WHEN out_ip.routing_domain_id = 'default' OR out_ip.routing_domain_id IS NULL
+                                    THEN 'ip:' + out_ip.address
+                                    ELSE 'ip:' + coalesce(out_ip.scoped_id, out_ip.address) END,
                        type: 'COMMUNICATED_TO',
                        protocol: r1.protocol,
                        flow_key: r1.flow_key,
@@ -919,8 +1082,12 @@ class Neo4jReadRepository:
                        observed_window_seconds: r1.observed_window_seconds
                    }) AS out_edges,
                    collect(DISTINCT {
-                       source: 'ip:' + in_ip.address,
-                       target: 'ip:' + center.address,
+                       source: CASE WHEN in_ip.routing_domain_id = 'default' OR in_ip.routing_domain_id IS NULL
+                                    THEN 'ip:' + in_ip.address
+                                    ELSE 'ip:' + coalesce(in_ip.scoped_id, in_ip.address) END,
+                       target: CASE WHEN center.routing_domain_id = 'default' OR center.routing_domain_id IS NULL
+                                    THEN 'ip:' + center.address
+                                    ELSE 'ip:' + coalesce(center.scoped_id, center.address) END,
                        type: 'COMMUNICATED_TO',
                        protocol: r2.protocol,
                        flow_key: r2.flow_key,
@@ -933,7 +1100,9 @@ class Neo4jReadRepository:
                        observed_window_seconds: r2.observed_window_seconds
                    }) AS in_edges,
                    collect(DISTINCT {
-                       source: 'ip:' + center.address,
+                       source: CASE WHEN center.routing_domain_id = 'default' OR center.routing_domain_id IS NULL
+                                    THEN 'ip:' + center.address
+                                    ELSE 'ip:' + coalesce(center.scoped_id, center.address) END,
                        target: 'l2:' + l2.identifier,
                        type: 'OBSERVED_WITH',
                        protocol: null,
@@ -949,24 +1118,27 @@ class Neo4jReadRepository:
             """
         else:  # depth == 2
             cypher = """
-            MATCH (center:IPAddress {address: $address})
+            MATCH (center:IPAddress)
+            WHERE (
+                ($scoped_id IS NOT NULL AND center.scoped_id = $scoped_id)
+                OR ($scoped_id IS NULL AND center.address = $address)
+            )
             OPTIONAL MATCH p = (center)-[r:COMMUNICATED_TO|OBSERVED_WITH*1..2]-(target)
             WITH center, collect(DISTINCT p) AS paths
             RETURN center.address AS center, paths
             """
 
         def _work(tx) -> Optional[Dict[str, Any]]:
-            # Verify center node exists
-            center_check = tx.run("MATCH (ip:IPAddress {address: $address}) RETURN count(ip) AS c", address=address)
-            if center_check.single()["c"] == 0:
+            scoped_id_val, addr_val, dom_val = self._resolve_endpoint(tx, address=address, domain=domain, scoped_id=scoped_id)
+            if addr_val is None:
                 return None
 
-            center_id = f"ip:{address}"
+            center_id = f"ip:{scoped_id_val}" if (dom_val and dom_val != "default" and scoped_id_val) else f"ip:{address}"
             nodes_map = {center_id: {"id": center_id, "type": "IPAddress", "value": address}}
             candidate_edges = []
 
             if depth == 1:
-                rec = tx.run(cypher, address=address).single()
+                rec = tx.run(cypher, address=address, scoped_id=scoped_id_val).single()
                 for group in [rec["out_ips"], rec["in_ips"], rec["l2_nodes"]]:
                     for n in group:
                         if n.get("value") is not None:
@@ -977,13 +1149,15 @@ class Neo4jReadRepository:
                         if e.get("source") and e.get("target") and "None" not in e["source"] and "None" not in e["target"]:
                             candidate_edges.append(e)
             else:
-                rec = tx.run(cypher, address=address).single()
+                rec = tx.run(cypher, address=address, scoped_id=scoped_id_val).single()
                 paths = rec["paths"]
                 for p in paths:
                     if p is not None:
                         for n in p.nodes:
                             if "IPAddress" in n.labels:
-                                nid = f"ip:{n['address']}"
+                                r_dom = n.get("routing_domain_id")
+                                r_scoped = n.get("scoped_id")
+                                nid = f"ip:{r_scoped}" if (r_dom and r_dom != "default" and r_scoped) else f"ip:{n['address']}"
                                 nodes_map[nid] = {"id": nid, "type": "IPAddress", "value": n["address"]}
                             elif "Layer2Identifier" in n.labels:
                                 nid = f"l2:{n['identifier']}"
@@ -991,8 +1165,20 @@ class Neo4jReadRepository:
                         for rel in p.relationships:
                             src_node = rel.start_node
                             dst_node = rel.end_node
-                            src_id = f"ip:{src_node['address']}" if "IPAddress" in src_node.labels else f"l2:{src_node['identifier']}"
-                            dst_id = f"ip:{dst_node['address']}" if "IPAddress" in dst_node.labels else f"l2:{dst_node['identifier']}"
+                            if "IPAddress" in src_node.labels:
+                                s_dom = src_node.get("routing_domain_id")
+                                s_scoped = src_node.get("scoped_id")
+                                src_id = f"ip:{s_scoped}" if (s_dom and s_dom != "default" and s_scoped) else f"ip:{src_node['address']}"
+                            else:
+                                src_id = f"l2:{src_node['identifier']}"
+
+                            if "IPAddress" in dst_node.labels:
+                                d_dom = dst_node.get("routing_domain_id")
+                                d_scoped = dst_node.get("scoped_id")
+                                dst_id = f"ip:{d_scoped}" if (d_dom and d_dom != "default" and d_scoped) else f"ip:{dst_node['address']}"
+                            else:
+                                dst_id = f"l2:{dst_node['identifier']}"
+
                             candidate_edges.append({
                                 "source": src_id,
                                 "target": dst_id,
@@ -1018,35 +1204,41 @@ class Neo4jReadRepository:
 
             # Filter edges to only those where both endpoints are in retained nodes
             valid_edges = []
-            seen_edge_keys = set()
+            seen_edges = set()
             for e in candidate_edges:
                 if e["source"] in retained_node_ids and e["target"] in retained_node_ids:
-                    # Parallel flow identity: use flow_key if present, fallback to protocol
-                    if e.get("flow_key"):
-                        edge_key = (e["source"], e["target"], e["type"], e["flow_key"])
-                    else:
-                        edge_key = (e["source"], e["target"], e["type"], e.get("protocol"))
-
-                    if edge_key not in seen_edge_keys:
-                        seen_edge_keys.add(edge_key)
+                    edge_key = (
+                        e["source"],
+                        e["target"],
+                        e["type"],
+                        e.get("protocol"),
+                        e.get("flow_key"),
+                        e.get("src_port"),
+                        e.get("dst_port"),
+                    )
+                    if edge_key not in seen_edges:
+                        seen_edges.add(edge_key)
                         valid_edges.append(e)
 
             # Sort edges deterministically
-            valid_edges.sort(
+            sorted_edges = sorted(
+                valid_edges,
                 key=lambda x: (
                     x["source"],
                     x["target"],
                     x["type"],
-                    str(x.get("protocol")),
-                    str(x.get("flow_key")),
-                )
+                    x.get("protocol") or "",
+                    x.get("flow_key") or "",
+                    x.get("src_port") or 0,
+                    x.get("dst_port") or 0,
+                ),
             )
 
             return {
                 "center": address,
                 "depth": depth,
                 "nodes": retained_nodes,
-                "edges": valid_edges,
+                "edges": sorted_edges,
             }
 
         with self.driver.session() as session:
@@ -1057,24 +1249,33 @@ class Neo4jReadRepository:
         source: str,
         target: str,
         max_hops: int = 5,
+        source_domain: Optional[str] = None,
+        target_domain: Optional[str] = None,
+        source_scoped_id: Optional[str] = None,
+        target_scoped_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Find the shortest directional communication path between two IP addresses.
-        
+
         Returns dict with path details or error flag ('source_not_found', 'target_not_found', 'no_path').
+        Raises AmbiguousEndpointError if source or target address is ambiguous across domains.
         """
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
 
         def _work(tx) -> Dict[str, Any]:
-            src_c = tx.run("MATCH (n:IPAddress {address: $source}) RETURN count(n) AS c", source=source).single()["c"]
-            if src_c == 0:
+            src_scoped, src_addr, _ = self._resolve_endpoint(
+                tx, address=source, domain=source_domain, scoped_id=source_scoped_id
+            )
+            if src_addr is None:
                 return {"error": "source_not_found"}
 
-            dst_c = tx.run("MATCH (n:IPAddress {address: $target}) RETURN count(n) AS c", target=target).single()["c"]
-            if dst_c == 0:
+            dst_scoped, dst_addr, _ = self._resolve_endpoint(
+                tx, address=target, domain=target_domain, scoped_id=target_scoped_id
+            )
+            if dst_addr is None:
                 return {"error": "target_not_found"}
 
-            if source == target:
+            if (src_scoped and dst_scoped and src_scoped == dst_scoped) or (not src_scoped and not dst_scoped and source == target):
                 return {
                     "source": source,
                     "target": target,
@@ -1083,15 +1284,27 @@ class Neo4jReadRepository:
                     "length": 0,
                 }
 
-            cypher = """
-            MATCH (src:IPAddress {address: $source}), (dst:IPAddress {address: $target})
-            MATCH p = shortestPath((src)-[:COMMUNICATED_TO*1..10]->(dst))
-            WHERE length(p) <= $max_hops
-            RETURN [n IN nodes(p) | n.address] AS hops,
-                   [r IN relationships(p) | r.protocol] AS protocols,
-                   length(p) AS length
-            """
-            res = tx.run(cypher, source=source, target=target, max_hops=max_hops)
+            if src_scoped and dst_scoped:
+                cypher = """
+                MATCH (src:IPAddress {scoped_id: $src_scoped}), (dst:IPAddress {scoped_id: $dst_scoped})
+                MATCH p = shortestPath((src)-[:COMMUNICATED_TO*1..10]->(dst))
+                WHERE length(p) <= $max_hops
+                RETURN [n IN nodes(p) | n.address] AS hops,
+                       [r IN relationships(p) | r.protocol] AS protocols,
+                       length(p) AS length
+                """
+                res = tx.run(cypher, src_scoped=src_scoped, dst_scoped=dst_scoped, max_hops=max_hops)
+            else:
+                cypher = """
+                MATCH (src:IPAddress {address: $source}), (dst:IPAddress {address: $target})
+                MATCH p = shortestPath((src)-[:COMMUNICATED_TO*1..10]->(dst))
+                WHERE length(p) <= $max_hops
+                RETURN [n IN nodes(p) | n.address] AS hops,
+                       [r IN relationships(p) | r.protocol] AS protocols,
+                       length(p) AS length
+                """
+                res = tx.run(cypher, source=source, target=target, max_hops=max_hops)
+
             record = res.single()
             if not record:
                 return {"error": "no_path"}

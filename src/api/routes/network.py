@@ -16,7 +16,7 @@ from src.api.models import (
     PaginatedResponse,
 )
 from src.api.dependencies import get_read_repository, validate_canonical_ip
-from src.graph.read_repository import Neo4jReadRepository
+from src.graph.read_repository import Neo4jReadRepository, AmbiguousEndpointError
 
 router = APIRouter(prefix="/api/v1/network", tags=["Network"])
 
@@ -27,9 +27,9 @@ router = APIRouter(prefix="/api/v1/network", tags=["Network"])
 def get_traffic_analytics_summary(
     repo: Neo4jReadRepository = Depends(get_read_repository),
 ) -> TrafficAnalyticsSummaryResponse:
-    """Retrieve overall traffic analytics summary, metric completeness mode, and distribution rankings."""
-    data = repo.get_traffic_analytics_summary()
-    return TrafficAnalyticsSummaryResponse(**data)
+    """Retrieve overall traffic analytics summary, distribution metrics, and measurement completeness classification."""
+    summary = repo.get_traffic_analytics_summary()
+    return TrafficAnalyticsSummaryResponse(**summary)
 
 
 @router.get("/analytics/endpoints", response_model=PaginatedResponse[EndpointAnalyticsResponse])
@@ -37,19 +37,16 @@ def get_endpoints_analytics(
     sort_by: Literal[
         "fan_out",
         "fan_in",
-        "observed_bytes_sent",
-        "observed_bytes_received",
         "observed_packets_sent",
-        "observed_packets_received",
-    ] = Query(
-        default="fan_out",
-        description="Factual sorting criteria for endpoint ranking",
-    ),
+        "observed_bytes_sent",
+        "first_observed",
+        "last_observed",
+    ] = Query(default="fan_out", description="Ranking metric for endpoints"),
     limit: int = Query(default=50, ge=1, le=200, description="Max items per page"),
     offset: int = Query(default=0, ge=0, description="Offset starting index"),
     repo: Neo4jReadRepository = Depends(get_read_repository),
 ) -> PaginatedResponse[EndpointAnalyticsResponse]:
-    """Retrieve a paginated, ranked list of endpoint traffic and topology metrics."""
+    """Retrieve ranked endpoint analytics, fan-in/fan-out counts, and volume metrics."""
     items, total = repo.get_endpoints_analytics(sort_by=sort_by, limit=limit, offset=offset)
     return PaginatedResponse[EndpointAnalyticsResponse](
         items=[EndpointAnalyticsResponse(**item) for item in items],
@@ -63,12 +60,17 @@ def get_endpoints_analytics(
 
 @router.get("/ips", response_model=PaginatedResponse[IPAddressResponse])
 def list_ip_addresses(
+    domain: Optional[str] = Query(default=None, description="Optional filter by routing domain"),
     limit: int = Query(default=50, ge=1, le=200, description="Max items per page"),
     offset: int = Query(default=0, ge=0, description="Offset starting index"),
     repo: Neo4jReadRepository = Depends(get_read_repository),
 ) -> PaginatedResponse[IPAddressResponse]:
     """Retrieve a paginated list of observed IP addresses."""
-    items, total = repo.list_ips(limit=limit, offset=offset)
+    items, total = (
+        repo.list_ips(limit=limit, offset=offset, domain=domain)
+        if domain is not None
+        else repo.list_ips(limit=limit, offset=offset)
+    )
     return PaginatedResponse[IPAddressResponse](
         items=[IPAddressResponse(**item) for item in items],
         total=total,
@@ -80,11 +82,22 @@ def list_ip_addresses(
 @router.get("/ips/{address}", response_model=IPDetailResponse)
 def get_ip_address_detail(
     address: str,
+    domain: Optional[str] = Query(default=None, description="Optional routing domain for disambiguation"),
     repo: Neo4jReadRepository = Depends(get_read_repository),
 ) -> IPDetailResponse:
     """Retrieve detailed local graph context, associated Layer 2 identifiers, and flow counts for an IP."""
     canonical_address = validate_canonical_ip(address)
-    detail = repo.get_ip_detail(canonical_address)
+    try:
+        detail = (
+            repo.get_ip_detail(canonical_address, domain=domain)
+            if domain is not None
+            else repo.get_ip_detail(canonical_address)
+        )
+    except AmbiguousEndpointError as err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(err),
+        )
     if detail is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -96,6 +109,7 @@ def get_ip_address_detail(
 @router.get("/ips/{address}/peers", response_model=PaginatedResponse[PeerResponse])
 def list_ip_peers(
     address: str,
+    domain: Optional[str] = Query(default=None, description="Optional routing domain for disambiguation"),
     direction: Literal["outbound", "inbound", "all"] = Query(
         default="all",
         description="Direction of communication relative to queried IP",
@@ -106,7 +120,17 @@ def list_ip_peers(
 ) -> PaginatedResponse[PeerResponse]:
     """List communicating peers and observed protocols for an IP address."""
     canonical_address = validate_canonical_ip(address)
-    result = repo.list_ip_peers(canonical_address, direction=direction, limit=limit, offset=offset)
+    try:
+        result = (
+            repo.list_ip_peers(canonical_address, direction=direction, limit=limit, offset=offset, domain=domain)
+            if domain is not None
+            else repo.list_ip_peers(canonical_address, direction=direction, limit=limit, offset=offset)
+        )
+    except AmbiguousEndpointError as err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(err),
+        )
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -124,13 +148,24 @@ def list_ip_peers(
 @router.get("/ips/{address}/layer2", response_model=PaginatedResponse[Layer2IdentifierResponse])
 def list_ip_layer2_associations(
     address: str,
+    domain: Optional[str] = Query(default=None, description="Optional routing domain for disambiguation"),
     limit: int = Query(default=50, ge=1, le=200, description="Max items per page"),
     offset: int = Query(default=0, ge=0, description="Offset starting index"),
     repo: Neo4jReadRepository = Depends(get_read_repository),
 ) -> PaginatedResponse[Layer2IdentifierResponse]:
     """Retrieve paginated Layer 2 identifiers observed in association with an IP address."""
     canonical_address = validate_canonical_ip(address)
-    result = repo.list_ip_layer2(canonical_address, limit=limit, offset=offset)
+    try:
+        result = (
+            repo.list_ip_layer2(canonical_address, limit=limit, offset=offset, domain=domain)
+            if domain is not None
+            else repo.list_ip_layer2(canonical_address, limit=limit, offset=offset)
+        )
+    except AmbiguousEndpointError as err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(err),
+        )
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

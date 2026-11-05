@@ -27,11 +27,15 @@ class ReadyResponse(BaseModel):
 class IPAddressResponse(BaseModel):
     """Observed IP address model."""
     address: str = Field(description="Canonical IP address string")
+    scoped_id: Optional[str] = Field(default=None, description="Scoped IP identifier")
+    routing_domain_id: Optional[str] = Field(default=None, description="Routing domain identifier")
 
 
 class IPDetailResponse(BaseModel):
     """Detailed local graph context and flow counts for an IP address."""
     address: str = Field(description="Canonical IP address string")
+    scoped_id: Optional[str] = Field(default=None, description="Scoped IP identifier")
+    routing_domain_id: Optional[str] = Field(default=None, description="Routing domain identifier")
     layer2_identifiers: List[str] = Field(description="Observed associated Layer 2 identifiers")
     outbound_flows: int = Field(description="Count of outgoing Layer 3 communications")
     inbound_flows: int = Field(description="Count of incoming Layer 3 communications")
@@ -187,6 +191,8 @@ class TrafficAnalyticsSummaryResponse(BaseModel):
 class EndpointAnalyticsResponse(BaseModel):
     """Factual traffic and topology metrics for an observed IP endpoint."""
     address: str = Field(description="Canonical IP address")
+    scoped_id: Optional[str] = Field(default=None, description="Scoped IP identifier")
+    routing_domain_id: Optional[str] = Field(default=None, description="Routing domain identifier")
     outbound_communication_aggregates: int = Field(description="Count of outgoing COMMUNICATED_TO relationships")
     inbound_communication_aggregates: int = Field(description="Count of incoming COMMUNICATED_TO relationships")
     distinct_outbound_peers: int = Field(description="Distinct destination IP addresses contacted (fan-out)")
