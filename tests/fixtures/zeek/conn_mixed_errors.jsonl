@@ -1,0 +1,11 @@
+
+{"ts":1725148900.1,"uid":"CValidFirst000001","id.orig_h":"203.0.113.10","id.orig_p":50000,"id.resp_h":"203.0.113.20","id.resp_p":443,"proto":"tcp","duration":2.5,"orig_bytes":100,"resp_bytes":200}
+{not valid json at all
+["json_array_not_object"]
+{"ts":1725148901.1,"uid":"CBadIp00000000002","id.orig_h":"999.999.999.999","id.orig_p":1234,"id.resp_h":"203.0.113.20","id.resp_p":80,"proto":"tcp"}
+{"ts":1725148902.1,"uid":"CMismatchVer00003","id.orig_h":"203.0.113.10","id.orig_p":1234,"id.resp_h":"2001:db8::1","id.resp_p":80,"proto":"tcp"}
+{"ts":1725148903.1,"id.orig_h":"203.0.113.10","id.orig_p":1234,"id.resp_h":"203.0.113.20","id.resp_p":80,"proto":"tcp"}
+{"ts":"not-a-timestamp","uid":"CBadTs00000000004","id.orig_h":"203.0.113.10","id.orig_p":1234,"id.resp_h":"203.0.113.20","id.resp_p":80,"proto":"tcp"}
+{"ts":1725148904.1,"uid":"CBadPort000000005","id.orig_h":"203.0.113.10","id.orig_p":70000,"id.resp_h":"203.0.113.20","id.resp_p":80,"proto":"tcp"}
+{"ts":1725148905.1,"uid":"CUnsupProto000006","id.orig_h":"203.0.113.10","id.resp_h":"203.0.113.20","proto":"unknown_transport"}
+{"ts":1725148906.1,"uid":"CBadMetrics000007","id.orig_h":"203.0.113.10","id.orig_p":50001,"id.resp_h":"203.0.113.20","id.resp_p":443,"proto":"tcp","duration":-5.0,"orig_bytes":-10,"resp_pkts":"abc","orig_ip_bytes":true,"local_orig":"yes"}
