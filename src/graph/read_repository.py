@@ -852,6 +852,8 @@ class Neo4jReadRepository:
 
     def list_alert_facts(
         self,
+        source_ip: Optional[str] = None,
+        target_ip: Optional[str] = None,
         sid: Optional[int] = None,
         priority: Optional[int] = None,
         protocol: Optional[str] = None,
@@ -865,6 +867,12 @@ class Neo4jReadRepository:
         conditions = []
         params: Dict[str, Any] = {"limit": limit, "offset": offset}
 
+        if source_ip is not None:
+            conditions.append("src.address = $source_ip")
+            params["source_ip"] = source_ip
+        if target_ip is not None:
+            conditions.append("dst.address = $target_ip")
+            params["target_ip"] = target_ip
         if sid is not None:
             conditions.append("fact.sid = $sid")
             params["sid"] = sid
