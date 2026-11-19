@@ -1,0 +1,1 @@
+{"ts":1725149000.000001,"uid":"CRfc1918Conn00001","id.orig_h":"10.0.0.5","id.orig_p":51000,"id.resp_h":"10.0.0.20","id.resp_p":443,"proto":"tcp","service":"ssl","duration":0.75,"orig_bytes":300,"resp_bytes":1200,"orig_pkts":4,"resp_pkts":5,"orig_ip_bytes":508,"resp_ip_bytes":1460}

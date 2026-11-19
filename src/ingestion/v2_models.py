@@ -376,3 +376,47 @@ class AlertEventRecord:
     source_type: str = "unknown"
     source_record_id: Optional[str] = None
     source_provenance: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ZeekConnectionObservation:
+    """Normalized temporal connection observation parsed from Zeek conn.log JSONL.
+
+    Neo4j-independent domain model preserving Zeek's exact temporal precision
+    (Decimal epoch and canonical timestamp strings), native Zeek connection UID,
+    explicit RoutingDomain-scoped endpoints, separate directional payload vs
+    IP-level byte and packet metrics, and separate Community ID correlation key.
+    Absent optional fields remain None rather than inventing fallback zeros.
+    """
+    observation_id: str
+    flow_key: str
+    zeek_uid: str
+    routing_domain_id: str
+    src_scoped_id: str
+    dst_scoped_id: str
+    src_ip: str
+    dst_ip: str
+    protocol: str
+    start_ts: str
+    src_port: Optional[int] = None
+    dst_port: Optional[int] = None
+    community_id: Optional[str] = None
+    start_epoch: Optional[Decimal] = None
+    duration: Optional[Decimal] = None
+    end_epoch: Optional[Decimal] = None
+    end_ts: Optional[str] = None
+    orig_bytes: Optional[int] = None
+    resp_bytes: Optional[int] = None
+    orig_pkts: Optional[int] = None
+    resp_pkts: Optional[int] = None
+    orig_ip_bytes: Optional[int] = None
+    resp_ip_bytes: Optional[int] = None
+    missed_bytes: Optional[int] = None
+    service: Optional[str] = None
+    conn_state: Optional[str] = None
+    history: Optional[str] = None
+    local_orig: Optional[bool] = None
+    local_resp: Optional[bool] = None
+    sensor_id: str = "default"
+    source_type: str = "zeek"
+    source_provenance: Optional[str] = None
