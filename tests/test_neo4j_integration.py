@@ -16,9 +16,9 @@ import pytest
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError
 
-from src.graph.schema import ensure_schema
+from src.graph.schema import ensure_schema, migrate_ip_identity_to_scoped, MigrationRequiredError
 from src.graph.repository import Neo4jRepository
-from src.graph.read_repository import Neo4jReadRepository
+from src.graph.read_repository import Neo4jReadRepository, AmbiguousEndpointError
 from src.ingestion.models import TrafficRecord, AlertRecord
 from src.ingestion.traffic_parser import parse_traffic_file
 from src.ingestion.alert_parser import parse_alert_file
@@ -65,12 +65,14 @@ def test_live_neo4j_schema_and_idempotent_ingestion(live_neo4j_driver):
     with live_neo4j_driver.session() as session:
         constraints_res = session.run("SHOW CONSTRAINTS").data()
         constraint_names = {c.get("name") for c in constraints_res}
-        assert "ip_address_unique" in constraint_names
+        assert "routing_domain_unique" in constraint_names
+        assert "ip_scoped_unique" in constraint_names
         assert "layer2_identifier_unique" in constraint_names
         assert "alert_fact_unique" in constraint_names
 
         indexes_res = session.run("SHOW INDEXES").data()
         index_names = {i.get("name") for i in indexes_res}
+        assert "ip_address_index" in index_names
         assert "alert_fact_priority_index" in index_names
         assert "alert_fact_sid_index" in index_names
 
@@ -1080,3 +1082,347 @@ def test_live_correlation_parallel_flow_distinguishability(live_neo4j_driver):
             session.run("MATCH (fact:AlertFact) WHERE fact.sid = 7777001 DETACH DELETE fact").consume()
             session.run("MATCH (ip:IPAddress) WHERE ip.address IN $ips DETACH DELETE ip", ips=test_ips).consume()
             session.run("MATCH (l2:Layer2Identifier) WHERE l2.identifier STARTS WITH '02:00:00:7c:41:' OR l2.identifier STARTS WITH '02:00:00:7c:42:' DETACH DELETE l2").consume()
+
+
+@pytest.mark.integration
+def test_live_overlapping_rfc1918_addresses_and_ambiguity(live_neo4j_driver):
+    """TEST C: Verify live Neo4j supports overlapping RFC 1918 IP addresses in distinct domains and ambiguity handling."""
+    ensure_schema(live_neo4j_driver)
+    repo = Neo4jRepository(live_neo4j_driver, batch_size=100)
+    read_repo = Neo4jReadRepository(live_neo4j_driver)
+
+    ip_overlap = "10.0.0.99"
+    test_traffic_corp = [
+        TrafficRecord(
+            eth_src_resolved="02:00:00:88:01:01",
+            eth_dst_resolved="02:00:00:88:01:02",
+            ip_src=ip_overlap,
+            ip_dst="10.0.0.100",
+            protocol="TCP",
+        )
+    ]
+    test_traffic_branch = [
+        TrafficRecord(
+            eth_src_resolved="02:00:00:88:02:01",
+            eth_dst_resolved="02:00:00:88:02:02",
+            ip_src=ip_overlap,
+            ip_dst="10.0.0.200",
+            protocol="TCP",
+        )
+    ]
+
+    try:
+        # Ingest in two separate routing domains using consistent domain_id parameter
+        repo.write_traffic_records(test_traffic_corp, domain_id="test_corp")
+        repo.write_traffic_records(test_traffic_branch, domain_id="test_branch")
+
+        with live_neo4j_driver.session() as session:
+            corp_node = session.run(
+                "MATCH (ip:IPAddress {scoped_id: 'test_corp#10.0.0.99'}) RETURN ip.address AS addr, ip.routing_domain_id AS dom"
+            ).single()
+            assert corp_node is not None
+            assert corp_node["addr"] == ip_overlap
+            assert corp_node["dom"] == "test_corp"
+
+            branch_node = session.run(
+                "MATCH (ip:IPAddress {scoped_id: 'test_branch#10.0.0.99'}) RETURN ip.address AS addr, ip.routing_domain_id AS dom"
+            ).single()
+            assert branch_node is not None
+            assert branch_node["addr"] == ip_overlap
+            assert branch_node["dom"] == "test_branch"
+
+        # Ambiguous lookup without domain must raise AmbiguousEndpointError
+        with pytest.raises(AmbiguousEndpointError):
+            read_repo.get_ip_detail(ip_overlap)
+
+        # Disambiguated lookup by domain (including mixed-case normalization)
+        corp_detail = read_repo.get_ip_detail(ip_overlap, domain="test_corp")
+        assert corp_detail is not None
+        assert corp_detail["scoped_id"] == "test_corp#10.0.0.99"
+
+        branch_detail = read_repo.get_ip_detail(ip_overlap, domain="TEST_BRANCH")
+        assert branch_detail is not None
+        assert branch_detail["scoped_id"] == "test_branch#10.0.0.99"
+
+        # Case-insensitive domain filter in list_ips
+        corp_ips, corp_total = read_repo.list_ips(domain="  TEST_CORP  ")
+        assert corp_total == 2
+        assert {item["scoped_id"] for item in corp_ips} == {"test_corp#10.0.0.99", "test_corp#10.0.0.100"}
+
+        # Cross-domain fan-out must NOT merge test_corp#10.0.0.99 (1 peer) and test_branch#10.0.0.99 (1 peer) into 2
+        summary = read_repo.get_traffic_analytics_summary()
+        overlap_fan_outs = [f for f in summary["top_fan_out"] if f["address"] == ip_overlap]
+        assert len(overlap_fan_outs) == 2
+        assert all(f["distinct_destination_ips"] == 1 for f in overlap_fan_outs)
+
+        # Case-insensitive protocol filter in list_communications
+        tcp_comms, tcp_total = read_repo.list_communications(source_ip=ip_overlap, protocol="tcp")
+        assert tcp_total == 2
+        assert all(c["protocol"] == "TCP" for c in tcp_comms)
+
+        # V1 sort_by compatibility in get_endpoints_analytics
+        ep_items, ep_total = read_repo.get_endpoints_analytics(sort_by="observed_bytes_received", domain="TEST_CORP")
+        assert ep_total == 2
+        assert len(ep_items) == 2
+
+        # Depth-2 neighborhood must NOT leak branch IPs across a shared Layer2Identifier
+        shared_l2 = "02:00:00:88:ff:ff"
+        repo.write_traffic_records(
+            [
+                TrafficRecord(
+                    eth_src_resolved=shared_l2,
+                    eth_dst_resolved="02:00:00:88:01:02",
+                    ip_src=ip_overlap,
+                    ip_dst="10.0.0.100",
+                    protocol="UDP",
+                )
+            ],
+            domain_id="test_corp",
+        )
+        repo.write_traffic_records(
+            [
+                TrafficRecord(
+                    eth_src_resolved=shared_l2,
+                    eth_dst_resolved="02:00:00:88:02:02",
+                    ip_src=ip_overlap,
+                    ip_dst="10.0.0.200",
+                    protocol="UDP",
+                )
+            ],
+            domain_id="test_branch",
+        )
+        nh_d2 = read_repo.get_neighborhood(ip_overlap, depth=2, domain="test_corp")
+        assert nh_d2 is not None
+        nh_d2_ids = {n["id"] for n in nh_d2["nodes"]}
+        assert "ip:test_corp#10.0.0.99" in nh_d2_ids
+        assert "ip:test_corp#10.0.0.100" in nh_d2_ids
+        assert f"l2:{shared_l2}" in nh_d2_ids
+        assert not any("test_branch" in nid for nid in nh_d2_ids)
+
+        # Test migration helper is idempotent on live DB and check stable return contract
+        mig_stats = migrate_ip_identity_to_scoped(live_neo4j_driver)
+        assert mig_stats["default_domain"] == "default"
+        assert mig_stats["migrated_ips"] >= 0
+
+    finally:
+        # Safe cleanup: only delete test-owned domains and test-owned scoped IDs, NEVER delete by raw IP across all domains
+        with live_neo4j_driver.session() as session:
+            session.run("MATCH (ip:IPAddress) WHERE ip.routing_domain_id IN ['test_corp', 'test_branch'] DETACH DELETE ip").consume()
+            session.run("MATCH (l2:Layer2Identifier) WHERE l2.identifier STARTS WITH '02:00:00:88:' DETACH DELETE l2").consume()
+            session.run("MATCH (rd:RoutingDomain) WHERE rd.domain_id IN ['test_corp', 'test_branch'] DETACH DELETE rd").consume()
+
+
+@pytest.mark.integration
+def test_live_legacy_migration_safety_and_preservation(live_neo4j_driver):
+    """TEST B: Verify genuine V1 graph migration preserves nodes, relationships, and is idempotent."""
+    with live_neo4j_driver.session() as session:
+        # 1. Clean previous test artifacts (strictly scoped to default/unmigrated test nodes)
+        session.run(
+            "MATCH (ip:IPAddress) "
+            "WHERE ip.scoped_id IN ['default#198.51.100.210', 'default#198.51.100.211'] "
+            "   OR (ip.scoped_id IS NULL AND ip.address IN ['198.51.100.210', '198.51.100.211']) "
+            "DETACH DELETE ip"
+        ).consume()
+        session.run("MATCH (l2:Layer2Identifier {identifier: '02:00:00:9a:00:01'}) DETACH DELETE l2").consume()
+        session.run("MATCH (fact:AlertFact {fact_key: 'test_legacy_fact_1'}) DETACH DELETE fact").consume()
+
+        # 2. Create genuine un-migrated legacy V1 nodes (scoped_id and routing_domain_id are NULL)
+        session.run(
+            """
+            CREATE (src:IPAddress {address: '198.51.100.210'}),
+                   (dst:IPAddress {address: '198.51.100.211'}),
+                   (l2:Layer2Identifier {identifier: '02:00:00:9a:00:01'}),
+                   (fact:AlertFact {fact_key: 'test_legacy_fact_1', sid: 8888001, priority: 1, protocol: 'TCP'})
+            CREATE (src)-[:COMMUNICATED_TO {protocol: 'TCP', flow_key: 'test_legacy_fk1'}]->(dst)
+            CREATE (src)-[:OBSERVED_WITH]->(l2)
+            CREATE (src)-[:SOURCE_OF]->(fact)
+            CREATE (fact)-[:TARGETS]->(dst)
+            """
+        ).consume()
+
+    try:
+        # 3. Calling ensure_schema() on an unmigrated V1 database MUST raise MigrationRequiredError
+        with pytest.raises(MigrationRequiredError):
+            ensure_schema(live_neo4j_driver)
+
+        # 4. Perform explicit migration
+        mig_stats = migrate_ip_identity_to_scoped(live_neo4j_driver, default_domain="default")
+        assert mig_stats["total_ips"] >= 2
+        assert mig_stats["migrated_ips"] >= 2
+        assert mig_stats["default_domain"] == "default"
+
+        # 5. Verify nodes and relationships in live graph
+        with live_neo4j_driver.session() as session:
+            src_node = session.run("MATCH (ip:IPAddress {scoped_id: 'default#198.51.100.210'}) RETURN ip").single()
+            dst_node = session.run("MATCH (ip:IPAddress {scoped_id: 'default#198.51.100.211'}) RETURN ip").single()
+            assert src_node is not None
+            assert dst_node is not None
+            assert src_node["ip"]["routing_domain_id"] == "default"
+            assert dst_node["ip"]["routing_domain_id"] == "default"
+
+            # Verify IN_DOMAIN relationships
+            in_domain_count = session.run(
+                """
+                MATCH (ip:IPAddress)-[:IN_DOMAIN]->(rd:RoutingDomain {domain_id: 'default'})
+                WHERE ip.address IN ['198.51.100.210', '198.51.100.211']
+                RETURN count(ip) AS c
+                """
+            ).single()["c"]
+            assert in_domain_count == 2
+
+            # Verify original COMMUNICATED_TO, OBSERVED_WITH, SOURCE_OF, TARGETS relationships preserved
+            # and historical AlertFact backfilled with default routing_domain_id
+            rel_check = session.run(
+                """
+                MATCH (src:IPAddress {scoped_id: 'default#198.51.100.210'})-[c:COMMUNICATED_TO]->(dst:IPAddress {scoped_id: 'default#198.51.100.211'}),
+                      (src)-[:OBSERVED_WITH]->(l2:Layer2Identifier {identifier: '02:00:00:9a:00:01'}),
+                      (src)-[:SOURCE_OF]->(fact:AlertFact {fact_key: 'test_legacy_fact_1'})-[:TARGETS]->(dst)
+                RETURN count(c) AS c_count, fact.routing_domain_id AS fact_dom
+                """
+            ).single()
+            assert rel_check is not None
+            assert rel_check["c_count"] == 1
+            assert rel_check["fact_dom"] == "default"
+
+        # 6. Verify repeat migration is idempotent and safe
+        repeat_stats = migrate_ip_identity_to_scoped(live_neo4j_driver, default_domain="default")
+        assert repeat_stats["migrated_ips"] == 0
+
+        # 7. Calling ensure_schema() now succeeds without error
+        ensure_schema(live_neo4j_driver)
+
+    finally:
+        # Delete both migrated and unmigrated test nodes so any mid-test failure never poisons later tests
+        with live_neo4j_driver.session() as session:
+            session.run(
+                "MATCH (ip:IPAddress) "
+                "WHERE ip.scoped_id IN ['default#198.51.100.210', 'default#198.51.100.211'] "
+                "   OR (ip.scoped_id IS NULL AND ip.address IN ['198.51.100.210', '198.51.100.211']) "
+                "DETACH DELETE ip"
+            ).consume()
+            session.run("MATCH (l2:Layer2Identifier {identifier: '02:00:00:9a:00:01'}) DETACH DELETE l2").consume()
+            session.run("MATCH (fact:AlertFact {fact_key: 'test_legacy_fact_1'}) DETACH DELETE fact").consume()
+
+
+@pytest.mark.integration
+def test_live_cross_domain_alert_facts_isolation(live_neo4j_driver):
+    """TEST E: Verify matching alert metadata in distinct domains creates isolated AlertFacts and correlations."""
+    ensure_schema(live_neo4j_driver)
+    repo = Neo4jRepository(live_neo4j_driver, batch_size=100)
+    read_repo = Neo4jReadRepository(live_neo4j_driver)
+
+    alert = AlertRecord(
+        src_ip="198.51.100.230",
+        dst_ip="198.51.100.231",
+        sid=9999099,
+        gid=1,
+        rev=1,
+        message="Cross-domain test alert",
+        priority=1,
+        protocol="TCP",
+        src_port=44444,
+        dst_port=80,
+    )
+
+    try:
+        # Ingest alert in two separate domains + traffic ONLY in test_dom_x
+        repo.write_alert_records([alert], domain_id="test_dom_x")
+        repo.write_alert_records([alert], domain_id="test_dom_y")
+        repo.write_traffic_records(
+            [
+                TrafficRecord(
+                    eth_src_resolved="02:00:00:99:dd:01",
+                    eth_dst_resolved="02:00:00:99:dd:02",
+                    ip_src="198.51.100.230",
+                    ip_dst="198.51.100.231",
+                    protocol="TCP",
+                )
+            ],
+            domain_id="test_dom_x",
+        )
+
+        # Case-insensitive protocol filter in list_alert_facts
+        tcp_alerts, tcp_alerts_total = read_repo.list_alert_facts(
+            source_ip="198.51.100.230",
+            target_ip="198.51.100.231",
+            sid=9999099,
+            protocol="tcp",
+        )
+        assert tcp_alerts_total == 2
+        assert len(tcp_alerts) == 2
+
+        # Traffic in test_dom_x must correlate ONLY with test_dom_x's AlertFact (1 row, not 2)
+        corrs, _ = read_repo.list_traffic_alert_correlations(limit=200)
+        matching_corrs = [c for c in corrs if c["sid"] == 9999099]
+        assert len(matching_corrs) == 1
+
+        with live_neo4j_driver.session() as session:
+            facts = session.run(
+                "MATCH (f:AlertFact) WHERE f.sid = 9999099 RETURN f.fact_key AS key, f.routing_domain_id AS dom"
+            ).data()
+            assert len(facts) == 2
+            doms = {f["dom"] for f in facts}
+            keys = {f["key"] for f in facts}
+            assert doms == {"test_dom_x", "test_dom_y"}
+            assert len(keys) == 2  # distinct fact_keys
+
+            dom_x_key = next(f["key"] for f in facts if f["dom"] == "test_dom_x")
+            assert matching_corrs[0]["fact_key"] == dom_x_key
+
+            # Verify no cross-domain links
+            cross_links = session.run(
+                """
+                MATCH (src:IPAddress {scoped_id: 'test_dom_x#198.51.100.230'})-[:SOURCE_OF]->(f:AlertFact {routing_domain_id: 'test_dom_y'})
+                RETURN count(f) AS c
+                """
+            ).single()["c"]
+            assert cross_links == 0
+
+    finally:
+        with live_neo4j_driver.session() as session:
+            session.run("MATCH (fact:AlertFact) WHERE fact.sid = 9999099 DETACH DELETE fact").consume()
+            session.run("MATCH (ip:IPAddress) WHERE ip.routing_domain_id IN ['test_dom_x', 'test_dom_y'] DETACH DELETE ip").consume()
+            session.run("MATCH (l2:Layer2Identifier) WHERE l2.identifier STARTS WITH '02:00:00:99:dd:' DETACH DELETE l2").consume()
+            session.run("MATCH (rd:RoutingDomain) WHERE rd.domain_id IN ['test_dom_x', 'test_dom_y'] DETACH DELETE rd").consume()
+
+
+@pytest.mark.integration
+def test_live_duplicate_ingestion_idempotency(live_neo4j_driver):
+    """TEST D: Ingest identical default-domain traffic twice and verify 1 logical endpoint per scoped ID."""
+    ensure_schema(live_neo4j_driver)
+    repo = Neo4jRepository(live_neo4j_driver, batch_size=100)
+
+    test_traffic = [
+        TrafficRecord(
+            eth_src_resolved="02:00:00:aa:00:01",
+            eth_dst_resolved="02:00:00:aa:00:02",
+            ip_src="198.51.100.240",
+            ip_dst="198.51.100.241",
+            protocol="TCP",
+        )
+    ]
+
+    try:
+        # Ingest twice
+        repo.write_traffic_records(test_traffic, domain_id="test_dup_dom")
+        repo.write_traffic_records(test_traffic, domain_id="test_dup_dom")
+
+        with live_neo4j_driver.session() as session:
+            ip_count = session.run(
+                "MATCH (ip:IPAddress) WHERE ip.routing_domain_id = 'test_dup_dom' RETURN count(ip) AS c"
+            ).single()["c"]
+            assert ip_count == 2
+
+            edge_count = session.run(
+                """
+                MATCH (src:IPAddress {scoped_id: 'test_dup_dom#198.51.100.240'})-[c:COMMUNICATED_TO]->(dst:IPAddress {scoped_id: 'test_dup_dom#198.51.100.241'})
+                RETURN count(c) AS c
+                """
+            ).single()["c"]
+            assert edge_count == 1
+
+    finally:
+        with live_neo4j_driver.session() as session:
+            session.run("MATCH (ip:IPAddress) WHERE ip.routing_domain_id = 'test_dup_dom' DETACH DELETE ip").consume()
+            session.run("MATCH (l2:Layer2Identifier) WHERE l2.identifier STARTS WITH '02:00:00:aa:' DETACH DELETE l2").consume()
+            session.run("MATCH (rd:RoutingDomain) WHERE rd.domain_id = 'test_dup_dom' DETACH DELETE rd").consume()

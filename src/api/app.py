@@ -11,6 +11,7 @@ from neo4j.exceptions import ServiceUnavailable, AuthError
 from src.config import get_cors_origins, APP_NAME
 from src.api.dependencies import lifespan
 from src.api.routes import health, network, alerts, correlations, graph, import_data
+from src.graph.read_repository import AmbiguousEndpointError
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,22 @@ def create_app() -> FastAPI:
             allow_headers=["*"],
         )
 
-    # --- Global Exception Handlers for Database Errors ---
+    # --- Global Exception Handlers for Database Errors and Ambiguity ---
+    @app.exception_handler(AmbiguousEndpointError)
+    def ambiguous_endpoint_handler(request: Request, exc: AmbiguousEndpointError):
+        logger.warning("Ambiguous endpoint requested on %s: %s", request.url.path, exc)
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": {
+                    "code": "AMBIGUOUS_ENDPOINT",
+                    "message": str(exc),
+                    "address": exc.address,
+                    "matching_domains": sorted(exc.matching_domains),
+                }
+            },
+        )
+
     @app.exception_handler(ConnectionError)
     def connection_error_handler(request: Request, exc: ConnectionError):
         logger.error("Database connection error on %s: %s", request.url.path, exc)

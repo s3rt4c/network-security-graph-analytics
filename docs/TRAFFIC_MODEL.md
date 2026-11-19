@@ -65,39 +65,74 @@ Packet observations sharing the same directional 5-tuple are deterministically a
 
 ---
 
+## Scoped IP Identity & Routing Domains
+
+To support modern segmented networks and multi-tenant telemetry without false-positive node collisions:
+
+- **Scoped Identity Format:** `{domain}#{canonical_ip}` (e.g. `corp#10.0.0.5`, `branch#10.0.0.5`).
+- **Domain Assignment:** Every IP belongs to a `(:RoutingDomain)` node via an `[:IN_DOMAIN]` relationship.
+- **Default Domain:** Datasets ingested without an explicit routing domain ID default to `"default"`.
+- **Overlapping RFC 1918 Isolation:** Hosts in separate routing domains sharing identical private IPv4 addresses (such as `10.0.0.1` or `192.168.1.1`) are represented as independent `:IPAddress` nodes with separate topologies, metrics, and alert facts.
+- **Domain-Aware Alert Fact Keys:** Hashing in `compute_alert_fact_key(alert, domain_id)` isolates alert facts across domains while preserving byte-identical digests for the `"default"` domain:
+  ```python
+  canonical_payload = {
+      "src_ip": canonicalize_ip(alert.src_ip),
+      "dst_ip": canonicalize_ip(alert.dst_ip),
+      "sid": alert.sid,
+      "gid": alert.gid,
+      "rev": alert.rev,
+      "message": alert.message,
+      "priority": alert.priority,
+      "protocol": alert.protocol,
+      "src_port": alert.src_port,
+      "dst_port": alert.dst_port,
+  }
+  if norm_domain != "default":
+      canonical_payload["routing_domain_id"] = norm_domain
+  ```
+
+---
+
 ## Neo4j Graph Model
 
 ### Graph Schema
 
 ```
-                  (:Layer2Identifier)
-                 {identifier: str (UQ)}
-                           ▲
-                           │ [:OBSERVED_WITH]
-                           │
-     (src:IPAddress) ──────────────[:COMMUNICATED_TO]─────────────▶ (dst:IPAddress)
-    {address: str (UQ)}   {flow_key: str,                         {address: str (UQ)}
-           │               protocol: str,                                  ▲
-           │               src_port: int | None,                           │
-           │               dst_port: int | None,                           │
-           │               observed_packet_count: int | None,              │
-           │               observed_bytes: int | None,                     │
-           │               first_seen: float | None,                       │
-           │               last_seen: float | None,                        │
-           │               observed_window_seconds: float | None}          │
-           │                                                               │
-           │ [:SOURCE_OF]                                                  │
-           ▼                                                               │
-      (:AlertFact) ──────────────────────────────────[:TARGETS]────────────┘
-     {fact_key: str (UQ),
-      sid: int | None,
-      gid: int | None,
-      rev: int | None,
-      message: str | None,
-      priority: int | None,
-      protocol: str | None,
-      src_port: int | None,
-      dst_port: int | None}
+                                 (:RoutingDomain)
+                              {domain_id: str (UQ)}
+                                    ▲       ▲
+                                    │       │ [:IN_DOMAIN]
+                       [:IN_DOMAIN] │       │
+                                    │       │
+                   (:Layer2Identifier)      │
+                  {identifier: str (UQ)}    │
+                            ▲               │
+                            │ [:OBSERVED_WITH]
+                            │               │
+      (src:IPAddress) ──────────────[:COMMUNICATED_TO]─────────────▶ (dst:IPAddress)
+    {scoped_id: str (UQ), {flow_key: str,                        {scoped_id: str (UQ),
+     address: str (IDX),   protocol: str,                         address: str (IDX),
+     routing_domain_id}    src_port: int | None,                  routing_domain_id}
+            │              dst_port: int | None,                           ▲
+            │              observed_packet_count: int | None,              │
+            │              observed_bytes: int | None,                     │
+            │              first_seen: float | None,                       │
+            │              last_seen: float | None,                        │
+            │              observed_window_seconds: float | None}          │
+            │                                                              │
+            │ [:SOURCE_OF]                                                 │
+            ▼                                                              │
+       (:AlertFact) ──────────────────────────────────[:TARGETS]───────────┘
+      {fact_key: str (UQ),
+       routing_domain_id: str,
+       sid: int | None,
+       gid: int | None,
+       rev: int | None,
+       message: str | None,
+       priority: int | None,
+       protocol: str | None,
+       src_port: int | None,
+       dst_port: int | None}
 ```
 
 ```
@@ -106,11 +141,13 @@ Layer 2 Frame Topology:
 ```
 
 ### Node Entities
-- **`:IPAddress`**: Observed IPv4 or canonicalized IPv6 endpoint. Unique constraint on `address`.
+- **`:RoutingDomain`**: Logical routing context or network segment domain. Unique constraint on `domain_id`.
+- **`:IPAddress`**: Scoped IPv4 or canonicalized IPv6 endpoint. Unique constraint on `scoped_id`. Non-unique index on `address`.
 - **`:Layer2Identifier`**: Observed Layer 2 hardware MAC address or resolved identifier. Unique constraint on `identifier`.
-- **`:AlertFact`**: Unique normalized alert fact binding source, target, and security rule metadata. Unique constraint on `fact_key`.
+- **`:AlertFact`**: Unique normalized alert fact binding source, target, and security rule metadata within a routing domain. Unique constraint on `fact_key`.
 
 ### Relationship Entities
+- **`(:IPAddress)-[:IN_DOMAIN]->(:RoutingDomain)`**: Logical membership connecting an IP address to its routing domain.
 - **`(:IPAddress)-[:COMMUNICATED_TO]->(:IPAddress)`**: Directional Layer 3 communication aggregate. Contains `flow_key`, `protocol`, transport ports, and volume metrics when ingested from enriched data.
 - **`(:Layer2Identifier)-[:L2_COMMUNICATED_TO {protocol}]->(:Layer2Identifier)`**: Directional Layer 2 frame communication topology.
 - **`(:IPAddress)-[:OBSERVED_WITH]->(:Layer2Identifier)`**: Observed Layer 2 / Layer 3 association in captured traffic.

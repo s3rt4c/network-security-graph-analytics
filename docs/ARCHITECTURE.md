@@ -24,6 +24,8 @@ A. CLI Ingestion (python -m src.main)
                             ▼
                 src/graph/repository.py
      - Batched UNWIND write persistence (session.execute_write)
+     - Scoped IP & RoutingDomain assignment
+     - Domain-isolated AlertFact hashing
 
 B. Browser Data Import (React UI -> POST /api/v1/import/validate -> POST /api/v1/import)
    Browser Upload (TSV / JSON) ──▶ src/services/import_service.py (Stateless validation & staging)
@@ -31,12 +33,15 @@ B. Browser Data Import (React UI -> POST /api/v1/import/validate -> POST /api/v1
                                                ▼
                                  src/graph/repository.py
      - Atomic single active workspace replacement & rollback (replace_workspace_data)
+     - Recreates default RoutingDomain
                             │
                             ▼
                    Neo4j Graph Database
        ┌─────────────────────────────────────────┐
+       │  (:RoutingDomain)                       │
        │  (:IPAddress)  (:Layer2Identifier)      │
        │  (:AlertFact)                           │
+       │  [:IN_DOMAIN]                           │
        │  [:COMMUNICATED_TO]                     │
        │  [:L2_COMMUNICATED_TO]                  │
        │  [:OBSERVED_WITH]                       │
@@ -46,6 +51,7 @@ B. Browser Data Import (React UI -> POST /api/v1/import/validate -> POST /api/v1
                             │ session.execute_read
                             │
                 src/graph/read_repository.py
+     - Scoped IP resolution & AmbiguousEndpointError
                             ▲
                             │ dependency injection
                             │
@@ -82,23 +88,58 @@ frontend/src/
 
 ## Component Breakdown
 
-### 1. Ingestion Pipeline (`src/ingestion/`)
+### 1. Ingestion Pipeline & Identity Primitives (`src/ingestion/`)
 - **`traffic_parser.py`**: Dual-mode parser supporting basic 7-column TSVs and enriched 14-column tshark TSVs. Performs IP canonicalization (RFC 5952), port validation, packet count and wire frame byte aggregation, timestamp interval tracking, and deterministic SHA-256 `flow_key` calculation.
-- **`alert_parser.py`**: Parses Snort/IDS JSON alert arrays, validates required source and destination IP endpoints, normalizes and validates optional numeric rule metadata (signature IDs, generator IDs, revisions, numeric priorities), normalizes protocols, and creates immutable `AlertRecord` instances with bounded diagnostic telemetry. (Canonical IP transformation and deterministic SHA-256 `fact_key` computation are performed by the persistence layer in `src/graph/repository.py`).
+- **`alert_parser.py`**: Parses Snort/IDS JSON alert arrays, validates required source and destination IP endpoints, normalizes and validates optional numeric rule metadata (signature IDs, generator IDs, revisions, numeric priorities), normalizes protocols, and creates immutable `AlertRecord` instances with bounded diagnostic telemetry.
+- **`community_id.py`**: Implementation of the Core Community ID specification (Community ID v1). Generates standard 5-tuple flow hashes compatible with Zeek, Suricata, and network monitoring tools (`1:...`).
+- **`v2_models.py`**: Canonical V2 identity primitives:
+  - `scoped_ip_id(domain, address)`: Format `{domain}#{canonical_ip}` enabling support for overlapping RFC 1918 private subnets across distinct routing domains.
+  - `alert_definition_id(...)`: Stable rule signature identity distinguishing known and unknown generator IDs (`suricata:snort:1:100` vs `suricata:snort:none:100`).
+  - `telemetry_event_id(...)`: Unique event identifier for individual packet/flow telemetry events.
 - **`models.py`**: Immutable domain dataclasses (`TrafficRecord`, `AlertRecord`, `IngestionSummary`, `L2Pair`).
 
 ### 2. Graph Persistence Layer (`src/graph/`)
-- **`schema.py`**: Declares and ensures Neo4j 5.x uniqueness constraints (`IPAddress.address`, `Layer2Identifier.identifier`, `AlertFact.fact_key`) and RANGE indexes (`AlertFact.priority`, `AlertFact.sid`).
-- **`repository.py`**: Executes batched Cypher writes using parameterized `UNWIND` blocks inside managed write transactions (`session.execute_write`). Contains `replace_workspace_data` for atomic workspace clearing and re-ingestion with rollback protection.
+- **`schema.py`**: Declares and ensures Neo4j 5.x uniqueness constraints and indexes:
+  - `routing_domain_unique`: UNIQUE `RoutingDomain.domain_id`
+  - `ip_scoped_unique`: UNIQUE `IPAddress.scoped_id`
+  - `layer2_identifier_unique`: UNIQUE `Layer2Identifier.identifier`
+  - `alert_fact_unique`: UNIQUE `AlertFact.fact_key`
+  - `ip_address_index`: RANGE INDEX on `IPAddress.address`
+  - `alert_fact_priority_index`: RANGE INDEX on `AlertFact.priority`
+  - `alert_fact_sid_index`: RANGE INDEX on `AlertFact.sid`
+  - **Preflight Safety**: `ensure_schema(driver)` refuses and raises `MigrationRequiredError` if unmigrated legacy nodes exist (`scoped_id IS NULL`), preventing premature removal of the legacy constraint.
+  - `migrate_ip_identity_to_scoped()`: Automated preflight migration backfilling legacy IP nodes to the `default` routing domain and backfilling historical `AlertFact` nodes.
+- **`repository.py`**: Executes batched Cypher writes using parameterized `UNWIND` blocks inside managed write transactions (`session.execute_write`).
+  - Merges `(:RoutingDomain {domain_id: $domain})`.
+  - Merges `(:IPAddress {scoped_id: $scoped_id})` and links with `[:IN_DOMAIN]` to `(:RoutingDomain)`.
+  - **Domain-Isolated Alert Facts**: Generates domain-aware `fact_key` hashes via `compute_alert_fact_key(alert, domain_id)`, preventing cross-domain alert collisions.
+  - Contains `replace_workspace_data` for atomic workspace clearing and re-ingestion with rollback protection, recreating the default routing domain.
 
 ### 3. Read Query Layer (`src/graph/read_repository.py`)
 - Executes optimized Cypher read queries using managed read transactions (`session.execute_read`).
+- **Endpoint Resolution & Ambiguity Safety**:
+  - Implements `_resolve_endpoint(address, domain=None, scoped_id=None)`:
+    - If `scoped_id` is supplied, matches exact scoped identity.
+    - If `domain` and `address` are supplied, resolves deterministically via `scoped_ip_id(domain, address)`.
+    - If only `address` is supplied and exactly one IP node exists across all domains, returns it seamlessly (preserving 100% single-domain backwards compatibility).
+    - If only `address` is supplied and multiple IP nodes exist with that address across different routing domains, raises `AmbiguousEndpointError`.
 - Provides aggregated analytics summaries, paginated endpoint volume rankings, filtered communication queries, bounded graph neighborhood traversals, and directional shortest-path computations.
 
 ### 4. REST API Backend (`src/api/`)
 - Built with **FastAPI** and **Pydantic v2**.
 - Structured into modular routers: `health.py`, `import_data.py`, `network.py`, `alerts.py`, `correlations.py`, and `graph.py`.
 - Employs lifespan events for database connectivity lifecycle and FastAPI dependency injection for repository access.
+- Global exception handling maps `AmbiguousEndpointError` to machine-readable **HTTP 409 Conflict**:
+  ```json
+  {
+    "detail": {
+      "code": "AMBIGUOUS_ENDPOINT",
+      "message": "Multiple IP endpoints match '10.0.0.5' across domains: 'branch', 'corp'. Specify 'domain' or query by scoped_id.",
+      "address": "10.0.0.5",
+      "matching_domains": ["branch", "corp"]
+    }
+  }
+  ```
 
 ### 5. Web Frontend (`frontend/`)
 - Single-page application built with **React 19**, **TypeScript 6.x**, and **Vite 8**.
@@ -124,7 +165,7 @@ neo4j_project/
 │   ├── TRAFFIC_MODEL.md           # Traffic formats, flow aggregation & graph schema
 │   ├── API.md                     # REST API endpoints & query behavior
 │   ├── IMPORT_SECURITY.md         # Browser import model & security boundaries
-│   ├── MIGRATION.md               # v1.1 -> v1.2 graph migration guidance
+│   ├── MIGRATION.md               # v1.1 -> v1.2 & V2 graph migration guidance
 │   └── images/                    # UI visuals and dashboard screenshots
 ├── frontend/                      # React 19 + TypeScript + Cytoscape.js SPA
 │   ├── src/
@@ -137,22 +178,31 @@ neo4j_project/
 │   └── vite.config.ts
 ├── src/
 │   ├── config.py                  # Environment-based configuration with lazy loading
-│   ├── main.py                    # Application CLI entry point
-│   ├── api/                       # FastAPI REST API backend (v1.2.0)
+│   ├── main.py                    # Application CLI entry point (--migrate support)
+│   ├── api/                       # FastAPI REST API backend
+│   │   ├── app.py                 # FastAPI application factory and error handlers
+│   │   ├── models.py              # Pydantic v2 API response models
+│   │   └── routes/                # Modular route endpoints
 │   ├── services/                  # Business logic services (import validation & staging)
 │   ├── graph/                     # Graph persistence, schema & read repositories
-│   └── ingestion/                 # Dual-mode parsers & domain dataclasses
-├── tests/
-│   ├── conftest.py                # Pytest fixtures and mock factories
-│   ├── test_alert_parser.py       # Alert parsing tests
-│   ├── test_api_*.py              # API endpoint unit tests
-│   ├── test_api_live_neo4j.py     # Live API integration tests
-│   ├── test_graph_*.py            # Graph schema and repository unit tests
-│   ├── test_neo4j_atomic_replace.py # Atomic replacement & rollback integration tests
-│   ├── test_neo4j_integration.py  # Live Neo4j schema & query tests
-│   └── test_traffic_parser.py     # Traffic parser dual-mode unit tests
-├── compose.yaml                   # Disposable Neo4j 5 test container
-├── pytest.ini
-├── requirements.txt               # Python dependencies
-└── README.md
+│   │   ├── schema.py              # V2 schema constraints, indexes & safe migration
+│   │   ├── repository.py          # Neo4j write repository & atomic workspace replacement
+│   │   └── read_repository.py     # Neo4j read repository & ambiguity-safe queries
+│   └── ingestion/                 # Parsers, V2 identity models & Community ID
+│       ├── community_id.py        # Core Community ID hash implementation
+│       ├── v2_models.py           # Scoped IP, alert definition, and telemetry event IDs
+│       ├── models.py              # TrafficRecord, AlertRecord, L2Pair domain models
+│       ├── traffic_parser.py      # Dual-mode traffic parser
+│       └── alert_parser.py        # IDS alert parser
+└── tests/
+    ├── conftest.py                # Pytest fixtures and mock factories
+    ├── test_alert_parser.py       # Alert parsing tests
+    ├── test_api_*.py              # API endpoint unit tests
+    ├── test_api_live_neo4j.py     # Live API integration tests
+    ├── test_community_id.py       # Community ID adapter unit tests
+    ├── test_graph_*.py            # Graph schema, repository, and migration unit tests
+    ├── test_neo4j_integration.py  # Live Neo4j integration tests
+    ├── test_read_ambiguity.py     # Ambiguity handling and 409 Conflict tests
+    ├── test_traffic_parser.py     # Traffic TSV parsing unit tests
+    └── test_v2_identities.py      # V2 identity primitives unit tests
 ```

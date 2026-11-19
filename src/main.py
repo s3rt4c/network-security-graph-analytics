@@ -2,12 +2,12 @@
 Network Traffic Analysis — Main Application Orchestrator
 
 Processes network traffic data (tshark TSV export) and IDS/Snort alert data
-(JSON), then loads the results into a Neo4j graph database using the Phase 3
-normalized graph schema (IPAddress, Layer2Identifier, AlertFact).
+(JSON), then loads the results into a Neo4j graph database using the V2
+scoped graph schema (RoutingDomain, IPAddress, Layer2Identifier, AlertFact).
 
 Originally developed during a cybersecurity internship (September 2024).
 Modernized with a pandas-based ingestion pipeline, batched UNWIND persistence,
-and idempotent graph schema management.
+scoped IP identity support, and idempotent graph schema management.
 
 SECURITY NOTE:
     Historical commits in this repository contain hardcoded credentials.
@@ -31,6 +31,8 @@ from src.ingestion import (
 )
 from src.graph import (
     ensure_schema,
+    migrate_ip_identity_to_scoped,
+    MigrationRequiredError,
     Neo4jRepository,
 )
 
@@ -57,6 +59,23 @@ def main():
     driver = None
 
     try:
+        # --- Standalone Migration CLI Support ---
+        if "--migrate" in sys.argv:
+            logger.info("Explicit --migrate flag detected. Executing V1 to V2 IP identity migration...")
+            neo4j_cfg = get_neo4j_config()
+            driver = GraphDatabase.driver(
+                neo4j_cfg["uri"],
+                auth=(neo4j_cfg["username"], neo4j_cfg["password"]),
+            )
+            driver.verify_connectivity()
+            stats = migrate_ip_identity_to_scoped(driver)
+            logger.info(
+                "Migration complete: %d legacy IP nodes migrated to default domain (total=%d).",
+                stats["migrated_ips"],
+                stats["total_ips"],
+            )
+            return
+
         # --- 1. Ingestion: Retrieve Ingestion Configuration & Parse Data ---
         ingestion_cfg = get_ingestion_config()
         traffic_records, traffic_summary = parse_traffic_file(ingestion_cfg["traffic_csv_path"])
@@ -86,13 +105,25 @@ def main():
         driver.verify_connectivity()
         logger.info("Neo4j connection established.")
 
-        # --- 3. Apply Schema Constraints & Indexes ---
-        ensure_schema(driver)
+        # --- 3. Apply Schema Constraints & Indexes (Safe Migration Check) ---
+        try:
+            ensure_schema(driver)
+        except MigrationRequiredError as exc:
+            logger.warning(
+                "Legacy V1 database detected (%d unmigrated IP nodes). Executing controlled migration before writes...",
+                exc.unmigrated_count,
+            )
+            mig_stats = migrate_ip_identity_to_scoped(driver)
+            logger.info(
+                "Migration complete: %d legacy IP nodes migrated to default domain (total=%d).",
+                mig_stats["migrated_ips"],
+                mig_stats["total_ips"],
+            )
 
         # --- 4. Persist to Neo4j via Repository ---
         repo = Neo4jRepository(driver)
-        persisted_traffic = repo.write_traffic_records(traffic_records)
-        persisted_alerts = repo.write_alert_records(alert_records)
+        persisted_traffic = repo.write_traffic_records(traffic_records, domain_id="default")
+        persisted_alerts = repo.write_alert_records(alert_records, domain_id="default")
 
         logger.info("=" * 60)
         logger.info(
