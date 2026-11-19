@@ -46,6 +46,7 @@ def live_driver():
         driver.close()
 
 
+@pytest.mark.integration
 def test_live_traffic_only_replacement(live_driver):
     """replace_workspace_data with traffic-only removes prior alerts and populates traffic graph with metrics."""
     ensure_schema(live_driver)
@@ -119,7 +120,18 @@ def test_live_traffic_only_replacement(live_driver):
         assert rel["sp"] == 50000
         assert rel["dp"] == 443
 
+        # Verify default RoutingDomain and IN_DOMAIN links were recreated atomically
+        domain_links = session.run(
+            "MATCH (ip:IPAddress)-[:IN_DOMAIN]->(rd:RoutingDomain {domain_id: 'default'}) "
+            "WHERE ip.scoped_id IN ['default#198.51.100.10', 'default#198.51.100.20', 'default#198.51.100.30'] "
+            "RETURN count(ip) AS c, rd.name AS name"
+        ).single()
+        assert domain_links is not None
+        assert domain_links["c"] == 3
+        assert domain_links["name"] == "Default Routing Domain"
 
+
+@pytest.mark.integration
 def test_live_alerts_only_replacement(live_driver):
     """replace_workspace_data with alerts-only removes prior flows and creates AlertFacts with IP context."""
     ensure_schema(live_driver)
@@ -146,6 +158,7 @@ def test_live_alerts_only_replacement(live_driver):
     assert ip_detail["outbound_flows"] == 0  # No traffic flows
 
 
+@pytest.mark.integration
 def test_live_combined_replacement(live_driver):
     """replace_workspace_data with combined data creates topology, alert facts, and correlations."""
     ensure_schema(live_driver)
@@ -184,6 +197,7 @@ def test_live_combined_replacement(live_driver):
     assert corrs_items[0]["target_ip"] == "198.51.100.80"
 
 
+@pytest.mark.integration
 def test_live_transaction_rollback_preserves_previous_workspace(live_driver, monkeypatch):
     """Calling replace_workspace_data with a mid-transaction write failure rolls back the scoped deletion."""
     ensure_schema(live_driver)
@@ -306,3 +320,9 @@ def test_live_transaction_rollback_preserves_previous_workspace(live_driver, mon
         assert rel_post is not None
         assert rel_post["pkts"] == 20
         assert rel_post["bytes"] == 5000
+
+        rd_post = session.run(
+            "MATCH (rd:RoutingDomain {domain_id: 'default'}) RETURN count(rd) AS c"
+        ).single()
+        assert rd_post is not None
+        assert rd_post["c"] == 1
