@@ -72,7 +72,7 @@ For in-memory or piped line iterables, use `iter_zeek_conn_lines(lines, sensor_i
 | Zeek Field | Normalized Field | Semantics & Invalid Handling |
 |---|---|---|
 | `id.orig_p`, `id.resp_p` | `src_port`, `dst_port` | Integer `0..65535` (or ICMP type/code). Absent -> `None`. Malformed/out-of-range skips the record to protect 5-tuple identity integrity. |
-| `duration` | `duration` (`Decimal \| None`) | Non-negative `Decimal` seconds. Derives `end_epoch` / `end_ts` when valid; invalid emits `invalid_duration` warning and yields `None`. |
+| `duration` | `duration` (`Decimal \| None`) | Non-negative `Decimal` seconds representing the time interval between the first and last observed packet per Zeek `Conn::Info`. Derives `end_epoch` / `end_ts` (`start_epoch + duration`) when valid; invalid emits `invalid_duration` warning and yields `None`. |
 | `orig_bytes`, `resp_bytes` | `orig_bytes`, `resp_bytes` | Directional payload bytes (TCP sequence-number estimates / protocol payload). Not interchangeable with IP bytes. |
 | `orig_ip_bytes`, `resp_ip_bytes` | `orig_ip_bytes`, `resp_ip_bytes` | Directional IP-level byte counts from IP headers. |
 | `orig_pkts`, `resp_pkts` | `orig_pkts`, `resp_pkts` | Directional originator and responder packet counts. |
@@ -108,12 +108,14 @@ All V2 identities delegate strictly to existing primitives in `src/ingestion/v2_
 
 ---
 
-## 6. Timestamp Precision & Directional Metric Semantics
+## 6. Timestamp Precision, Warning Scalability & Directional Metric Semantics
 
-- JSON floating-point numbers are parsed with `json.loads(..., parse_float=Decimal)` so sub-microsecond / nanosecond timestamps (e.g., `1725148800.123456789`) retain full precision for both `start_epoch` and `observation_id` hashing without IEEE 754 float64 truncation.
-- `end_epoch` and `end_ts` are derived strictly as `start_epoch + duration` (using exact `Decimal` arithmetic) **only** when `duration` is present and valid; absent or invalid `duration` leaves `end_epoch = None` and `end_ts = None`.
-- Observed timestamps are kept completely separate from processing/import wall-clock time.
-- Directional metrics strictly separate `orig_bytes`/`resp_bytes` (payload-level) from `orig_ip_bytes`/`resp_ip_bytes` (IP-level) and `orig_pkts`/`resp_pkts`. Missing counters remain `None` rather than inventing `0`.
+- **Numeric JSON timestamps:** Parsed with `json.loads(..., parse_float=Decimal)` so sub-microsecond / nanosecond timestamps (e.g., `1725148800.123456789`) retain full precision for both `start_epoch` and `observation_id` hashing without IEEE 754 float64 truncation. Equivalent numeric representations (e.g., `1725148800.1` and `1725148800.100`) normalize to the same canonical decimal string (`"1725148800.1"`).
+- **Timezone-aware ISO 8601 timestamps:** Consistent with the Phase 1 `canonicalize_event_timestamp()` contract, ISO 8601 string timestamps retain their exact trimmed source representation in `start_ts` and `observation_id` without rewriting timezone offsets. Equivalent instants written with different offsets (e.g., `2024-09-01T12:00:00Z` vs `2024-09-01T15:00:00+03:00`) both compute the exact same numeric `start_epoch` (`Decimal("1725192000")`) for temporal ordering and duration arithmetic, while preserving source-representation-specific identity in `start_ts` and `observation_id`.
+- **Derived `end_epoch` / `end_ts` semantics:** Derived strictly as `start_epoch + duration` (using exact `Decimal` arithmetic) **only** when `duration` is present and valid; absent or invalid `duration` leaves `end_epoch = None` and `end_ts = None`. Per Zeek `Conn::Info` semantics, `duration` is the elapsed time between the first and last observed packet — therefore `end_epoch` / `end_ts` represent a derived last-observed-packet timestamp and **not** a confirmed TCP session termination timestamp (connections may time out, reset, or be truncated mid-capture).
+- **Observed vs import time:** Observed timestamps are kept completely separate from processing/import wall-clock time.
+- **Directional metrics:** Strictly separate `orig_bytes`/`resp_bytes` (payload-level) from `orig_ip_bytes`/`resp_ip_bytes` (IP-level) and `orig_pkts`/`resp_pkts`. Missing counters remain `None` rather than inventing `0`.
+- **Bounded warning logging:** On large logs with many malformed lines, per-stream `logger.warning` output is capped at `MAX_LOGGED_WARNINGS` (`10`) individual entries plus a single suppression notice, and `sample_errors` is capped at `MAX_SAMPLE_ERRORS` (`10`), while `IngestionSummary.warning_counts` continues recording exact totals for every warning category.
 
 ---
 

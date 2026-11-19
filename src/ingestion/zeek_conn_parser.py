@@ -33,6 +33,7 @@ from src.ingestion.v2_models import (
 logger = logging.getLogger(__name__)
 
 MAX_SAMPLE_ERRORS = 10
+MAX_LOGGED_WARNINGS = MAX_SAMPLE_ERRORS
 
 # Supported transport protocols for Community ID tuple computation.
 _SUPPORTED_TRANSPORT_PROTOS = frozenset({"TCP", "UDP", "ICMP", "ICMP6", "ICMPV6", "SCTP"})
@@ -301,6 +302,8 @@ class ZeekConnStream:
         self._skipped_records = 0
         self._warning_counts: Dict[str, int] = {}
         self._sample_errors: List[str] = []
+        self._logged_warnings = 0
+        self._warning_log_suppressed = False
         self._closed = False
 
     @property
@@ -332,7 +335,16 @@ class ZeekConnStream:
         self._warning_counts[reason] = self._warning_counts.get(reason, 0) + 1
         if len(self._sample_errors) < MAX_SAMPLE_ERRORS:
             self._sample_errors.append(f"{reason}: {detail}")
-        logger.warning("Zeek conn parse warning [%s]: %s", reason, detail)
+        if self._logged_warnings < MAX_LOGGED_WARNINGS:
+            self._logged_warnings += 1
+            logger.warning("Zeek conn parse warning [%s]: %s", reason, detail)
+        elif not self._warning_log_suppressed:
+            self._warning_log_suppressed = True
+            logger.warning(
+                "Zeek conn parse warning limit (%d) reached; suppressing further per-record warning logs "
+                "(exact totals remain tracked in IngestionSummary.warning_counts)",
+                MAX_LOGGED_WARNINGS,
+            )
 
     def _parse_entry(self, entry: Dict[str, Any], line_no: int) -> Optional[ZeekConnectionObservation]:
         # 1. Required timestamp ('ts') with lossless precision
@@ -429,7 +441,9 @@ class ZeekConnStream:
             )
             return None
 
-        # 6. Optional duration and derived end time (never fabricated if duration absent or invalid)
+        # 6. Optional duration and derived last-observed-packet timestamp (start_epoch + duration).
+        # Per Zeek Conn::Info semantics, duration is the elapsed time between the first and last
+        # observed packet (not a confirmed TCP session termination time). Never fabricated if absent/invalid.
         duration: Optional[Decimal] = None
         end_epoch: Optional[Decimal] = None
         end_ts: Optional[str] = None

@@ -23,9 +23,11 @@ unsupported protocols, malformed ports, invalid metrics, and strict config error
 
 from decimal import Decimal
 import json
+import logging
 from pathlib import Path
 import pytest
 
+import src.ingestion as ingestion_pkg
 from src.ingestion.community_id import compute_community_id
 from src.ingestion.v2_models import (
     ZeekConnectionObservation,
@@ -34,6 +36,8 @@ from src.ingestion.v2_models import (
     scoped_ip_id,
 )
 from src.ingestion.zeek_conn_parser import (
+    MAX_LOGGED_WARNINGS,
+    MAX_SAMPLE_ERRORS,
     iter_zeek_conn_lines,
     parse_zeek_conn_file,
     stream_zeek_conn_file,
@@ -446,3 +450,86 @@ def test_zeek_connection_observation_is_frozen():
     records, _ = parse_zeek_conn_file(OVERLAPPING_RFC1918_FIXTURE, sensor_id="sensor-1")
     with pytest.raises(Exception):
         records[0].zeek_uid = "mutated"  # type: ignore[misc]
+
+
+def test_timezone_aware_iso8601_preserves_source_representation_and_epoch_equivalence():
+    """Verify equivalent timezone-aware ISO instants share start_epoch while preserving Phase 1 string identity."""
+    lines = [
+        json.dumps({
+            "ts": "2024-09-01T12:00:00Z",
+            "uid": "CIsoTz00000000001",
+            "id.orig_h": "192.0.2.10",
+            "id.orig_p": 50000,
+            "id.resp_h": "192.0.2.20",
+            "id.resp_p": 443,
+            "proto": "tcp",
+        }),
+        json.dumps({
+            "ts": "2024-09-01T15:00:00+03:00",
+            "uid": "CIsoTz00000000001",
+            "id.orig_h": "192.0.2.10",
+            "id.orig_p": 50000,
+            "id.resp_h": "192.0.2.20",
+            "id.resp_p": 443,
+            "proto": "tcp",
+        }),
+    ]
+    records = list(iter_zeek_conn_lines(lines, sensor_id="tap-tz"))
+    assert len(records) == 2
+    utc_rec, offset_rec = records
+
+    # Both compute the exact same numeric UTC epoch
+    assert utc_rec.start_epoch == Decimal("1725192000")
+    assert offset_rec.start_epoch == Decimal("1725192000")
+
+    # Phase 1 canonicalize_event_timestamp() contract intentionally preserves trimmed ISO strings as-is
+    assert utc_rec.start_ts == "2024-09-01T12:00:00Z"
+    assert offset_rec.start_ts == "2024-09-01T15:00:00+03:00"
+    assert utc_rec.observation_id == compute_observation_id(
+        source_type="zeek",
+        sensor_id="tap-tz",
+        source_record_id="CIsoTz00000000001",
+        timestamp="2024-09-01T12:00:00Z",
+        flow_key=utc_rec.flow_key,
+    )
+    assert offset_rec.observation_id == compute_observation_id(
+        source_type="zeek",
+        sensor_id="tap-tz",
+        source_record_id="CIsoTz00000000001",
+        timestamp="2024-09-01T15:00:00+03:00",
+        flow_key=offset_rec.flow_key,
+    )
+    assert utc_rec.observation_id != offset_rec.observation_id
+
+
+def test_warning_logging_is_bounded_while_warning_counts_remain_exact(caplog):
+    """Verify high-volume malformed logs bound logger warnings and sample_errors while keeping exact counts."""
+    malformed_count = 50
+    lines = ["{not-valid-json" for _ in range(malformed_count)]
+
+    with caplog.at_level(logging.WARNING, logger="src.ingestion.zeek_conn_parser"):
+        stream = iter_zeek_conn_lines(lines, sensor_id="sensor-noisy")
+        records = list(stream)
+        summary = stream.summary
+
+    assert records == []
+    assert summary.total_raw_records == malformed_count
+    assert summary.valid_records == 0
+    assert summary.skipped_records == malformed_count
+    assert summary.warning_counts == {"malformed_json": malformed_count}
+    assert len(summary.sample_errors) == MAX_SAMPLE_ERRORS
+
+    # Bounded to MAX_LOGGED_WARNINGS per-record warnings + 1 suppression notice
+    assert len(caplog.records) == MAX_LOGGED_WARNINGS + 1
+    assert "suppressing further per-record warning logs" in caplog.records[-1].message
+
+
+def test_v1_ingestion_package_surface_remains_isolated():
+    """Verify src.ingestion.__all__ preserves V1 exports without eagerly exporting V2 Zeek parser symbols."""
+    assert set(ingestion_pkg.__all__) == {
+        "TrafficRecord",
+        "AlertRecord",
+        "IngestionSummary",
+        "parse_traffic_file",
+        "parse_alert_file",
+    }
