@@ -3,7 +3,13 @@ Unit tests for Neo4j graph schema module.
 """
 
 from unittest.mock import MagicMock
-from src.graph.schema import ensure_schema, SCHEMA_STATEMENTS, LEGACY_DROP_STATEMENTS
+import pytest
+from src.graph.schema import (
+    ensure_schema,
+    MigrationRequiredError,
+    SCHEMA_STATEMENTS,
+    LEGACY_DROP_STATEMENTS,
+)
 
 
 def test_schema_statements_definitions():
@@ -40,23 +46,55 @@ def test_schema_statements_definitions():
     assert "DROP CONSTRAINT ip_address_unique IF EXISTS" in legacy_text
 
 
-def test_ensure_schema_execution():
-    """Verify ensure_schema calls session.run and consume() for each DDL statement."""
+def test_ensure_schema_execution_when_clean():
+    """Verify ensure_schema runs preflight check, drops legacy constraint, and applies V2 schema."""
     mock_session = MagicMock()
     mock_driver = MagicMock()
     mock_driver.session.return_value.__enter__.return_value = mock_session
 
-    mock_result = MagicMock()
-    mock_session.run.return_value = mock_result
+    # Preflight check returns 0 unmigrated nodes
+    mock_check_res = MagicMock()
+    mock_check_res.single.return_value = {"unmigrated_count": 0}
+
+    mock_ddl_res = MagicMock()
+
+    def run_side_effect(stmt, **params):
+        if "unmigrated_count" in stmt:
+            return mock_check_res
+        return mock_ddl_res
+
+    mock_session.run.side_effect = run_side_effect
 
     ensure_schema(mock_driver)
 
-    total_expected = len(LEGACY_DROP_STATEMENTS) + len(SCHEMA_STATEMENTS)
+    # 1 preflight check + 1 legacy drop + 7 schema statements = 9 calls
+    total_expected = 1 + len(LEGACY_DROP_STATEMENTS) + len(SCHEMA_STATEMENTS)
     assert mock_session.run.call_count == total_expected
-    assert mock_result.consume.call_count == total_expected
 
     executed_statements = [call.args[0] for call in mock_session.run.call_args_list]
+    assert any("unmigrated_count" in s for s in executed_statements)
     for drop in LEGACY_DROP_STATEMENTS:
         assert drop in executed_statements
     for stmt in SCHEMA_STATEMENTS:
         assert stmt in executed_statements
+
+
+def test_ensure_schema_raises_when_unmigrated_nodes_exist():
+    """Verify ensure_schema refuses and raises MigrationRequiredError if unmigrated nodes exist."""
+    mock_session = MagicMock()
+    mock_driver = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    mock_check_res = MagicMock()
+    mock_check_res.single.return_value = {"unmigrated_count": 5}
+    mock_session.run.return_value = mock_check_res
+
+    with pytest.raises(MigrationRequiredError) as exc_info:
+        ensure_schema(mock_driver)
+
+    assert exc_info.value.unmigrated_count == 5
+    assert "5 legacy V1 IPAddress node(s)" in str(exc_info.value)
+
+    # Must only have called the preflight check, and MUST NOT have called any DROP statements!
+    assert mock_session.run.call_count == 1
+    assert "DROP CONSTRAINT" not in mock_session.run.call_args[0][0]

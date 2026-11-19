@@ -7,10 +7,23 @@ and routing domains.
 """
 
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from src.ingestion.v2_models import scoped_ip_id
 
 logger = logging.getLogger(__name__)
+
+
+class MigrationRequiredError(RuntimeError):
+    """Raised when unmigrated legacy V1 IPAddress nodes are detected during schema verification."""
+
+    def __init__(self, unmigrated_count: int, message: Optional[str] = None):
+        self.unmigrated_count = unmigrated_count
+        super().__init__(
+            message
+            or f"Database contains {unmigrated_count} legacy V1 IPAddress node(s) lacking scoped_id. "
+            "Run migrate_ip_identity_to_scoped(driver) before applying V2 schema or writing records."
+        )
+
 
 # Legacy constraints to drop during schema migration / initialization
 LEGACY_DROP_STATEMENTS: List[str] = [
@@ -51,13 +64,36 @@ SCHEMA_STATEMENTS: List[str] = [
 
 def ensure_schema(driver) -> None:
     """Apply all uniqueness constraints and indexes to the Neo4j database idempotently.
-    
+
+    Preflight check:
+    Verifies that no legacy V1 IPAddress nodes remain unmigrated. If unmigrated nodes
+    exist (scoped_id IS NULL), raises MigrationRequiredError to prevent dropping the
+    legacy uniqueness constraint and avoid creating duplicate logical endpoints.
+
+    If 0 unmigrated nodes exist (fresh database or already migrated V2 database):
     Drops legacy global address uniqueness constraints to allow scoped IP coexistence,
     then applies Neo4j 5.x 'IF NOT EXISTS' constraints and indexes.
     Explicitly consumes transaction results for each statement.
     """
     logger.info("Ensuring Neo4j graph schema constraints and indexes...")
     with driver.session() as session:
+        # Preflight check: refuse to drop legacy constraints if unmigrated nodes exist
+        check_res = session.run(
+            "MATCH (ip:IPAddress) WHERE ip.scoped_id IS NULL RETURN count(ip) AS unmigrated_count"
+        )
+        unmigrated_count = 0
+        if hasattr(check_res, "single"):
+            rec = check_res.single()
+            if rec is not None and isinstance(rec, dict) and "unmigrated_count" in rec:
+                unmigrated_count = int(rec["unmigrated_count"])
+            elif hasattr(rec, "get"):
+                val = rec.get("unmigrated_count")
+                if isinstance(val, (int, float)):
+                    unmigrated_count = int(val)
+
+        if unmigrated_count > 0:
+            raise MigrationRequiredError(unmigrated_count)
+
         for drop_stmt in LEGACY_DROP_STATEMENTS:
             logger.debug("Executing legacy constraint cleanup: %s", drop_stmt)
             res = session.run(drop_stmt)
@@ -69,6 +105,7 @@ def ensure_schema(driver) -> None:
             result = session.run(statement)
             if hasattr(result, "consume"):
                 result.consume()
+
     logger.info("Neo4j graph schema constraints and indexes verified.")
 
 
@@ -78,18 +115,20 @@ def migrate_ip_identity_to_scoped(driver, default_domain: str = "default") -> Di
     1. Preflight validation:
        - Verify existing :IPAddress nodes have valid IP addresses
        - Validate target scoped_ids can be generated without collisions
+       - Aborts immediately before modifying any database state if validation fails
     2. Data backfill in managed write transaction:
        - Merge default :RoutingDomain {domain_id: default_domain, name: 'Default Routing Domain'}
        - Backfill routing_domain_id and scoped_id on :IPAddress nodes
        - Link all endpoints to their corresponding :RoutingDomain via :IN_DOMAIN
-    3. Schema transition:
-       - Drops legacy ip_address_unique constraint
-       - Applies V2 schema constraints (routing_domain_unique, ip_scoped_unique, ip_address_index)
-
-    Fails loudly if any existing IPAddress node cannot be validated or causes collisions.
+       - Backfill historical :AlertFact nodes with routing_domain_id = default_domain
+    3. Post-write verification:
+       - Confirms 0 unmigrated IPAddress nodes remain in the database
+    4. Schema transition:
+       - Safely invokes ensure_schema(driver), which drops the legacy ip_address_unique
+         constraint and applies V2 constraints and indexes.
 
     Returns:
-        Dict with migration summary statistics: total_ips, migrated_ips, default_domain.
+        Dict with migration summary statistics: total_ips, migrated_ips, already_migrated_ips, default_domain.
     """
     logger.info("Starting V1 to V2 IP identity schema migration (default_domain=%s)...", default_domain)
 
@@ -169,11 +208,30 @@ def migrate_ip_identity_to_scoped(driver, default_domain: str = "default") -> Di
             if hasattr(r3, "consume"):
                 r3.consume()
 
+            # 4. Backfill historical AlertFact nodes lacking routing_domain_id
+            r4 = tx.run(
+                "MATCH (fact:AlertFact) "
+                "WHERE fact.routing_domain_id IS NULL "
+                "SET fact.routing_domain_id = $domain_id",
+                domain_id=default_domain,
+            )
+            if hasattr(r4, "consume"):
+                r4.consume()
+
             return len(updates)
 
         migrated_count = session.execute_write(_execute_migration)
 
-    # Schema transition (drop legacy, apply V2 constraints & indexes)
+        # Verification step: ensure no unmigrated IPAddress nodes remain
+        verify_res = session.run("MATCH (ip:IPAddress) WHERE ip.scoped_id IS NULL RETURN count(ip) AS unmigrated")
+        if hasattr(verify_res, "single"):
+            v_rec = verify_res.single()
+            if v_rec and v_rec.get("unmigrated", 0) > 0:
+                raise RuntimeError(
+                    f"Migration post-check failed: {v_rec['unmigrated']} unmigrated IPAddress nodes remain"
+                )
+
+    # Schema transition (safe now because 0 unmigrated IP nodes remain)
     ensure_schema(driver)
 
     logger.info(
@@ -184,5 +242,6 @@ def migrate_ip_identity_to_scoped(driver, default_domain: str = "default") -> Di
     return {
         "total_ips": len(records),
         "migrated_ips": migrated_count,
+        "already_migrated_ips": len(records) - migrated_count,
         "default_domain": default_domain,
     }

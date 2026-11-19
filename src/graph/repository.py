@@ -91,6 +91,7 @@ MERGE (dst)-[:IN_DOMAIN]->(rd)
 
 MERGE (fact:AlertFact {fact_key: row.fact_key})
 ON CREATE SET
+    fact.routing_domain_id = row.routing_domain_id,
     fact.sid = row.sid,
     fact.gid = row.gid,
     fact.rev = row.rev,
@@ -99,6 +100,8 @@ ON CREATE SET
     fact.protocol = row.protocol,
     fact.src_port = row.src_port,
     fact.dst_port = row.dst_port
+ON MATCH SET
+    fact.routing_domain_id = coalesce(fact.routing_domain_id, row.routing_domain_id)
 MERGE (src)-[:SOURCE_OF]->(fact)
 MERGE (fact)-[:TARGETS]->(dst)
 """
@@ -152,12 +155,16 @@ def _traffic_record_to_payload(record: TrafficRecord, domain_id: str = "default"
     }
 
 
-def compute_alert_fact_key(alert: AlertRecord) -> str:
+def compute_alert_fact_key(alert: AlertRecord, domain_id: Optional[str] = None) -> str:
     """Generate a deterministic SHA-256 fact_key for a normalized AlertRecord.
 
     NOTE: fact_key represents a deterministic identity for a unique normalized
     alert fact, NOT an IDS event ID or timestamped instance.
+    When domain_id is specified and non-default, it isolates the fact_key to that
+    specific routing domain to avoid cross-domain alert collisions.
+    For 'default' domain or None, the key matches V1 calculation for backwards compatibility.
     """
+    norm_domain = domain_id.strip().lower() if domain_id and domain_id.strip() else "default"
     canonical_payload = {
         "src_ip": canonicalize_ip(alert.src_ip),
         "dst_ip": canonicalize_ip(alert.dst_ip),
@@ -170,6 +177,8 @@ def compute_alert_fact_key(alert: AlertRecord) -> str:
         "src_port": alert.src_port,
         "dst_port": alert.dst_port,
     }
+    if norm_domain != "default":
+        canonical_payload["routing_domain_id"] = norm_domain
     # Deterministic canonical serialization: sort keys, stable delimiters, UTF-8
     serialized = json.dumps(canonical_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -241,7 +250,7 @@ class Neo4jRepository:
                 "src_scoped_id": scoped_ip_id(norm_domain, a.src_ip),
                 "dst_scoped_id": scoped_ip_id(norm_domain, a.dst_ip),
                 "routing_domain_id": norm_domain,
-                "fact_key": compute_alert_fact_key(a),
+                "fact_key": compute_alert_fact_key(a, domain_id=norm_domain),
                 "sid": a.sid,
                 "gid": a.gid,
                 "rev": a.rev,
@@ -317,7 +326,7 @@ class Neo4jRepository:
                     "src_scoped_id": scoped_ip_id(norm_domain, a.src_ip),
                     "dst_scoped_id": scoped_ip_id(norm_domain, a.dst_ip),
                     "routing_domain_id": norm_domain,
-                    "fact_key": compute_alert_fact_key(a),
+                    "fact_key": compute_alert_fact_key(a, domain_id=norm_domain),
                     "sid": a.sid,
                     "gid": a.gid,
                     "rev": a.rev,

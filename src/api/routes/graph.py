@@ -31,7 +31,12 @@ def get_graph_neighborhood(
     except AmbiguousEndpointError as err:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=str(err),
+            detail={
+                "code": "AMBIGUOUS_ENDPOINT",
+                "message": str(err),
+                "address": err.address,
+                "matching_domains": sorted(err.matching_domains),
+            },
         )
     if result is None:
         raise HTTPException(
@@ -68,7 +73,12 @@ def get_shortest_path(
     except AmbiguousEndpointError as err:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=str(err),
+            detail={
+                "code": "AMBIGUOUS_ENDPOINT",
+                "message": str(err),
+                "address": err.address,
+                "matching_domains": sorted(err.matching_domains),
+            },
         )
 
     err = result.get("error")

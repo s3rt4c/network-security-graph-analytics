@@ -119,9 +119,11 @@ def test_api_get_ip_detail_ambiguous_returns_409(client_with_mock_repo):
 
     response = client.get("/api/v1/network/ips/10.0.0.5")
     assert response.status_code == 409
-    assert "ambiguous" in response.json()["detail"].lower()
-    assert "corp" in response.json()["detail"]
-    assert "branch" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert detail["code"] == "AMBIGUOUS_ENDPOINT"
+    assert detail["address"] == "10.0.0.5"
+    assert "corp" in detail["matching_domains"]
+    assert "branch" in detail["matching_domains"]
 
 
 def test_api_get_ip_detail_domain_disambiguated_returns_200(client_with_mock_repo):
@@ -158,7 +160,9 @@ def test_api_list_ip_peers_ambiguous_returns_409(client_with_mock_repo):
 
     response = client.get("/api/v1/network/ips/10.0.0.5/peers")
     assert response.status_code == 409
-    assert "ambiguous" in response.json()["detail"].lower()
+    detail = response.json()["detail"]
+    assert detail["code"] == "AMBIGUOUS_ENDPOINT"
+    assert detail["address"] == "10.0.0.5"
 
 
 def test_api_list_ip_peers_disambiguated(client_with_mock_repo):
@@ -181,7 +185,9 @@ def test_api_list_ip_layer2_ambiguous_returns_409(client_with_mock_repo):
 
     response = client.get("/api/v1/network/ips/10.0.0.5/layer2")
     assert response.status_code == 409
-    assert "ambiguous" in response.json()["detail"].lower()
+    detail = response.json()["detail"]
+    assert detail["code"] == "AMBIGUOUS_ENDPOINT"
+    assert detail["address"] == "10.0.0.5"
 
 
 def test_api_list_ip_layer2_disambiguated(client_with_mock_repo):
@@ -201,7 +207,9 @@ def test_api_neighborhood_ambiguous_returns_409(client_with_mock_repo):
 
     response = client.get("/api/v1/graph/neighborhood/10.0.0.5")
     assert response.status_code == 409
-    assert "ambiguous" in response.json()["detail"].lower()
+    detail = response.json()["detail"]
+    assert detail["code"] == "AMBIGUOUS_ENDPOINT"
+    assert detail["address"] == "10.0.0.5"
 
 
 def test_api_neighborhood_disambiguated(client_with_mock_repo):
@@ -226,7 +234,9 @@ def test_api_shortest_path_ambiguous_source_returns_409(client_with_mock_repo):
 
     response = client.get("/api/v1/graph/path?source=10.0.0.5&target=10.0.0.6")
     assert response.status_code == 409
-    assert "ambiguous" in response.json()["detail"].lower()
+    detail = response.json()["detail"]
+    assert detail["code"] == "AMBIGUOUS_ENDPOINT"
+    assert detail["address"] == "10.0.0.5"
 
 
 def test_api_shortest_path_disambiguated(client_with_mock_repo):

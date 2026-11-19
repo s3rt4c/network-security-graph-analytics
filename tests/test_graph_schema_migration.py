@@ -174,3 +174,91 @@ def test_traffic_payload_supports_routing_domain():
     assert branch_payload["src_scoped_id"] == "branch#10.0.0.5"
     assert corp_payload["routing_domain_id"] == "corp"
     assert branch_payload["routing_domain_id"] == "branch"
+
+
+# ---------------------------------------------------------------------------
+# Fresh, Legacy, Partial States and Alert Fact Isolation Tests
+# ---------------------------------------------------------------------------
+from src.graph.repository import compute_alert_fact_key
+from src.ingestion.models import AlertRecord
+
+
+def test_migrate_ip_identity_partial_interrupted_state():
+    """Verify migration handles partial state where some nodes are already migrated."""
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    # Node 1 is already migrated, Node 2 is unmigrated
+    mock_nodes = [
+        {"element_id": "4:abc:1", "address": "10.0.0.1", "scoped_id": "default#10.0.0.1", "routing_domain_id": "default"},
+        {"element_id": "4:abc:2", "address": "10.0.0.2", "scoped_id": None, "routing_domain_id": None},
+    ]
+    mock_session.run.return_value = mock_nodes
+
+    def fake_execute_write(work_fn):
+        tx = MagicMock()
+        return work_fn(tx)
+
+    mock_session.execute_write.side_effect = fake_execute_write
+
+    stats = migrate_ip_identity_to_scoped(mock_driver, default_domain="default")
+    assert stats["total_ips"] == 2
+    assert stats["migrated_ips"] == 1
+    assert stats["already_migrated_ips"] == 1
+    assert stats["default_domain"] == "default"
+
+
+def test_domain_aware_alert_fact_key_isolation():
+    """Verify identical alert records produce distinct fact keys in distinct routing domains."""
+    alert = AlertRecord(
+        src_ip="10.0.0.5",
+        dst_ip="10.0.0.6",
+        sid=2001,
+        gid=1,
+        rev=1,
+        message="ET MALWARE Suspicious Activity",
+        priority=1,
+        protocol="TCP",
+        src_port=54321,
+        dst_port=443,
+    )
+
+    default_key = compute_alert_fact_key(alert, domain_id="default")
+    none_key = compute_alert_fact_key(alert, domain_id=None)
+    corp_key = compute_alert_fact_key(alert, domain_id="corp")
+    branch_key = compute_alert_fact_key(alert, domain_id="branch")
+
+    # default and None match V1 calculation for backwards compatibility
+    assert default_key == none_key
+    assert corp_key != default_key
+    assert branch_key != default_key
+    assert corp_key != branch_key
+
+
+def test_historical_alert_facts_backfilled_in_migration():
+    """Verify migration execute_write runs backfill query for un-scoped AlertFact nodes."""
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    mock_nodes = [
+        {"element_id": "4:abc:1", "address": "10.0.0.1", "scoped_id": None, "routing_domain_id": None},
+    ]
+    mock_session.run.return_value = mock_nodes
+
+    tx_runs = []
+    def fake_execute_write(work_fn):
+        tx = MagicMock()
+        tx.run.side_effect = lambda query, **kwargs: tx_runs.append((query, kwargs))
+        return work_fn(tx)
+
+    mock_session.execute_write.side_effect = fake_execute_write
+
+    stats = migrate_ip_identity_to_scoped(mock_driver, default_domain="default")
+    assert stats["migrated_ips"] == 1
+
+    # Check that AlertFact backfill query was executed
+    alert_backfill_runs = [q for q, kw in tx_runs if "MATCH (fact:AlertFact)" in q]
+    assert len(alert_backfill_runs) == 1
+    assert "WHERE fact.routing_domain_id IS NULL" in alert_backfill_runs[0]

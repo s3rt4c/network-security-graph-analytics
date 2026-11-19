@@ -48,7 +48,14 @@ def create_app() -> FastAPI:
         logger.warning("Ambiguous endpoint requested on %s: %s", request.url.path, exc)
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
-            content={"detail": str(exc)},
+            content={
+                "detail": {
+                    "code": "AMBIGUOUS_ENDPOINT",
+                    "message": str(exc),
+                    "address": exc.address,
+                    "matching_domains": sorted(exc.matching_domains),
+                }
+            },
         )
 
     @app.exception_handler(ConnectionError)

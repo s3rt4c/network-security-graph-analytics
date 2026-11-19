@@ -96,7 +96,12 @@ def get_ip_address_detail(
     except AmbiguousEndpointError as err:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=str(err),
+            detail={
+                "code": "AMBIGUOUS_ENDPOINT",
+                "message": str(err),
+                "address": err.address,
+                "matching_domains": sorted(err.matching_domains),
+            },
         )
     if detail is None:
         raise HTTPException(
@@ -129,7 +134,12 @@ def list_ip_peers(
     except AmbiguousEndpointError as err:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=str(err),
+            detail={
+                "code": "AMBIGUOUS_ENDPOINT",
+                "message": str(err),
+                "address": err.address,
+                "matching_domains": sorted(err.matching_domains),
+            },
         )
     if result is None:
         raise HTTPException(
@@ -164,7 +174,12 @@ def list_ip_layer2_associations(
     except AmbiguousEndpointError as err:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=str(err),
+            detail={
+                "code": "AMBIGUOUS_ENDPOINT",
+                "message": str(err),
+                "address": err.address,
+                "matching_domains": sorted(err.matching_domains),
+            },
         )
     if result is None:
         raise HTTPException(

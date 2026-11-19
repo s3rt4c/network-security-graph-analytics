@@ -112,11 +112,17 @@ class Neo4jReadRepository:
         if not rec or rec.get("c") == 0:
             return None, None, None
 
-        matching_domains = rec.get("matching_domains") or []
-        matching_scoped_ids = rec.get("matching_scoped_ids") or []
+        matching_domains = [d for d in (rec.get("matching_domains") or []) if d is not None]
+        matching_scoped_ids = [s for s in (rec.get("matching_scoped_ids") or []) if s is not None]
+        distinct_domains = sorted(set(matching_domains))
 
-        if len(matching_domains) > 1:
-            raise AmbiguousEndpointError(address, matching_domains, matching_scoped_ids)
+        c_val = rec.get("c")
+        if (c_val is not None and c_val > 1) or len(distinct_domains) > 1:
+            raise AmbiguousEndpointError(
+                address=address,
+                matching_domains=distinct_domains or ["default"],
+                matching_scoped_ids=matching_scoped_ids,
+            )
 
         resolved_scoped = matching_scoped_ids[0] if matching_scoped_ids else None
         resolved_domain = matching_domains[0] if matching_domains else None
@@ -973,12 +979,14 @@ class Neo4jReadRepository:
         count_cypher = """
         MATCH (src:IPAddress)-[:SOURCE_OF]->(fact:AlertFact)-[:TARGETS]->(dst:IPAddress),
               (src)-[c:COMMUNICATED_TO]->(dst)
+        WHERE (fact.routing_domain_id IS NULL OR src.routing_domain_id IS NULL OR fact.routing_domain_id = src.routing_domain_id)
         RETURN count(*) AS total
         """
 
         page_cypher = """
         MATCH (src:IPAddress)-[:SOURCE_OF]->(fact:AlertFact)-[:TARGETS]->(dst:IPAddress),
               (src)-[c:COMMUNICATED_TO]->(dst)
+        WHERE (fact.routing_domain_id IS NULL OR src.routing_domain_id IS NULL OR fact.routing_domain_id = src.routing_domain_id)
         RETURN src.address AS source_ip,
                dst.address AS target_ip,
                c.protocol AS traffic_protocol,
