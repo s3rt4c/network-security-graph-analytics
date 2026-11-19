@@ -136,11 +136,11 @@ def compute_v2_flow_key(
         raise ValueError("dst_scoped_id cannot be empty")
 
     if src_port is not None:
-        if not isinstance(src_port, int) or not (0 <= src_port <= 65535):
+        if isinstance(src_port, bool) or not isinstance(src_port, int) or not (0 <= src_port <= 65535):
             raise ValueError(f"Invalid src_port: {src_port}. Must be an integer in 0..65535 or None.")
 
     if dst_port is not None:
-        if not isinstance(dst_port, int) or not (0 <= dst_port <= 65535):
+        if isinstance(dst_port, bool) or not isinstance(dst_port, int) or not (0 <= dst_port <= 65535):
             raise ValueError(f"Invalid dst_port: {dst_port}. Must be an integer in 0..65535 or None.")
 
     clean_src = str(src_scoped_id).strip()
@@ -248,9 +248,9 @@ def alert_definition_id(
         raise ValueError("engine cannot be empty")
     if not ruleset_namespace or not str(ruleset_namespace).strip():
         raise ValueError("ruleset_namespace cannot be empty")
-    if sid is None or sid < 0:
+    if sid is None or isinstance(sid, bool) or not isinstance(sid, int) or sid < 0:
         raise ValueError(f"Invalid signature ID (sid): {sid}")
-    if gid is not None and gid < 0:
+    if gid is not None and (isinstance(gid, bool) or not isinstance(gid, int) or gid < 0):
         raise ValueError(f"Invalid generator ID (gid): {gid}. GID must be non-negative or None.")
 
     norm_engine = engine.strip().lower()

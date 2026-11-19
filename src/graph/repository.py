@@ -241,6 +241,8 @@ class Neo4jRepository:
             return 0
 
         norm_domain = domain_id.strip().lower() if domain_id and domain_id.strip() else "default"
+        if "#" in norm_domain:
+            raise ValueError(f"domain_id cannot contain delimiter '#': '{norm_domain}'")
 
         # Transform to parameter dictionaries with fact_key, canonicalized IPs, and scoped IDs
         payload = [
@@ -312,6 +314,9 @@ class Neo4jRepository:
             Tuple of (traffic_records_persisted_count, alert_facts_persisted_count)
         """
         norm_domain = domain_id.strip().lower() if domain_id and domain_id.strip() else "default"
+        if "#" in norm_domain:
+            raise ValueError(f"domain_id cannot contain delimiter '#': '{norm_domain}'")
+        domain_name = "Default Routing Domain" if norm_domain == "default" else norm_domain
 
         traffic_payload: List[Dict[str, Any]] = []
         if traffic_records:
@@ -352,11 +357,12 @@ class Neo4jRepository:
             del_result = tx.run(CYPHER_SCOPED_CLEANUP)
             del_result.consume()
 
-            # Step 1b: Recreate default RoutingDomain
+            # Step 1b: Recreate target RoutingDomain
             tx.run(
                 "MERGE (rd:RoutingDomain {domain_id: $domain_id}) "
-                "ON CREATE SET rd.name = 'Default Routing Domain'",
+                "ON CREATE SET rd.name = $domain_name",
                 domain_id=norm_domain,
+                domain_name=domain_name,
             ).consume()
 
             # Step 2: Ingest traffic batches if provided

@@ -82,3 +82,24 @@ def validate_canonical_ip(ip_str: str) -> str:
             status_code=422,
             detail=f"Invalid IP address format: '{ip_str}'",
         )
+
+
+def validate_routing_domain(domain: Optional[str]) -> Optional[str]:
+    """Normalize and validate an optional routing domain query parameter.
+
+    Returns None when omitted or whitespace-only, or the trimmed lowercase domain ID.
+
+    Raises:
+        HTTPException (422): If domain contains the reserved '#' scoped-ID delimiter.
+    """
+    if domain is None:
+        return None
+    normalized = domain.strip().lower()
+    if not normalized:
+        return None
+    if "#" in normalized:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid routing domain format (cannot contain '#'): '{domain}'",
+        )
+    return normalized

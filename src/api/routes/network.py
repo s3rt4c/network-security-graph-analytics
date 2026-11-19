@@ -15,7 +15,7 @@ from src.api.models import (
     EndpointAnalyticsResponse,
     PaginatedResponse,
 )
-from src.api.dependencies import get_read_repository, validate_canonical_ip
+from src.api.dependencies import get_read_repository, validate_canonical_ip, validate_routing_domain
 from src.graph.read_repository import Neo4jReadRepository, AmbiguousEndpointError
 
 router = APIRouter(prefix="/api/v1/network", tags=["Network"])
@@ -37,8 +37,10 @@ def get_endpoints_analytics(
     sort_by: Literal[
         "fan_out",
         "fan_in",
-        "observed_packets_sent",
         "observed_bytes_sent",
+        "observed_bytes_received",
+        "observed_packets_sent",
+        "observed_packets_received",
         "first_observed",
         "last_observed",
     ] = Query(default="fan_out", description="Ranking metric for endpoints"),
@@ -66,9 +68,10 @@ def list_ip_addresses(
     repo: Neo4jReadRepository = Depends(get_read_repository),
 ) -> PaginatedResponse[IPAddressResponse]:
     """Retrieve a paginated list of observed IP addresses."""
+    norm_domain = validate_routing_domain(domain)
     items, total = (
-        repo.list_ips(limit=limit, offset=offset, domain=domain)
-        if domain is not None
+        repo.list_ips(limit=limit, offset=offset, domain=norm_domain)
+        if norm_domain is not None
         else repo.list_ips(limit=limit, offset=offset)
     )
     return PaginatedResponse[IPAddressResponse](
@@ -87,10 +90,11 @@ def get_ip_address_detail(
 ) -> IPDetailResponse:
     """Retrieve detailed local graph context, associated Layer 2 identifiers, and flow counts for an IP."""
     canonical_address = validate_canonical_ip(address)
+    norm_domain = validate_routing_domain(domain)
     try:
         detail = (
-            repo.get_ip_detail(canonical_address, domain=domain)
-            if domain is not None
+            repo.get_ip_detail(canonical_address, domain=norm_domain)
+            if norm_domain is not None
             else repo.get_ip_detail(canonical_address)
         )
     except AmbiguousEndpointError as err:
@@ -125,10 +129,11 @@ def list_ip_peers(
 ) -> PaginatedResponse[PeerResponse]:
     """List communicating peers and observed protocols for an IP address."""
     canonical_address = validate_canonical_ip(address)
+    norm_domain = validate_routing_domain(domain)
     try:
         result = (
-            repo.list_ip_peers(canonical_address, direction=direction, limit=limit, offset=offset, domain=domain)
-            if domain is not None
+            repo.list_ip_peers(canonical_address, direction=direction, limit=limit, offset=offset, domain=norm_domain)
+            if norm_domain is not None
             else repo.list_ip_peers(canonical_address, direction=direction, limit=limit, offset=offset)
         )
     except AmbiguousEndpointError as err:
@@ -165,10 +170,11 @@ def list_ip_layer2_associations(
 ) -> PaginatedResponse[Layer2IdentifierResponse]:
     """Retrieve paginated Layer 2 identifiers observed in association with an IP address."""
     canonical_address = validate_canonical_ip(address)
+    norm_domain = validate_routing_domain(domain)
     try:
         result = (
-            repo.list_ip_layer2(canonical_address, limit=limit, offset=offset, domain=domain)
-            if domain is not None
+            repo.list_ip_layer2(canonical_address, limit=limit, offset=offset, domain=norm_domain)
+            if norm_domain is not None
             else repo.list_ip_layer2(canonical_address, limit=limit, offset=offset)
         )
     except AmbiguousEndpointError as err:

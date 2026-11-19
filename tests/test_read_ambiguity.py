@@ -257,3 +257,140 @@ def test_api_shortest_path_disambiguated(client_with_mock_repo):
     mock_repo.get_shortest_path.assert_called_once_with(
         "10.0.0.5", "10.0.0.6", max_hops=5, source_domain="corp", target_domain="corp"
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests: Domain Validation/Normalization, Sort Compatibility,
+# Protocol Normalization, and Cross-Domain Read Isolation
+# ---------------------------------------------------------------------------
+def test_api_domain_validation_rejects_hash_with_422_and_normalizes_case(client_with_mock_repo):
+    """Verify '#' in domain query param returns HTTP 422 (not 500) and mixed-case domain normalizes to lowercase."""
+    client, mock_repo = client_with_mock_repo
+
+    # All domain-accepting routes must return 422 for domain containing '#'
+    assert client.get("/api/v1/network/ips?domain=bad%23domain").status_code == 422
+    assert client.get("/api/v1/network/ips/10.0.0.5?domain=bad%23domain").status_code == 422
+    assert client.get("/api/v1/network/ips/10.0.0.5/peers?domain=bad%23domain").status_code == 422
+    assert client.get("/api/v1/network/ips/10.0.0.5/layer2?domain=bad%23domain").status_code == 422
+    assert client.get("/api/v1/graph/neighborhood/10.0.0.5?domain=bad%23domain").status_code == 422
+    assert client.get("/api/v1/graph/path?source=10.0.0.5&target=10.0.0.6&source_domain=bad%23domain").status_code == 422
+    assert client.get("/api/v1/graph/path?source=10.0.0.5&target=10.0.0.6&target_domain=bad%23domain").status_code == 422
+
+    # Mixed-case padded domain normalizes to lowercase before reaching repository
+    mock_repo.list_ips.return_value = ([], 0)
+    res_case = client.get("/api/v1/network/ips?domain=%20CORP%20")
+    assert res_case.status_code == 200
+    mock_repo.list_ips.assert_called_once_with(limit=50, offset=0, domain="corp")
+
+    # Whitespace-only domain is treated as omitted (not silently mapped to 'default')
+    mock_repo.list_ips.reset_mock()
+    res_ws = client.get("/api/v1/network/ips?domain=%20%20")
+    assert res_ws.status_code == 200
+    mock_repo.list_ips.assert_called_once_with(limit=50, offset=0)
+
+
+def test_api_endpoints_analytics_received_sort_options_v1_compat(client_with_mock_repo):
+    """Verify V1/frontend sort_by options observed_bytes_received and observed_packets_received return 200 OK."""
+    client, mock_repo = client_with_mock_repo
+    mock_repo.get_endpoints_analytics.return_value = ([], 0)
+
+    for sort_key in ("observed_bytes_received", "observed_packets_received"):
+        mock_repo.get_endpoints_analytics.reset_mock()
+        res = client.get(f"/api/v1/network/analytics/endpoints?sort_by={sort_key}")
+        assert res.status_code == 200
+        mock_repo.get_endpoints_analytics.assert_called_once_with(sort_by=sort_key, limit=50, offset=0)
+
+
+def test_read_repo_protocol_normalization_and_param_order():
+    """Verify list_communications and list_alert_facts normalize protocol case/whitespace and keep V1 param order."""
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_tx = MagicMock()
+    mock_session.execute_read.side_effect = lambda fn: fn(mock_tx)
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    repo = Neo4jReadRepository(mock_driver)
+
+    # list_communications normalizes lowercase/padded protocol
+    mock_count = MagicMock()
+    mock_count.single.return_value = {"total": 0}
+    mock_tx.run.side_effect = [mock_count, []]
+    repo.list_communications(protocol="  tcp  ")
+    assert mock_tx.run.call_args_list[0].kwargs["protocol"] == "TCP"
+
+    # list_communications treats whitespace-only protocol as omitted
+    mock_tx.run.reset_mock()
+    mock_tx.run.side_effect = [mock_count, []]
+    repo.list_communications(protocol="   ")
+    assert "protocol" not in mock_tx.run.call_args_list[0].kwargs
+
+    # list_alert_facts preserves V1 positional signature (source_ip, target_ip, priority, sid, protocol)
+    mock_tx.run.reset_mock()
+    mock_tx.run.side_effect = [mock_count, []]
+    repo.list_alert_facts("10.0.0.1", "10.0.0.2", 1, 2001, "  udp ")
+    count_kwargs = mock_tx.run.call_args_list[0].kwargs
+    page_cypher = mock_tx.run.call_args_list[1].args[0]
+    assert count_kwargs["priority"] == 1
+    assert count_kwargs["sid"] == 2001
+    assert count_kwargs["protocol"] == "UDP"
+    assert "CASE WHEN fact.priority IS NULL THEN 1 ELSE 0 END" in page_cypher
+
+
+def test_read_repo_cross_domain_cypher_guards():
+    """Verify Cypher queries enforce per-node fan-out/fan-in grouping, domain normalization, and depth-2 isolation."""
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_tx = MagicMock()
+    mock_session.execute_read.side_effect = lambda fn: fn(mock_tx)
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    repo = Neo4jReadRepository(mock_driver)
+
+    # 1. list_ips normalizes domain filter to lowercase
+    mock_count = MagicMock()
+    mock_count.single.return_value = {"total": 0}
+    mock_tx.run.side_effect = [mock_count, []]
+    repo.list_ips(domain="  CORP  ")
+    assert mock_tx.run.call_args_list[0].kwargs["domain"] == "corp"
+
+    # 2. get_endpoints_analytics supports observed_bytes_received / observed_packets_received & normalizes domain
+    mock_tx.run.reset_mock()
+    mock_tx.run.side_effect = [mock_count, []]
+    repo.get_endpoints_analytics(sort_by="observed_bytes_received", domain="  BRANCH ")
+    assert mock_tx.run.call_args_list[0].kwargs["domain"] == "branch"
+    assert "observed_bytes_received DESC" in mock_tx.run.call_args_list[1].args[0]
+
+    # 3. get_traffic_analytics_summary groups top_fan_out / top_fan_in per node (WITH src / WITH dst)
+    mock_tx.run.reset_mock()
+    mock_summary = MagicMock()
+    mock_summary.single.return_value = {
+        "total_aggs": 1,
+        "enriched_aggs": 1,
+        "total_pkts": 5,
+        "total_bytes": 500,
+        "first_obs": 1.0,
+        "last_obs": 2.0,
+    }
+    mock_tx.run.side_effect = [mock_summary, [], [], [], []]
+    repo.get_traffic_analytics_summary()
+    proto_query = mock_tx.run.call_args_list[1].args[0]
+    fan_out_query = mock_tx.run.call_args_list[3].args[0]
+    fan_in_query = mock_tx.run.call_args_list[4].args[0]
+    assert "c.observed_window_seconds IS NOT NULL" in proto_query
+    assert "WITH src, count(DISTINCT dst)" in fan_out_query
+    assert "WITH dst, count(DISTINCT src)" in fan_in_query
+
+    # 4. get_neighborhood(depth=2) restricts IPAddress traversal to center's routing domain
+    mock_tx.run.reset_mock()
+    mock_resolve = MagicMock()
+    mock_resolve.single.return_value = {
+        "scoped_id": "corp#10.0.0.5",
+        "address": "10.0.0.5",
+        "domain_id": "corp",
+    }
+    mock_nh_res = MagicMock()
+    mock_nh_res.single.return_value = {"center": "10.0.0.5", "paths": []}
+    mock_tx.run.side_effect = [mock_resolve, mock_nh_res]
+    repo.get_neighborhood("10.0.0.5", depth=2, domain="corp")
+    depth2_query = mock_tx.run.call_args_list[1].args[0]
+    assert "n.routing_domain_id = center.routing_domain_id" in depth2_query

@@ -76,10 +76,11 @@ class Neo4jReadRepository:
             rec = res.single()
             if not rec:
                 return None, None, None
-            return rec.get("scoped_id"), rec.get("address", address), rec.get("domain_id")
+            return rec.get("scoped_id"), rec.get("address") or address, rec.get("domain_id")
 
-        if domain:
-            target_scoped = scoped_ip_id(domain, address)
+        norm_domain = domain.strip().lower() if domain and domain.strip() else None
+        if norm_domain:
+            target_scoped = scoped_ip_id(norm_domain, address)
             res = tx.run(
                 "MATCH (ip:IPAddress {scoped_id: $scoped_id}) "
                 "RETURN ip.scoped_id AS scoped_id, ip.address AS address, ip.routing_domain_id AS domain_id",
@@ -92,13 +93,13 @@ class Neo4jReadRepository:
                     "MATCH (ip:IPAddress {address: $address, routing_domain_id: $domain}) "
                     "RETURN ip.scoped_id AS scoped_id, ip.address AS address, ip.routing_domain_id AS domain_id",
                     address=address,
-                    domain=domain,
+                    domain=norm_domain,
                 )
                 rec2 = res2.single()
                 if not rec2:
                     return None, None, None
-                return rec2.get("scoped_id", target_scoped), rec2.get("address", address), rec2.get("domain_id", domain)
-            return rec.get("scoped_id", target_scoped), rec.get("address", address), rec.get("domain_id", domain)
+                return rec2.get("scoped_id"), rec2.get("address") or address, rec2.get("domain_id") or norm_domain
+            return rec.get("scoped_id") or target_scoped, rec.get("address") or address, rec.get("domain_id") or norm_domain
 
         # Only address is supplied
         check_res = tx.run(
@@ -133,11 +134,13 @@ class Neo4jReadRepository:
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
 
+        norm_domain = domain.strip().lower() if domain and domain.strip() else None
+
         def _work(tx) -> Tuple[List[Dict[str, Any]], int]:
-            if domain:
+            if norm_domain:
                 count_res = tx.run(
                     "MATCH (ip:IPAddress) WHERE ip.routing_domain_id = $domain RETURN count(ip) AS total",
-                    domain=domain,
+                    domain=norm_domain,
                 )
                 total = count_res.single()["total"]
 
@@ -145,9 +148,9 @@ class Neo4jReadRepository:
                     "MATCH (ip:IPAddress) "
                     "WHERE ip.routing_domain_id = $domain "
                     "RETURN ip.address AS address, ip.scoped_id AS scoped_id, ip.routing_domain_id AS routing_domain_id "
-                    "ORDER BY ip.address ASC "
+                    "ORDER BY ip.address ASC, ip.scoped_id ASC "
                     "SKIP $offset LIMIT $limit",
-                    domain=domain,
+                    domain=norm_domain,
                     offset=offset,
                     limit=limit,
                 )
@@ -158,7 +161,7 @@ class Neo4jReadRepository:
                 page_res = tx.run(
                     "MATCH (ip:IPAddress) "
                     "RETURN ip.address AS address, ip.scoped_id AS scoped_id, ip.routing_domain_id AS routing_domain_id "
-                    "ORDER BY ip.address ASC "
+                    "ORDER BY ip.address ASC, ip.scoped_id ASC "
                     "SKIP $offset LIMIT $limit",
                     offset=offset,
                     limit=limit,
@@ -190,7 +193,7 @@ class Neo4jReadRepository:
         MATCH (ip:IPAddress)
         WHERE (
             ($scoped_id IS NOT NULL AND ip.scoped_id = $scoped_id)
-            OR ($scoped_id IS NULL AND ip.address = $address)
+            OR ($scoped_id IS NULL AND ip.address = $address AND ($domain IS NULL OR ip.routing_domain_id = $domain))
         )
         CALL {
             WITH ip
@@ -258,11 +261,11 @@ class Neo4jReadRepository:
         """
 
         def _work(tx) -> Optional[Dict[str, Any]]:
-            scoped_id_val, addr_val, _ = self._resolve_endpoint(tx, address=address, domain=domain, scoped_id=scoped_id)
+            scoped_id_val, addr_val, dom_val = self._resolve_endpoint(tx, address=address, domain=domain, scoped_id=scoped_id)
             if addr_val is None:
                 return None
 
-            res = tx.run(cypher, address=address, scoped_id=scoped_id_val)
+            res = tx.run(cypher, address=addr_val, scoped_id=scoped_id_val, domain=dom_val)
             record = res.single()
             if not record:
                 return None
@@ -371,7 +374,12 @@ class Neo4jReadRepository:
             MATCH ()-[c:COMMUNICATED_TO]->()
             RETURN c.protocol AS protocol,
                    count(c) AS agg_count,
-                   count(CASE WHEN c.observed_packet_count IS NOT NULL THEN 1 END) AS enriched_count,
+                   count(CASE WHEN c.observed_packet_count IS NOT NULL
+                                   AND c.observed_bytes IS NOT NULL
+                                   AND c.first_seen IS NOT NULL
+                                   AND c.last_seen IS NOT NULL
+                                   AND c.observed_window_seconds IS NOT NULL
+                              THEN 1 END) AS enriched_count,
                    sum(c.observed_packet_count) AS pkts,
                    sum(c.observed_bytes) AS bytes
             ORDER BY agg_count DESC, protocol ASC
@@ -393,7 +401,12 @@ class Neo4jReadRepository:
             WHERE c.dst_port IS NOT NULL
             RETURN c.dst_port AS dst_port,
                    count(c) AS agg_count,
-                   count(CASE WHEN c.observed_packet_count IS NOT NULL THEN 1 END) AS enriched_count,
+                   count(CASE WHEN c.observed_packet_count IS NOT NULL
+                                   AND c.observed_bytes IS NOT NULL
+                                   AND c.first_seen IS NOT NULL
+                                   AND c.last_seen IS NOT NULL
+                                   AND c.observed_window_seconds IS NOT NULL
+                              THEN 1 END) AS enriched_count,
                    sum(c.observed_packet_count) AS pkts,
                    sum(c.observed_bytes) AS bytes
             ORDER BY agg_count DESC, dst_port ASC
@@ -410,12 +423,13 @@ class Neo4jReadRepository:
                     "observed_bytes": int(r["bytes"]) if enr_count > 0 and r["bytes"] is not None else None,
                 })
 
-            # 4. Top Fan-out
+            # 4. Top Fan-out (grouped per scoped IPAddress node so overlapping domains are never merged)
             fan_out_cypher = """
             MATCH (src:IPAddress)-[:COMMUNICATED_TO]->(dst:IPAddress)
-            RETURN src.address AS address, count(DISTINCT dst) AS distinct_destination_ips
-            ORDER BY distinct_destination_ips DESC, address ASC
+            WITH src, count(DISTINCT dst) AS distinct_destination_ips
+            ORDER BY distinct_destination_ips DESC, src.address ASC, src.scoped_id ASC
             LIMIT 10
+            RETURN src.address AS address, distinct_destination_ips
             """
             fan_out_res = tx.run(fan_out_cypher)
             top_fan_out = [
@@ -423,12 +437,13 @@ class Neo4jReadRepository:
                 for r in fan_out_res
             ]
 
-            # 5. Top Fan-in
+            # 5. Top Fan-in (grouped per scoped IPAddress node so overlapping domains are never merged)
             fan_in_cypher = """
             MATCH (src:IPAddress)-[:COMMUNICATED_TO]->(dst:IPAddress)
-            RETURN dst.address AS address, count(DISTINCT src) AS distinct_source_ips
-            ORDER BY distinct_source_ips DESC, address ASC
+            WITH dst, count(DISTINCT src) AS distinct_source_ips
+            ORDER BY distinct_source_ips DESC, dst.address ASC, dst.scoped_id ASC
             LIMIT 10
+            RETURN dst.address AS address, distinct_source_ips
             """
             fan_in_res = tx.run(fan_in_cypher)
             top_fan_in = [
@@ -466,16 +481,19 @@ class Neo4jReadRepository:
             raise ConnectionError("Database driver unavailable")
 
         sort_clauses = {
-            "fan_out": "ORDER BY distinct_outbound_peers DESC, ip.address ASC",
-            "fan_in": "ORDER BY distinct_inbound_peers DESC, ip.address ASC",
-            "observed_packets_sent": "ORDER BY CASE WHEN observed_packets_sent IS NULL THEN 1 ELSE 0 END, observed_packets_sent DESC, ip.address ASC",
-            "observed_bytes_sent": "ORDER BY CASE WHEN observed_bytes_sent IS NULL THEN 1 ELSE 0 END, observed_bytes_sent DESC, ip.address ASC",
-            "first_observed": "ORDER BY CASE WHEN first_observed IS NULL THEN 1 ELSE 0 END, first_observed ASC, ip.address ASC",
-            "last_observed": "ORDER BY CASE WHEN last_observed IS NULL THEN 1 ELSE 0 END, last_observed DESC, ip.address ASC",
+            "fan_out": "ORDER BY distinct_outbound_peers DESC, address ASC, scoped_id ASC",
+            "fan_in": "ORDER BY distinct_inbound_peers DESC, address ASC, scoped_id ASC",
+            "observed_bytes_sent": "ORDER BY CASE WHEN observed_bytes_sent IS NULL THEN 1 ELSE 0 END, observed_bytes_sent DESC, address ASC, scoped_id ASC",
+            "observed_bytes_received": "ORDER BY CASE WHEN observed_bytes_received IS NULL THEN 1 ELSE 0 END, observed_bytes_received DESC, address ASC, scoped_id ASC",
+            "observed_packets_sent": "ORDER BY CASE WHEN observed_packets_sent IS NULL THEN 1 ELSE 0 END, observed_packets_sent DESC, address ASC, scoped_id ASC",
+            "observed_packets_received": "ORDER BY CASE WHEN observed_packets_received IS NULL THEN 1 ELSE 0 END, observed_packets_received DESC, address ASC, scoped_id ASC",
+            "first_observed": "ORDER BY CASE WHEN first_observed IS NULL THEN 1 ELSE 0 END, first_observed ASC, address ASC, scoped_id ASC",
+            "last_observed": "ORDER BY CASE WHEN last_observed IS NULL THEN 1 ELSE 0 END, last_observed DESC, address ASC, scoped_id ASC",
         }
         order_clause = sort_clauses.get(sort_by, sort_clauses["fan_out"])
 
-        where_clause = "WHERE ip.routing_domain_id = $domain" if domain else ""
+        norm_domain = domain.strip().lower() if domain and domain.strip() else None
+        where_clause = "WHERE ip.routing_domain_id = $domain" if norm_domain else ""
         count_cypher = f"MATCH (ip:IPAddress) {where_clause} RETURN count(ip) AS total"
 
         page_cypher = f"""
@@ -554,8 +572,8 @@ class Neo4jReadRepository:
 
         def _work(tx) -> Tuple[List[Dict[str, Any]], int]:
             params: Dict[str, Any] = {"offset": offset, "limit": limit}
-            if domain:
-                params["domain"] = domain
+            if norm_domain:
+                params["domain"] = norm_domain
             total = tx.run(count_cypher, **params).single()["total"]
             page_res = tx.run(page_cypher, **params)
             items = []
@@ -651,7 +669,7 @@ class Neo4jReadRepository:
                 RETURN peer_address, dir AS direction, raw_proto
                 """
 
-            params: Dict[str, Any] = {"address": address, "scoped_id": scoped_id_val}
+            params: Dict[str, Any] = {"address": addr_val, "scoped_id": scoped_id_val}
             count_cypher = f"CALL {{ {subquery} }} RETURN count(*) AS total"
             total = tx.run(count_cypher, **params).single()["total"]
 
@@ -703,7 +721,7 @@ class Neo4jReadRepository:
                 else "MATCH (ip:IPAddress {address: $address})-[:OBSERVED_WITH]->(l2:Layer2Identifier)"
             )
             count_cypher = f"{match_part} RETURN count(l2) AS total"
-            params: Dict[str, Any] = {"address": address, "scoped_id": scoped_id_val}
+            params: Dict[str, Any] = {"address": addr_val, "scoped_id": scoped_id_val}
             total = tx.run(count_cypher, **params).single()["total"]
 
             page_cypher = f"""
@@ -763,6 +781,8 @@ class Neo4jReadRepository:
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
 
+        proto_upper = protocol.strip().upper() if protocol and protocol.strip() else None
+
         conditions = []
         params: Dict[str, Any] = {"limit": limit, "offset": offset}
 
@@ -772,9 +792,9 @@ class Neo4jReadRepository:
         if target_ip is not None:
             conditions.append("dst.address = $target_ip")
             params["target_ip"] = target_ip
-        if protocol is not None:
+        if proto_upper is not None:
             conditions.append("c.protocol = $protocol")
-            params["protocol"] = protocol
+            params["protocol"] = proto_upper
         if src_port is not None:
             conditions.append("c.src_port = $src_port")
             params["src_port"] = src_port
@@ -787,22 +807,28 @@ class Neo4jReadRepository:
         sort_clauses = {
             "identity": """
             ORDER BY src.address ASC, dst.address ASC, c.protocol ASC,
-                     CASE WHEN c.flow_key IS NULL THEN 1 ELSE 0 END, c.flow_key ASC
+                     CASE WHEN c.src_port IS NULL THEN 1 ELSE 0 END, c.src_port ASC,
+                     CASE WHEN c.dst_port IS NULL THEN 1 ELSE 0 END, c.dst_port ASC,
+                     CASE WHEN c.flow_key IS NULL THEN 1 ELSE 0 END, c.flow_key ASC,
+                     src.scoped_id ASC, dst.scoped_id ASC
             """,
             "observed_bytes": """
             ORDER BY CASE WHEN c.observed_bytes IS NULL THEN 1 ELSE 0 END, c.observed_bytes DESC,
                      src.address ASC, dst.address ASC, c.protocol ASC,
-                     CASE WHEN c.flow_key IS NULL THEN 1 ELSE 0 END, c.flow_key ASC
+                     CASE WHEN c.flow_key IS NULL THEN 1 ELSE 0 END, c.flow_key ASC,
+                     src.scoped_id ASC, dst.scoped_id ASC
             """,
             "observed_packets": """
             ORDER BY CASE WHEN c.observed_packet_count IS NULL THEN 1 ELSE 0 END, c.observed_packet_count DESC,
                      src.address ASC, dst.address ASC, c.protocol ASC,
-                     CASE WHEN c.flow_key IS NULL THEN 1 ELSE 0 END, c.flow_key ASC
+                     CASE WHEN c.flow_key IS NULL THEN 1 ELSE 0 END, c.flow_key ASC,
+                     src.scoped_id ASC, dst.scoped_id ASC
             """,
             "first_seen": """
             ORDER BY CASE WHEN c.first_seen IS NULL THEN 1 ELSE 0 END, c.first_seen ASC,
                      src.address ASC, dst.address ASC, c.protocol ASC,
-                     CASE WHEN c.flow_key IS NULL THEN 1 ELSE 0 END, c.flow_key ASC
+                     CASE WHEN c.flow_key IS NULL THEN 1 ELSE 0 END, c.flow_key ASC,
+                     src.scoped_id ASC, dst.scoped_id ASC
             """,
         }
         order_clause = sort_clauses.get(sort_by, sort_clauses["identity"])
@@ -854,8 +880,8 @@ class Neo4jReadRepository:
         self,
         source_ip: Optional[str] = None,
         target_ip: Optional[str] = None,
-        sid: Optional[int] = None,
         priority: Optional[int] = None,
+        sid: Optional[int] = None,
         protocol: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
@@ -863,6 +889,8 @@ class Neo4jReadRepository:
         """List normalized AlertFact entities with optional filtering, deterministic sorting, and pagination."""
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
+
+        proto_upper = protocol.strip().upper() if protocol and protocol.strip() else None
 
         conditions = []
         params: Dict[str, Any] = {"limit": limit, "offset": offset}
@@ -873,15 +901,15 @@ class Neo4jReadRepository:
         if target_ip is not None:
             conditions.append("dst.address = $target_ip")
             params["target_ip"] = target_ip
-        if sid is not None:
-            conditions.append("fact.sid = $sid")
-            params["sid"] = sid
         if priority is not None:
             conditions.append("fact.priority = $priority")
             params["priority"] = priority
-        if protocol is not None:
+        if sid is not None:
+            conditions.append("fact.sid = $sid")
+            params["sid"] = sid
+        if proto_upper is not None:
             conditions.append("fact.protocol = $protocol")
-            params["protocol"] = protocol
+            params["protocol"] = proto_upper
 
         where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
@@ -905,7 +933,9 @@ class Neo4jReadRepository:
                fact.protocol AS protocol,
                fact.src_port AS src_port,
                fact.dst_port AS dst_port
-        ORDER BY fact.priority ASC, fact.sid ASC, fact.fact_key ASC
+        ORDER BY CASE WHEN fact.priority IS NULL THEN 1 ELSE 0 END, fact.priority ASC,
+                 CASE WHEN fact.sid IS NULL THEN 1 ELSE 0 END, fact.sid ASC,
+                 fact.fact_key ASC
         SKIP $offset LIMIT $limit
         """
 
@@ -1140,6 +1170,13 @@ class Neo4jReadRepository:
                 OR ($scoped_id IS NULL AND center.address = $address)
             )
             OPTIONAL MATCH p = (center)-[r:COMMUNICATED_TO|OBSERVED_WITH*1..2]-(target)
+            WHERE ALL(
+                n IN nodes(p)
+                WHERE NOT n:IPAddress
+                   OR center.routing_domain_id IS NULL
+                   OR n.routing_domain_id IS NULL
+                   OR n.routing_domain_id = center.routing_domain_id
+            )
             WITH center, collect(DISTINCT p) AS paths
             RETURN center.address AS center, paths
             """
@@ -1149,12 +1186,12 @@ class Neo4jReadRepository:
             if addr_val is None:
                 return None
 
-            center_id = f"ip:{scoped_id_val}" if (dom_val and dom_val != "default" and scoped_id_val) else f"ip:{address}"
-            nodes_map = {center_id: {"id": center_id, "type": "IPAddress", "value": address}}
+            center_id = f"ip:{scoped_id_val}" if (dom_val and dom_val != "default" and scoped_id_val) else f"ip:{addr_val}"
+            nodes_map = {center_id: {"id": center_id, "type": "IPAddress", "value": addr_val}}
             candidate_edges = []
 
             if depth == 1:
-                rec = tx.run(cypher, address=address, scoped_id=scoped_id_val).single()
+                rec = tx.run(cypher, address=addr_val, scoped_id=scoped_id_val).single()
                 for group in [rec["out_ips"], rec["in_ips"], rec["l2_nodes"]]:
                     for n in group:
                         if n.get("value") is not None:
@@ -1165,7 +1202,7 @@ class Neo4jReadRepository:
                         if e.get("source") and e.get("target") and "None" not in e["source"] and "None" not in e["target"]:
                             candidate_edges.append(e)
             else:
-                rec = tx.run(cypher, address=address, scoped_id=scoped_id_val).single()
+                rec = tx.run(cypher, address=addr_val, scoped_id=scoped_id_val).single()
                 paths = rec["paths"]
                 for p in paths:
                     if p is not None:
@@ -1213,7 +1250,7 @@ class Neo4jReadRepository:
             # Deterministic node trimming (always retaining center node)
             sorted_other_nodes = sorted(
                 [n for nid, n in nodes_map.items() if nid != center_id],
-                key=lambda x: (x["type"], x["value"]),
+                key=lambda x: (x["type"], x["value"], x["id"]),
             )
             retained_nodes = [nodes_map[center_id]] + sorted_other_nodes[: max_nodes - 1]
             retained_node_ids = {n["id"] for n in retained_nodes}
@@ -1251,7 +1288,7 @@ class Neo4jReadRepository:
             )
 
             return {
-                "center": address,
+                "center": addr_val,
                 "depth": depth,
                 "nodes": retained_nodes,
                 "edges": sorted_edges,
@@ -1291,43 +1328,41 @@ class Neo4jReadRepository:
             if dst_addr is None:
                 return {"error": "target_not_found"}
 
-            if (src_scoped and dst_scoped and src_scoped == dst_scoped) or (not src_scoped and not dst_scoped and source == target):
+            if (src_scoped and dst_scoped and src_scoped == dst_scoped) or (not src_scoped and not dst_scoped and src_addr == dst_addr):
                 return {
-                    "source": source,
-                    "target": target,
-                    "hops": [source],
+                    "source": src_addr,
+                    "target": dst_addr,
+                    "hops": [src_addr],
                     "protocols": [],
                     "length": 0,
                 }
 
-            if src_scoped and dst_scoped:
-                cypher = """
-                MATCH (src:IPAddress {scoped_id: $src_scoped}), (dst:IPAddress {scoped_id: $dst_scoped})
-                MATCH p = shortestPath((src)-[:COMMUNICATED_TO*1..10]->(dst))
-                WHERE length(p) <= $max_hops
-                RETURN [n IN nodes(p) | n.address] AS hops,
-                       [r IN relationships(p) | r.protocol] AS protocols,
-                       length(p) AS length
-                """
-                res = tx.run(cypher, src_scoped=src_scoped, dst_scoped=dst_scoped, max_hops=max_hops)
-            else:
-                cypher = """
-                MATCH (src:IPAddress {address: $source}), (dst:IPAddress {address: $target})
-                MATCH p = shortestPath((src)-[:COMMUNICATED_TO*1..10]->(dst))
-                WHERE length(p) <= $max_hops
-                RETURN [n IN nodes(p) | n.address] AS hops,
-                       [r IN relationships(p) | r.protocol] AS protocols,
-                       length(p) AS length
-                """
-                res = tx.run(cypher, source=source, target=target, max_hops=max_hops)
+            src_match = "(src:IPAddress {scoped_id: $src_scoped})" if src_scoped else "(src:IPAddress {address: $source})"
+            dst_match = "(dst:IPAddress {scoped_id: $dst_scoped})" if dst_scoped else "(dst:IPAddress {address: $target})"
+            cypher = f"""
+            MATCH {src_match}, {dst_match}
+            MATCH p = shortestPath((src)-[:COMMUNICATED_TO*1..10]->(dst))
+            WHERE length(p) <= $max_hops
+            RETURN [n IN nodes(p) | n.address] AS hops,
+                   [r IN relationships(p) | r.protocol] AS protocols,
+                   length(p) AS length
+            """
+            res = tx.run(
+                cypher,
+                src_scoped=src_scoped,
+                dst_scoped=dst_scoped,
+                source=src_addr,
+                target=dst_addr,
+                max_hops=max_hops,
+            )
 
             record = res.single()
             if not record:
                 return {"error": "no_path"}
 
             return {
-                "source": source,
-                "target": target,
+                "source": src_addr,
+                "target": dst_addr,
                 "hops": [str(h) for h in record["hops"]],
                 "protocols": [str(p) for p in record["protocols"]],
                 "length": int(record["length"]),

@@ -262,3 +262,97 @@ def test_historical_alert_facts_backfilled_in_migration():
     alert_backfill_runs = [q for q, kw in tx_runs if "MATCH (fact:AlertFact)" in q]
     assert len(alert_backfill_runs) == 1
     assert "WHERE fact.routing_domain_id IS NULL" in alert_backfill_runs[0]
+
+
+def test_migrate_creates_uniqueness_guards_before_backfill():
+    """Verify migration applies routing_domain_unique and ip_scoped_unique before execute_write backfill."""
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    mock_nodes = [
+        {"element_id": "4:abc:1", "address": "10.0.0.1", "scoped_id": None, "routing_domain_id": None},
+    ]
+
+    events = []
+
+    def fake_run(stmt, **kwargs):
+        events.append(("run", stmt))
+        if "RETURN elementId(ip)" in stmt:
+            return mock_nodes
+        res = MagicMock()
+        if "unmigrated" in stmt:
+            res.single.return_value = {"unmigrated": 0, "unmigrated_count": 0}
+        return res
+
+    def fake_execute_write(work_fn):
+        events.append(("execute_write", None))
+        tx = MagicMock()
+        return work_fn(tx)
+
+    mock_session.run.side_effect = fake_run
+    mock_session.execute_write.side_effect = fake_execute_write
+
+    migrate_ip_identity_to_scoped(mock_driver, default_domain="default")
+
+    write_idx = next(i for i, (kind, _) in enumerate(events) if kind == "execute_write")
+    pre_write_stmts = [stmt for kind, stmt in events[:write_idx] if kind == "run"]
+
+    assert any("CONSTRAINT routing_domain_unique" in s for s in pre_write_stmts)
+    assert any("CONSTRAINT ip_scoped_unique" in s for s in pre_write_stmts)
+    assert not any("DROP CONSTRAINT" in s for s in pre_write_stmts)
+
+
+def test_migrate_normalizes_and_validates_default_domain():
+    """Verify migration normalizes mixed-case/padded default_domain consistently and rejects '#' even on empty DB."""
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    # Reject '#' delimiter before any DB query even on empty database
+    with pytest.raises(ValueError, match="cannot contain delimiter '#'"):
+        migrate_ip_identity_to_scoped(mock_driver, default_domain="bad#domain")
+    mock_session.run.assert_not_called()
+
+    # Mixed-case padded domain normalizes consistently across IP updates, RoutingDomain, AlertFact, and summary
+    mock_nodes = [
+        {"element_id": "4:abc:1", "address": "10.0.0.1", "scoped_id": None, "routing_domain_id": None},
+    ]
+    mock_session.run.return_value = mock_nodes
+
+    tx_runs = []
+
+    def fake_execute_write(work_fn):
+        tx = MagicMock()
+        tx.run.side_effect = lambda query, **kwargs: tx_runs.append((query, kwargs))
+        return work_fn(tx)
+
+    mock_session.execute_write.side_effect = fake_execute_write
+
+    stats = migrate_ip_identity_to_scoped(mock_driver, default_domain="  Corp-Main  ")
+    assert stats["default_domain"] == "corp-main"
+    assert stats["migrated_ips"] == 1
+
+    rd_call = next(kw for q, kw in tx_runs if "MERGE (rd:RoutingDomain" in q)
+    assert rd_call["domain_id"] == "corp-main"
+    assert rd_call["domain_name"] == "corp-main"
+
+    upd_call = next(kw for q, kw in tx_runs if "UNWIND $updates" in q)
+    assert upd_call["updates"][0]["scoped_id"] == "corp-main#10.0.0.1"
+    assert upd_call["updates"][0]["domain_id"] == "corp-main"
+
+    alert_call = next(kw for q, kw in tx_runs if "MATCH (fact:AlertFact)" in q)
+    assert alert_call["domain_id"] == "corp-main"
+
+
+def test_replace_workspace_data_validates_domain_before_cleanup():
+    """Verify replace_workspace_data rejects invalid domain_id containing '#' before any destructive delete."""
+    from src.graph.repository import Neo4jRepository
+
+    mock_driver = MagicMock()
+    repo = Neo4jRepository(mock_driver)
+
+    with pytest.raises(ValueError, match="cannot contain delimiter '#'"):
+        repo.replace_workspace_data(traffic_records=None, alert_records=None, domain_id="bad#domain")
+
+    mock_driver.session.assert_not_called()

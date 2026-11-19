@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 
 from src.api.models import GraphNeighborhoodResponse, PathResponse
-from src.api.dependencies import get_read_repository, validate_canonical_ip
+from src.api.dependencies import get_read_repository, validate_canonical_ip, validate_routing_domain
 from src.graph.read_repository import Neo4jReadRepository, AmbiguousEndpointError
 
 router = APIRouter(prefix="/api/v1/graph", tags=["Graph"])
@@ -22,10 +22,11 @@ def get_graph_neighborhood(
 ) -> GraphNeighborhoodResponse:
     """Retrieve a bounded local graph neighborhood (depth 1 or 2) around an IP address."""
     canonical_address = validate_canonical_ip(address)
+    norm_domain = validate_routing_domain(domain)
     try:
         result = (
-            repo.get_neighborhood(canonical_address, depth=depth, max_nodes=max_nodes, domain=domain)
-            if domain is not None
+            repo.get_neighborhood(canonical_address, depth=depth, max_nodes=max_nodes, domain=norm_domain)
+            if norm_domain is not None
             else repo.get_neighborhood(canonical_address, depth=depth, max_nodes=max_nodes)
         )
     except AmbiguousEndpointError as err:
@@ -58,15 +59,17 @@ def get_shortest_path(
     """Find the shortest directional Layer 3 communication path between two IP addresses."""
     can_src = validate_canonical_ip(source)
     can_dst = validate_canonical_ip(target)
+    norm_src_domain = validate_routing_domain(source_domain)
+    norm_dst_domain = validate_routing_domain(target_domain)
 
     try:
-        if source_domain is not None or target_domain is not None:
+        if norm_src_domain is not None or norm_dst_domain is not None:
             result = repo.get_shortest_path(
                 can_src,
                 can_dst,
                 max_hops=max_hops,
-                source_domain=source_domain,
-                target_domain=target_domain,
+                source_domain=norm_src_domain,
+                target_domain=norm_dst_domain,
             )
         else:
             result = repo.get_shortest_path(can_src, can_dst, max_hops=max_hops)

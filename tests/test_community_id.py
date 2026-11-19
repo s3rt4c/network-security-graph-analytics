@@ -210,3 +210,26 @@ def test_resolve_community_id_returns_none_when_insufficient_data():
     assert resolve_community_id(existing_id=None, ip_src="1.1.1.1", ip_dst=None) is None
     assert resolve_community_id(existing_id="", ip_src=None) is None
     assert resolve_community_id(existing_id=None) is None
+
+
+def test_sctp_support_and_direction_independence():
+    """Verify SCTP (IANA 132) computes valid bidirectional Community ID v1 with ports."""
+    forward = compute_community_id("1.1.1.1", "2.2.2.2", "SCTP", 1000, 2000)
+    reverse = compute_community_id("2.2.2.2", "1.1.1.1", 132, 2000, 1000)
+
+    assert forward == "1:NVQBrwNzYhbXlbkw8XA1ZipcKFM="
+    assert forward == reverse
+
+    # Missing or invalid ports for SCTP must return None
+    assert compute_community_id("1.1.1.1", "2.2.2.2", "SCTP", None, 2000) is None
+    assert compute_community_id("1.1.1.1", "2.2.2.2", "SCTP", 1000, None) is None
+    assert compute_community_id("1.1.1.1", "2.2.2.2", "SCTP", 70000, 2000) is None
+
+
+def test_bool_protocol_and_ports_rejected():
+    """Verify Python bools are not silently coerced to int protocol/port values."""
+    assert _normalize_protocol_number(True) is None
+    assert _normalize_protocol_number(False) is None
+    assert compute_community_id("1.1.1.1", "2.2.2.2", True, 1000, 80) is None  # type: ignore[arg-type]
+    assert compute_community_id("1.1.1.1", "2.2.2.2", "TCP", True, 80) is None  # type: ignore[arg-type]
+    assert compute_community_id("1.1.1.1", "2.2.2.2", "TCP", 1000, False) is None  # type: ignore[arg-type]

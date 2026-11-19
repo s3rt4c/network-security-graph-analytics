@@ -37,6 +37,8 @@ _PROTO_MAP = {
 
 def _normalize_protocol_number(protocol: Union[str, int]) -> Optional[int]:
     """Normalize a protocol name or number to its IANA integer value."""
+    if isinstance(protocol, bool):
+        return None
     if isinstance(protocol, int):
         return protocol if 0 <= protocol <= 255 else None
     if isinstance(protocol, str):
@@ -87,7 +89,7 @@ def compute_community_id(
         clean_dst = str(ip_dst).strip()
 
         if proto_num == 6:  # TCP
-            if src_port is None or dst_port is None:
+            if src_port is None or dst_port is None or isinstance(src_port, bool) or isinstance(dst_port, bool):
                 return None
             s_port = int(src_port)
             d_port = int(dst_port)
@@ -95,18 +97,30 @@ def compute_community_id(
                 return None
             tpl = communityid.FlowTuple.make_tcp(clean_src, clean_dst, s_port, d_port)
         elif proto_num == 17:  # UDP
-            if src_port is None or dst_port is None:
+            if src_port is None or dst_port is None or isinstance(src_port, bool) or isinstance(dst_port, bool):
                 return None
             s_port = int(src_port)
             d_port = int(dst_port)
             if not (0 <= s_port <= 65535 and 0 <= d_port <= 65535):
                 return None
             tpl = communityid.FlowTuple.make_udp(clean_src, clean_dst, s_port, d_port)
+        elif proto_num == 132:  # SCTP
+            if src_port is None or dst_port is None or isinstance(src_port, bool) or isinstance(dst_port, bool):
+                return None
+            s_port = int(src_port)
+            d_port = int(dst_port)
+            if not (0 <= s_port <= 65535 and 0 <= d_port <= 65535):
+                return None
+            tpl = communityid.FlowTuple.make_sctp(clean_src, clean_dst, s_port, d_port)
         elif proto_num == 1:  # ICMP
+            if isinstance(src_port, bool) or isinstance(dst_port, bool):
+                return None
             mtype = int(src_port) if src_port is not None else 0
             mcode = int(dst_port) if dst_port is not None else 0
             tpl = communityid.FlowTuple.make_icmp(clean_src, clean_dst, mtype, mcode)
         elif proto_num == 58:  # ICMPv6
+            if isinstance(src_port, bool) or isinstance(dst_port, bool):
+                return None
             mtype = int(src_port) if src_port is not None else 0
             mcode = int(dst_port) if dst_port is not None else 0
             tpl = communityid.FlowTuple.make_icmp6(clean_src, clean_dst, mtype, mcode)

@@ -171,6 +171,10 @@ def test_v2_flow_key_port_range_validation():
         compute_v2_flow_key("corp#10.0.0.1", "corp#10.0.0.2", "TCP", 70000, 80)
     with pytest.raises(ValueError, match="Invalid dst_port"):
         compute_v2_flow_key("corp#10.0.0.1", "corp#10.0.0.2", "TCP", 80, -1)
+    with pytest.raises(ValueError, match="Invalid src_port"):
+        compute_v2_flow_key("corp#10.0.0.1", "corp#10.0.0.2", "TCP", True, 80)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Invalid dst_port"):
+        compute_v2_flow_key("corp#10.0.0.1", "corp#10.0.0.2", "TCP", 80, False)  # type: ignore[arg-type]
 
 
 def test_v2_flow_key_domain_isolation():
@@ -280,6 +284,10 @@ def test_alert_definition_id_validation_errors():
         alert_definition_id("suricata", "et-open", 1, -1)
     with pytest.raises(ValueError, match="Invalid generator ID"):
         alert_definition_id("suricata", "et-open", -5, 100)
+    with pytest.raises(ValueError, match="Invalid signature ID"):
+        alert_definition_id("suricata", "et-open", 1, True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Invalid generator ID"):
+        alert_definition_id("suricata", "et-open", False, 100)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

@@ -98,3 +98,31 @@ def test_ensure_schema_raises_when_unmigrated_nodes_exist():
     # Must only have called the preflight check, and MUST NOT have called any DROP statements!
     assert mock_session.run.call_count == 1
     assert "DROP CONSTRAINT" not in mock_session.run.call_args[0][0]
+
+
+def test_ensure_schema_creates_v2_uniqueness_before_dropping_legacy():
+    """Verify ensure_schema establishes routing_domain_unique and ip_scoped_unique BEFORE dropping ip_address_unique."""
+    mock_session = MagicMock()
+    mock_driver = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    mock_check_res = MagicMock()
+    mock_check_res.single.return_value = {"unmigrated_count": 0}
+    mock_ddl_res = MagicMock()
+
+    mock_session.run.side_effect = lambda stmt, **params: (
+        mock_check_res if "unmigrated_count" in stmt else mock_ddl_res
+    )
+
+    ensure_schema(mock_driver)
+
+    executed = [call.args[0] for call in mock_session.run.call_args_list]
+    idx_rd_unique = next(i for i, s in enumerate(executed) if "routing_domain_unique" in s)
+    idx_ip_scoped_unique = next(i for i, s in enumerate(executed) if "ip_scoped_unique" in s)
+    idx_drop_legacy = next(i for i, s in enumerate(executed) if "DROP CONSTRAINT ip_address_unique" in s)
+    idx_ip_addr_index = next(i for i, s in enumerate(executed) if "INDEX ip_address_index" in s)
+
+    # Zero unprotected uniqueness window: new uniqueness constraints BEFORE drop; non-unique index AFTER drop
+    assert idx_rd_unique < idx_drop_legacy
+    assert idx_ip_scoped_unique < idx_drop_legacy
+    assert idx_drop_legacy < idx_ip_addr_index
