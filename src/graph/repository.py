@@ -94,7 +94,18 @@ class AlertEventConflictError(ValueError):
 
 @dataclass(frozen=True)
 class AlertEventPersistenceSummary:
-    """Summary counters returned after streaming Suricata AlertEvent persistence."""
+    """Summary counters returned after streaming Suricata AlertEvent persistence.
+
+    Counter accuracy semantics:
+    - In single-writer sequential runs, `created_count`, `duplicate_matched_count`,
+      `definitions_created_count`, and `batches_committed` reflect exact committed
+      mutations. `definitions_matched_count` sums distinct pre-existing definitions
+      referenced within each committed batch (preserving O(batch_size) memory).
+    - Under concurrent writers or ambiguous post-commit transient retries, created vs.
+      matched counters are best-effort Read Committed snapshots; node uniqueness and
+      event immutability remain strictly enforced by Neo4j constraints, ON CREATE SET
+      only writes, and payload_digest verification.
+    """
 
     total_received: int
     created_count: int

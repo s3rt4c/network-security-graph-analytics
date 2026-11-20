@@ -1700,12 +1700,19 @@ class Neo4jReadRepository:
         community_id: Optional[str] = None,
         flow_id: Optional[Union[int, str]] = None,
         sid: Optional[int] = None,
+        alert_definition_id: Optional[str] = None,
+        severity: Optional[int] = None,
         start_epoch_ns: Optional[int] = None,
         end_epoch_ns: Optional[int] = None,
         limit: int = 100,
         offset: int = 0,
     ) -> Tuple[List[Dict[str, Any]], int]:
         """List discrete Suricata AlertEvent nodes with optional indexed filtering and pagination.
+
+        Supports optional exact-match filters on `routing_domain_id`, `sensor_id`,
+        `flow_key`, `community_id`, `flow_id`, `sid`, `alert_definition_id`
+        (resolved via `(:AlertEvent)-[:TRIGGERED_RULE]->(:AlertDefinition)` using the
+        unique `AlertDefinition.definition_id` constraint), and `severity`.
 
         Temporal filtering operates strictly on lossless signed 64-bit integer
         nanosecond property `timestamp_epoch_ns`. Events missing a resolved epoch
@@ -1736,6 +1743,18 @@ class Neo4jReadRepository:
             if isinstance(sid, bool) or not isinstance(sid, int) or not (0 <= sid <= _INT64_MAX):
                 raise ValueError(f"sid must be an integer in 0..{_INT64_MAX} or None, got {sid!r}")
 
+        if severity is not None:
+            if isinstance(severity, bool) or not isinstance(severity, int) or not (0 <= severity <= _INT64_MAX):
+                raise ValueError(f"severity must be an integer in 0..{_INT64_MAX} or None, got {severity!r}")
+
+        norm_def_id: Optional[str] = None
+        if alert_definition_id is not None:
+            if not isinstance(alert_definition_id, str):
+                raise ValueError(f"alert_definition_id must be a string or None, got {alert_definition_id!r}")
+            cleaned_def_id = alert_definition_id.strip().lower()
+            if cleaned_def_id:
+                norm_def_id = cleaned_def_id
+
         flow_id_str: Optional[str] = None
         if flow_id is not None:
             if isinstance(flow_id, bool):
@@ -1759,6 +1778,13 @@ class Neo4jReadRepository:
             "offset": offset,
         }
 
+        if norm_def_id is not None:
+            match_clause = "MATCH (ae:AlertEvent)-[:TRIGGERED_RULE]->(ad:AlertDefinition)"
+            clauses.append("ad.definition_id = $alert_definition_id")
+            params["alert_definition_id"] = norm_def_id
+        else:
+            match_clause = "MATCH (ae:AlertEvent)"
+
         if routing_domain_id and routing_domain_id.strip():
             clauses.append("ae.routing_domain_id = $routing_domain_id")
             params["routing_domain_id"] = routing_domain_id.strip().lower()
@@ -1777,6 +1803,9 @@ class Neo4jReadRepository:
         if sid is not None:
             clauses.append("ae.sid = $sid")
             params["sid"] = sid
+        if severity is not None:
+            clauses.append("ae.severity = $severity")
+            params["severity"] = severity
         if start_epoch_ns is not None:
             clauses.append("ae.timestamp_epoch_ns IS NOT NULL AND ae.timestamp_epoch_ns >= $start_epoch_ns")
             params["start_epoch_ns"] = start_epoch_ns
@@ -1787,13 +1816,13 @@ class Neo4jReadRepository:
         where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
         count_cypher = f"""
-        MATCH (ae:AlertEvent)
+        {match_clause}
         {where_clause}
         RETURN count(ae) AS total
         """
 
         page_cypher = f"""
-        MATCH (ae:AlertEvent)
+        {match_clause}
         {where_clause}
         RETURN ae.event_id AS event_id,
                ae.alert_definition_id AS alert_definition_id,

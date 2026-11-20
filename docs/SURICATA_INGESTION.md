@@ -181,6 +181,8 @@ Suricata `AlertEvent` and `AlertDefinition` graph persistence builds directly on
   - `flow_id` values (unsigned 64-bit integers potentially exceeding Neo4j signed 64-bit `INT64_MAX`) are stored uniformly as canonical decimal strings (`str(flow_id)`).
   - High-precision timestamps store verbatim `timestamp_source`, lossless `timestamp_epoch_decimal`, and exact signed 64-bit `timestamp_epoch_ns` (or `None` for timezone-naive timestamps).
 - **Read API (`src/graph/read_repository.py`)**:
-  - `get_alert_event(event_id)` and `list_alert_events(...)` provide indexed filtering (including unsigned `flow_id` lookup and numeric `timestamp_epoch_ns` windowing) with deterministic `NULLS LAST` pagination.
+  - `get_alert_event(event_id)` and `list_alert_events(...)` provide exact-match filtering on `routing_domain_id`, `sensor_id`, `flow_key`, `community_id`, lossless unsigned `flow_id`, `sid`, `alert_definition_id` (via `(:AlertEvent)-[:TRIGGERED_RULE]->(:AlertDefinition)` using the unique definition constraint), `severity`, and numeric `timestamp_epoch_ns` windowing with deterministic `NULLS LAST` pagination.
+- **Persistence Summary Counters**:
+  - In sequential single-writer runs, `created_count`, `duplicate_matched_count`, and `definitions_created_count` reflect exact committed node creations/matches, while `definitions_matched_count` sums per-batch distinct pre-existing definitions referenced to maintain O(`batch_size`) streaming memory. Under concurrent writers or ambiguous post-commit retries, created vs. matched counters are best-effort Read Committed snapshots while graph uniqueness and event immutability remain strictly enforced.
 - **Streaming Service & CLI (`src/services/suricata_ingestion.py`)**:
   - `ingest_suricata_eve_file(...)` and `python -m src.services.suricata_ingestion` enforce `ensure_schema()` / `MigrationRequiredError` before persisting batches in O(`batch_size`) memory.

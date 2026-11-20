@@ -775,3 +775,147 @@ def test_o_v1_alert_and_traffic_contracts_unchanged():
     )
     assert written == 1
     assert iter_suricata_eve_alert_lines is not None
+
+
+# ---------------------------------------------------------------------------
+# P. Review-Hardening Tests: alert_definition_id/severity filters, boundaries & counters
+# ---------------------------------------------------------------------------
+
+def test_p_list_alert_events_alert_definition_id_and_severity_filters():
+    mock_session = MagicMock()
+    mock_driver = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+    repo = Neo4jReadRepository(mock_driver)
+
+    # Validation guardrails for alert_definition_id & severity
+    for bad_kw in (
+        {"alert_definition_id": 123},
+        {"alert_definition_id": True},
+        {"severity": True},
+        {"severity": False},
+        {"severity": -1},
+        {"severity": "1"},
+        {"severity": 1.5},
+        {"severity": INT64_MAX + 1},
+    ):
+        with pytest.raises(ValueError):
+            repo.list_alert_events(**bad_kw)
+
+    # 1. With alert_definition_id + severity=0 (falsy int) + routing_domain_id
+    count_res = MagicMock()
+    count_res.single.return_value = {"total": 0}
+    mock_tx = MagicMock()
+    mock_tx.run.side_effect = [count_res, []]
+    mock_session.execute_read.side_effect = lambda fn: fn(mock_tx)
+
+    items, total = repo.list_alert_events(
+        alert_definition_id="  Suricata:ET-Open:1:2001219  ",
+        severity=0,
+        routing_domain_id="DMZ",
+    )
+    assert (items, total) == ([], 0)
+    count_cypher = mock_tx.run.call_args_list[0].args[0]
+    page_cypher = mock_tx.run.call_args_list[1].args[0]
+    params = mock_tx.run.call_args_list[0].kwargs
+
+    assert "MATCH (ae:AlertEvent)-[:TRIGGERED_RULE]->(ad:AlertDefinition)" in count_cypher
+    assert "MATCH (ae:AlertEvent)-[:TRIGGERED_RULE]->(ad:AlertDefinition)" in page_cypher
+    assert "ad.definition_id = $alert_definition_id" in count_cypher
+    assert "ae.severity = $severity" in count_cypher
+    assert "ae.routing_domain_id = $routing_domain_id" in count_cypher
+    assert params["alert_definition_id"] == "suricata:et-open:1:2001219"
+    assert params["severity"] == 0
+    assert params["routing_domain_id"] == "dmz"
+
+    # 2. When alert_definition_id is omitted or whitespace-only, keep lean single-node MATCH
+    mock_tx2 = MagicMock()
+    mock_tx2.run.side_effect = [count_res, []]
+    mock_session.execute_read.side_effect = lambda fn: fn(mock_tx2)
+
+    repo.list_alert_events(alert_definition_id="   ", severity=2)
+    count_cypher2 = mock_tx2.run.call_args_list[0].args[0]
+    params2 = mock_tx2.run.call_args_list[0].kwargs
+    assert "MATCH (ae:AlertEvent)" in count_cypher2
+    assert "TRIGGERED_RULE" not in count_cypher2
+    assert "alert_definition_id" not in params2
+    assert params2["severity"] == 2
+
+
+def test_p_numeric_temporal_and_large_flow_id_boundary_contracts():
+    # Exact INT64_MAX nanosecond boundary (9223372036.854775807 -> INT64_MAX)
+    max_ns_obs = _make_alert_obs(
+        timestamp_source="2262-04-11T23:47:16.854775807+0000",
+        timestamp_epoch_decimal=Decimal("9223372036.854775807"),
+    )
+    p_max = suricata_alert_to_payload(max_ns_obs)
+    assert p_max["timestamp_epoch_decimal"] == "9223372036.854775807"
+    assert p_max["timestamp_epoch_ns"] == INT64_MAX
+
+    # One nanosecond beyond INT64_MAX -> exact decimal retained, ns index omitted (None)
+    over_ns_obs = _make_alert_obs(
+        timestamp_source="2262-04-11T23:47:16.854775808+0000",
+        timestamp_epoch_decimal=Decimal("9223372036.854775808"),
+    )
+    p_over = suricata_alert_to_payload(over_ns_obs)
+    assert p_over["timestamp_epoch_decimal"] == "9223372036.854775808"
+    assert p_over["timestamp_epoch_ns"] is None
+
+    # Trailing zeros beyond 9th decimal digit are exact nanoseconds (must NOT become None)
+    tz_obs = _make_alert_obs(
+        timestamp_source="2026-11-20T14:15:32.123456789000+0000",
+        timestamp_epoch_decimal=Decimal("1795184132.123456789000"),
+    )
+    p_tz = suricata_alert_to_payload(tz_obs)
+    assert p_tz["timestamp_epoch_decimal"] == "1795184132.123456789"
+    assert p_tz["timestamp_epoch_ns"] == 1795184132123456789
+
+    # Epoch zero (falsy Decimal(0))
+    zero_obs = _make_alert_obs(
+        timestamp_source="1970-01-01T00:00:00+0000",
+        timestamp_epoch_decimal=Decimal("0"),
+    )
+    p_zero = suricata_alert_to_payload(zero_obs)
+    assert p_zero["timestamp_epoch_decimal"] == "0"
+    assert p_zero["timestamp_epoch_ns"] == 0
+
+    # Read repository large flow_id canonicalization & rejection
+    mock_session = MagicMock()
+    mock_driver = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+    count_res = MagicMock()
+    count_res.single.return_value = {"total": 0}
+    mock_tx = MagicMock()
+    mock_tx.run.side_effect = [count_res, []]
+    mock_session.execute_read.side_effect = lambda fn: fn(mock_tx)
+
+    read_repo = Neo4jReadRepository(mock_driver)
+    read_repo.list_alert_events(flow_id="  00018446744073709551615  ")
+    assert mock_tx.run.call_args_list[0].kwargs["flow_id"] == "18446744073709551615"
+
+    for bad_fid in ("", "   ", "-5", "12.3", "²", 1.2):
+        with pytest.raises(ValueError, match="flow_id"):
+            read_repo.list_alert_events(flow_id=bad_fid)
+
+
+def test_p_multi_batch_definition_counter_accumulation():
+    mock_session = MagicMock()
+    mock_driver = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    # Simulate 3 batches sharing 1 new definition:
+    # Batch 1 creates def (1, 0), Batch 2 & 3 match pre-existing def (0, 1) each.
+    mock_session.execute_write.side_effect = [
+        (2, 0, 1, 0),
+        (2, 0, 0, 1),
+        (1, 0, 0, 1),
+    ]
+    repo = Neo4jRepository(mock_driver, batch_size=2)
+    events = [_make_alert_obs(source_record_id=f"r:{i}") for i in range(5)]
+
+    summary = repo.write_suricata_alert_events(events, batch_size=2)
+    assert summary.total_received == 5
+    assert summary.created_count == 5
+    assert summary.duplicate_matched_count == 0
+    assert summary.definitions_created_count == 1
+    assert summary.definitions_matched_count == 2
+    assert summary.batches_committed == 3
