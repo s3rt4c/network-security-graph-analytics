@@ -1,0 +1,1 @@
+{"timestamp":"2026-11-20T14:30:00.123456+0000","flow_id":5550001,"event_type":"alert","src_ip":"10.0.0.5","src_port":51000,"dest_ip":"10.0.0.20","dest_port":445,"proto":"TCP","app_proto":"smb","alert":{"action":"allowed","gid":1,"signature_id":2020001,"rev":4,"signature":"SYNTHETIC RFC1918 SMB Alert","category":"Attempted Administrator Privilege Gain","severity":1}}
