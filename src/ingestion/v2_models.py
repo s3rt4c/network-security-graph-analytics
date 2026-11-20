@@ -521,3 +521,48 @@ class ZeekConnectionObservation:
     sensor_id: str = "default"
     source_type: str = "zeek"
     source_provenance: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SuricataAlertObservation:
+    """Normalized temporal alert observation parsed from Suricata EVE JSONL (event_type='alert').
+
+    Neo4j-independent domain model preserving exact source timestamp strings and
+    Decimal UTC epochs (never coerced to float), separate AlertDefinition vs AlertEvent
+    identities, explicit RoutingDomain-scoped endpoints, explicit log_source_id provenance,
+    separate Community ID correlation key vs Suricata flow_id, and Suricata-specific alert
+    metadata (severity, action, category) without conflating them with V1 priority or final
+    packet verdicts. Absent optional fields remain None rather than inventing fallback values.
+    """
+    event_id: str
+    alert_definition_id: str
+    source_record_id: str
+    log_source_id: str
+    sensor_id: str
+    ruleset_namespace: str
+    routing_domain_id: str
+    flow_key: str
+    src_ip: str
+    dst_ip: str
+    src_scoped_id: str
+    dst_scoped_id: str
+    timestamp_source: str
+    sid: int
+    source_type: str = "suricata"
+    source_provenance: Optional[str] = None
+    timestamp_epoch_decimal: Optional[Decimal] = None
+    protocol: Optional[str] = None
+    src_port: Optional[int] = None
+    dst_port: Optional[int] = None
+    flow_id: Optional[int] = None
+    community_id: Optional[str] = None
+    gid: Optional[int] = None
+    rev: Optional[int] = None
+    signature: Optional[str] = None
+    category: Optional[str] = None
+    severity: Optional[int] = None
+    action: Optional[str] = None
+    app_proto: Optional[str] = None
+    direction: Optional[str] = None
+    tx_id: Optional[int] = None
+    pcap_cnt: Optional[int] = None
