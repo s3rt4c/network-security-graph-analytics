@@ -39,6 +39,8 @@ from src.ingestion.suricata_eve_parser import (
     MAX_LOGGED_WARNINGS,
     MAX_SAMPLE_ERRORS,
     SuricataIngestionSummary,
+    _compute_record_fingerprint,
+    _serialize_canonical_json,
     iter_suricata_eve_alert_lines,
     parse_suricata_eve_alert_file,
     stream_suricata_eve_alerts,
@@ -668,3 +670,142 @@ def test_parser_fails_clearly_on_missing_file_invalid_config_and_keeps_v1_isolat
         "parse_traffic_file",
         "parse_alert_file",
     }
+
+
+# ---------------------------------------------------------------------------
+# Record Fingerprint Type-Safety & Identity Hardening Regression Tests (A - H)
+# ---------------------------------------------------------------------------
+
+def test_record_fingerprint_a_b_preserves_json_number_vs_string_bool_and_null_types():
+    """Tests A & B: JSON numbers 1.25 / 1.0 remain distinct from strings '1.25' / '1', booleans, and null."""
+    # A: 1.25 (number) vs "1.25" (string)
+    num_125 = json.loads('{"extra": 1.25}', parse_float=Decimal)
+    str_125 = json.loads('{"extra": "1.25"}', parse_float=Decimal)
+    assert _serialize_canonical_json(num_125) == '{"extra":1.25}'
+    assert _serialize_canonical_json(str_125) == '{"extra":"1.25"}'
+    assert _compute_record_fingerprint(num_125) != _compute_record_fingerprint(str_125)
+
+    # B: 1.0 (number) vs "1" (string), plus int 1 vs "1"
+    num_1_0 = json.loads('{"extra": 1.0}', parse_float=Decimal)
+    num_1 = json.loads('{"extra": 1}', parse_float=Decimal)
+    str_1 = json.loads('{"extra": "1"}', parse_float=Decimal)
+    assert _serialize_canonical_json(num_1_0) == '{"extra":1}'
+    assert _serialize_canonical_json(num_1) == '{"extra":1}'
+    assert _serialize_canonical_json(str_1) == '{"extra":"1"}'
+    assert _compute_record_fingerprint(num_1_0) != _compute_record_fingerprint(str_1)
+    assert _compute_record_fingerprint(num_1) != _compute_record_fingerprint(str_1)
+    assert _compute_record_fingerprint(num_1_0) == _compute_record_fingerprint(num_1)
+
+    # Booleans distinct from numbers and strings; null distinct from "null"
+    bool_true = json.loads('{"extra": true}', parse_float=Decimal)
+    bool_false = json.loads('{"extra": false}', parse_float=Decimal)
+    num_0 = json.loads('{"extra": 0}', parse_float=Decimal)
+    str_true = json.loads('{"extra": "true"}', parse_float=Decimal)
+    val_null = json.loads('{"extra": null}', parse_float=Decimal)
+    str_null = json.loads('{"extra": "null"}', parse_float=Decimal)
+
+    assert _compute_record_fingerprint(bool_true) != _compute_record_fingerprint(num_1)
+    assert _compute_record_fingerprint(bool_true) != _compute_record_fingerprint(str_true)
+    assert _compute_record_fingerprint(bool_false) != _compute_record_fingerprint(num_0)
+    assert _compute_record_fingerprint(val_null) != _compute_record_fingerprint(str_null)
+
+    # Full alert records differing only in extra numeric 1.25 vs string "1.25" produce distinct event_ids
+    base = (
+        '"timestamp":"2026-11-20T14:15:30.123456+0000","event_type":"alert",'
+        '"src_ip":"192.0.2.1","dest_ip":"198.51.100.1","alert":{"gid":1,"signature_id":2001219}'
+    )
+    alert_num = list(
+        iter_suricata_eve_alert_lines(
+            ["{" + base + ',"extra":1.25}'],
+            sensor_id="s1",
+            ruleset_namespace="et-open",
+            log_source_id="eve-type-1",
+        )
+    )[0]
+    alert_str = list(
+        iter_suricata_eve_alert_lines(
+            ["{" + base + ',"extra":"1.25"}'],
+            sensor_id="s1",
+            ruleset_namespace="et-open",
+            log_source_id="eve-type-1",
+        )
+    )[0]
+    assert alert_num.source_record_id != alert_str.source_record_id
+    assert alert_num.event_id != alert_str.event_id
+
+
+def test_record_fingerprint_c_d_key_order_invariant_and_array_order_significant():
+    """Tests C & D: Object key order does not change fingerprint; array element order does."""
+    # C: Reordered object keys (top-level and nested) -> identical fingerprint
+    obj_a = json.loads('{"b": 1.25, "a": {"y": true, "x": "ok"}}', parse_float=Decimal)
+    obj_b = json.loads('{"a": {"x": "ok", "y": true}, "b": 1.250}', parse_float=Decimal)
+    assert _compute_record_fingerprint(obj_a) == _compute_record_fingerprint(obj_b)
+
+    # D: Array order is significant
+    arr_a = json.loads('{"tags": [1, 2, "a"]}', parse_float=Decimal)
+    arr_b = json.loads('{"tags": [2, 1, "a"]}', parse_float=Decimal)
+    assert _compute_record_fingerprint(arr_a) != _compute_record_fingerprint(arr_b)
+
+
+def test_record_fingerprint_e_high_precision_over_28_digits_context_independent():
+    """Test E: >28 significant decimal digits are never rounded or collapsed even under low Decimal context."""
+    d1 = json.loads('{"metric": 1725148800.12345678901234567890123456781}', parse_float=Decimal)
+    d2 = json.loads('{"metric": 1725148800.12345678901234567890123456782}', parse_float=Decimal)
+    s1 = json.loads('{"metric": "1725148800.12345678901234567890123456781"}', parse_float=Decimal)
+    extreme = json.loads('{"metric": 1.500e50000}', parse_float=Decimal)
+
+    with localcontext() as ctx:
+        ctx.prec = 6
+        fp_d1 = _compute_record_fingerprint(d1)
+        fp_d2 = _compute_record_fingerprint(d2)
+        fp_s1 = _compute_record_fingerprint(s1)
+        ser_extreme = _serialize_canonical_json(extreme)
+
+    assert fp_d1 != fp_d2
+    assert fp_d1 != fp_s1
+    assert ser_extreme == '{"metric":1.5e+50000}'
+    # Matches default-context fingerprint identically
+    assert fp_d1 == _compute_record_fingerprint(d1)
+
+
+def test_record_fingerprint_f_g_h_and_existing_community_id_on_non_transport_proto():
+    """Tests F, G, H plus existing community_id on GRE emits no spurious unsupported_protocol warning."""
+    line = (
+        '{"timestamp":"2026-11-20T14:15:30.123456+0000","event_type":"alert",'
+        '"src_ip":"192.0.2.1","dest_ip":"198.51.100.1","proto":"GRE",'
+        '"community_id":"1:existingGreCid==","extra":2.5,"alert":{"gid":1,"signature_id":3001}}'
+    )
+    # F & G: Reimport identical lines -> identical IDs; identical alert on line 1 vs line 2 -> distinct IDs
+    stream1 = iter_suricata_eve_alert_lines(
+        [line, line],
+        sensor_id="s1",
+        ruleset_namespace="et-open",
+        log_source_id="eve-fgh-1",
+    )
+    recs1 = list(stream1)
+    assert stream1.summary.warning_counts == {}  # No spurious unsupported_protocol warning when community_id exists
+    assert recs1[0].community_id == "1:existingGreCid=="
+    assert recs1[0].event_id != recs1[1].event_id
+
+    recs2 = list(
+        iter_suricata_eve_alert_lines(
+            [line, line],
+            sensor_id="s1",
+            ruleset_namespace="et-open",
+            log_source_id="eve-fgh-1",
+        )
+    )
+    assert [r.source_record_id for r in recs1] == [r.source_record_id for r in recs2]
+    assert [r.event_id for r in recs1] == [r.event_id for r in recs2]
+
+    # H: Distinct log_source_id remains strictly isolated
+    recs_other = list(
+        iter_suricata_eve_alert_lines(
+            [line, line],
+            sensor_id="s1",
+            ruleset_namespace="et-open",
+            log_source_id="eve-fgh-2",
+        )
+    )
+    assert recs1[0].source_record_id != recs_other[0].source_record_id
+    assert recs1[0].event_id != recs_other[0].event_id

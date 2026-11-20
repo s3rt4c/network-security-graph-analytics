@@ -133,31 +133,76 @@ def _validate_parser_config(
     )
 
 
-def _canonicalize_json_value(value: Any) -> Any:
-    """Convert parsed JSON values (including Decimal) into JSON-serializable canonical primitives."""
+def _format_canonical_json_number(value: Decimal) -> str:
+    """Format a Decimal as an exact unquoted canonical JSON number literal without context rounding."""
+    if value.is_nan():
+        return "NaN"
+    if value.is_infinite():
+        return "-Infinity" if value.is_signed() else "Infinity"
+    try:
+        return format_canonical_decimal(value)
+    except ValueError:
+        # Exact lossless scientific notation for extreme exponents exceeding +/-10_000
+        sign, digits, exp = value.as_tuple()
+        if not digits or all(d == 0 for d in digits):
+            return "0"
+        digit_str = "".join(str(d) for d in digits).lstrip("0")
+        eff_digits = digit_str.rstrip("0")
+        eff_exp = exp + (len(digit_str) - len(eff_digits))
+        sci_exp = eff_exp + len(eff_digits) - 1
+        prefix = "-" if sign else ""
+        mantissa = eff_digits if len(eff_digits) == 1 else f"{eff_digits[0]}.{eff_digits[1:]}"
+        exp_sign = "+" if sci_exp >= 0 else "-"
+        return f"{prefix}{mantissa}e{exp_sign}{abs(sci_exp)}"
+
+
+def _serialize_canonical_json(value: Any) -> str:
+    """Serialize a parsed JSON value to an unambiguous, type-preserving canonical JSON string.
+
+    Guarantees:
+    - JSON numbers (int, Decimal) emit unquoted literals; JSON strings emit quoted strings.
+    - JSON booleans (true/false) remain distinct from numbers (1/0) and strings.
+    - JSON null remains distinct from "null".
+    - Object key order is normalized lexicographically; array order is preserved.
+    - High-precision Decimal numbers (>28 significant digits) are serialized losslessly
+      independent of decimal.getcontext().prec.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
     if isinstance(value, Decimal):
-        if value.is_nan() or value.is_infinite():
-            return str(value)
-        try:
-            return format_canonical_decimal(value)
-        except ValueError:
-            return str(value)
-    if isinstance(value, dict):
-        return {str(k): _canonicalize_json_value(v) for k, v in value.items()}
+        return _format_canonical_json_number(value)
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return "NaN"
+        if value == float("inf"):
+            return "Infinity"
+        if value == float("-inf"):
+            return "-Infinity"
+        return _format_canonical_json_number(Decimal(str(value)))
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
-        return [_canonicalize_json_value(item) for item in value]
-    return value
+        return "[" + ",".join(_serialize_canonical_json(item) for item in value) + "]"
+    if isinstance(value, dict):
+        items = sorted(((str(k), v) for k, v in value.items()), key=lambda kv: kv[0])
+        return (
+            "{"
+            + ",".join(
+                f"{json.dumps(k, ensure_ascii=False)}:{_serialize_canonical_json(v)}"
+                for k, v in items
+            )
+            + "}"
+        )
+    raise TypeError(f"Unsupported value type for canonical JSON fingerprinting: {type(value).__name__}")
 
 
 def _compute_record_fingerprint(entry: Dict[str, Any]) -> str:
-    """Compute a stable SHA-256 fingerprint of a parsed EVE alert JSON object."""
-    canonical_obj = _canonicalize_json_value(entry)
-    serialized = json.dumps(
-        canonical_obj,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
+    """Compute a deterministic, type-safe SHA-256 fingerprint of a parsed EVE alert JSON object."""
+    serialized = _serialize_canonical_json(entry)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
@@ -609,7 +654,7 @@ class SuricataEveAlertStream:
         cid_src_port: Optional[int] = src_port
         cid_dst_port: Optional[int] = dst_port
 
-        if protocol is not None:
+        if existing_cid is None and protocol is not None:
             if protocol in _PORT_TRANSPORT_PROTOS:
                 if src_port is not None and dst_port is not None:
                     cid_proto = protocol

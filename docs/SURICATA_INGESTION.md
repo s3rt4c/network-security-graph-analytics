@@ -109,7 +109,7 @@ Suricata EVE does **not** guarantee a unique per-alert record ID: a single `flow
 To keep streaming memory strictly `O(1)` without an unbounded in-memory set:
 
 1. Callers must provide an explicit, stable **`log_source_id`** identifying the logical EVE log stream (never implicitly derived from the file's absolute filesystem path).
-2. For each valid alert at 1-based physical line ordinal `line_no`, the parser computes a canonical SHA-256 `record_fingerprint` of the parsed JSON object (using exact `format_canonical_decimal()` for numeric values) and derives:
+2. For each valid alert at 1-based physical line ordinal `line_no`, the parser computes a **type-safe canonical RFC 8259 JSON SHA-256 `record_fingerprint`** of the parsed JSON object — sorting object keys lexicographically, preserving array element order, keeping JSON types unambiguous (numbers unquoted via exact context-independent `format_canonical_decimal()`, strings quoted, booleans `true`/`false`, and `null` distinct from strings/numbers), and deriving:
    ```
    source_record_id = "{log_source_id}:line:{line_no}:{record_fingerprint}"
    ```
