@@ -29,6 +29,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
@@ -133,12 +134,21 @@ def _validate_parser_config(
     )
 
 
+class _NonStandardJsonConstantError(ValueError):
+    """Raised when non-RFC-8259 JSON constants (NaN, Infinity, -Infinity) appear in input."""
+
+
+def _reject_nonstandard_json_constant(constant: str) -> None:
+    """Reject non-standard JSON constants (NaN, Infinity, -Infinity) during json.loads()."""
+    raise _NonStandardJsonConstantError(
+        f"Non-standard JSON constant '{constant}' is not valid RFC 8259 JSON"
+    )
+
+
 def _format_canonical_json_number(value: Decimal) -> str:
-    """Format a Decimal as an exact unquoted canonical JSON number literal without context rounding."""
-    if value.is_nan():
-        return "NaN"
-    if value.is_infinite():
-        return "-Infinity" if value.is_signed() else "Infinity"
+    """Format a finite Decimal as an exact unquoted canonical JSON number literal without context rounding."""
+    if value.is_nan() or value.is_infinite():
+        raise ValueError(f"Non-finite Decimal value '{value}' is not valid RFC 8259 JSON")
     try:
         return format_canonical_decimal(value)
     except ValueError:
@@ -160,7 +170,8 @@ def _serialize_canonical_json(value: Any) -> str:
     """Serialize a parsed JSON value to an unambiguous, type-preserving canonical JSON string.
 
     Guarantees:
-    - JSON numbers (int, Decimal) emit unquoted literals; JSON strings emit quoted strings.
+    - JSON numbers (int, finite Decimal/float) emit unquoted literals; JSON strings emit quoted strings.
+    - Non-finite numeric values (NaN, Infinity, -Infinity) are rejected rather than serialized.
     - JSON booleans (true/false) remain distinct from numbers (1/0) and strings.
     - JSON null remains distinct from "null".
     - Object key order is normalized lexicographically; array order is preserved.
@@ -176,12 +187,8 @@ def _serialize_canonical_json(value: Any) -> str:
     if isinstance(value, Decimal):
         return _format_canonical_json_number(value)
     if isinstance(value, float):
-        if value != value:  # NaN
-            return "NaN"
-        if value == float("inf"):
-            return "Infinity"
-        if value == float("-inf"):
-            return "-Infinity"
+        if not math.isfinite(value):
+            raise ValueError(f"Non-finite float value '{value}' is not valid RFC 8259 JSON")
         return _format_canonical_json_number(Decimal(str(value)))
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
@@ -740,9 +747,14 @@ class SuricataEveAlertStream:
                 self._total_raw_records += 1
 
                 try:
-                    parsed = json.loads(stripped, parse_float=Decimal)
-                except json.JSONDecodeError as exc:
-                    self._record_warning("malformed_json", f"Line {line_no} malformed JSON: {exc.msg}")
+                    parsed = json.loads(
+                        stripped,
+                        parse_float=Decimal,
+                        parse_constant=_reject_nonstandard_json_constant,
+                    )
+                except (json.JSONDecodeError, _NonStandardJsonConstantError) as exc:
+                    detail = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+                    self._record_warning("malformed_json", f"Line {line_no} malformed JSON: {detail}")
                     self._skipped_records += 1
                     continue
 

@@ -809,3 +809,57 @@ def test_record_fingerprint_f_g_h_and_existing_community_id_on_non_transport_pro
     )
     assert recs1[0].source_record_id != recs_other[0].source_record_id
     assert recs1[0].event_id != recs_other[0].event_id
+
+
+def test_reject_nonstandard_json_constants_and_continue_streaming():
+    """Tests A-F: NaN, Infinity, and -Infinity are rejected as malformed_json while subsequent valid alerts succeed."""
+    base = (
+        '"timestamp":"2026-11-20T14:15:30.123456+0000","event_type":"alert",'
+        '"src_ip":"192.0.2.10","src_port":50000,"dest_ip":"198.51.100.20","dest_port":443,'
+        '"proto":"TCP","alert":{"gid":1,"signature_id":2005555}'
+    )
+    lines = [
+        "{" + base + ',"extra":NaN}',
+        "{" + base + ',"extra":Infinity}',
+        "{" + base + ',"extra":-Infinity}',
+        "{" + base + ',"extra":1725148800.12345678901234567890123456789}',
+    ]
+
+    stream = iter_suricata_eve_alert_lines(
+        lines,
+        sensor_id="s-strict",
+        ruleset_namespace="et-open",
+        log_source_id="eve-strict-1",
+    )
+    records = list(stream)
+    summary = stream.summary
+
+    # A, B, C: NaN, Infinity, -Infinity rejected as malformed_json
+    assert summary.total_raw_records == 4
+    assert summary.skipped_records == 3
+    assert summary.valid_records == 1
+    assert summary.ignored_non_alert_records == 0
+    assert summary.warning_counts == {"malformed_json": 3}
+
+    # D, E, F: Stream did not abort; following valid high-precision alert processed with stable type-safe identity
+    assert len(records) == 1
+    assert records[0].sid == 2005555
+
+    # Re-parsing the same stream yields the identical event_id
+    records_repeat = list(
+        iter_suricata_eve_alert_lines(
+            lines,
+            sensor_id="s-strict",
+            ruleset_namespace="et-open",
+            log_source_id="eve-strict-1",
+        )
+    )
+    assert records_repeat[0].event_id == records[0].event_id
+
+    # Serializer also rejects non-finite numeric values directly for consistency
+    with pytest.raises(ValueError, match="Non-finite"):
+        _serialize_canonical_json({"extra": Decimal("NaN")})
+    with pytest.raises(ValueError, match="Non-finite"):
+        _serialize_canonical_json({"extra": Decimal("Infinity")})
+    with pytest.raises(ValueError, match="Non-finite"):
+        _serialize_canonical_json({"extra": float("-inf")})
