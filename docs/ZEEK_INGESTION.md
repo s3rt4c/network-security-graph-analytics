@@ -1,8 +1,8 @@
 [← Back to README](../README.md)
 
-# Zeek `conn.log` JSON Ingestion & Normalization (Phase 3A.1)
+# Zeek `conn.log` JSON Ingestion & Neo4j `FlowObservation` Persistence (Phases 3A.1 & 3A.2)
 
-This document specifies the streaming Zeek `conn.log` JSONL parser (`src/ingestion/zeek_conn_parser.py`) and normalized observation data contract (`ZeekConnectionObservation` in `src/ingestion/v2_models.py`).
+This document specifies the streaming Zeek `conn.log` JSONL parser (`src/ingestion/zeek_conn_parser.py`), normalized observation data contract (`ZeekConnectionObservation` in `src/ingestion/v2_models.py`), Neo4j `FlowObservation` persistence (`src/graph/repository.py`, `src/graph/schema.py`, `src/graph/read_repository.py`), and streaming parser-to-database entrypoint (`src/services/zeek_ingestion.py`).
 
 ---
 
@@ -119,9 +119,69 @@ All V2 identities delegate strictly to existing primitives in `src/ingestion/v2_
 
 ---
 
-## 7. Known Limitations (Phase 3A.1 Scope)
+## 7. Neo4j `FlowObservation` Persistence (Phase 3A.2)
 
-- **No Neo4j persistence yet:** Phase 3A.1 covers parsing, validation, and normalization only; Neo4j `FlowObservation` persistence is deferred to Phase 3A.2.
+### Graph Model & Relationship Direction
+
+Each discrete Zeek connection observation is persisted as a `(:FlowObservation)` node distinct from logical `COMMUNICATED_TO` traffic aggregates:
+
+```
+(:FlowObservation {observation_id (UQ), ...})
+    ├──[:HAS_ORIGINATOR]──▶ (orig:IPAddress {scoped_id (UQ)})──[:IN_DOMAIN]──▶ (:RoutingDomain {domain_id (UQ)})
+    └──[:HAS_RESPONDER]───▶ (resp:IPAddress {scoped_id (UQ)})──[:IN_DOMAIN]──▶ (:RoutingDomain {domain_id (UQ)})
+```
+
+- **Uniqueness & Indexes (`src/graph/schema.py`):**
+  - `flow_observation_unique`: `UNIQUE` constraint on `FlowObservation.observation_id` (never `community_id`, `flow_key`, or `zeek_uid`).
+  - `flow_observation_community_id_index`: non-unique lookup index on `FlowObservation.community_id`.
+  - `flow_observation_sensor_id_index`: lookup index on `FlowObservation.sensor_id`.
+  - `flow_observation_routing_domain_index`: lookup index on `FlowObservation.routing_domain_id`.
+  - `flow_observation_start_epoch_ns_index`: numeric temporal lookup index on `FlowObservation.start_epoch_ns`.
+- **Mutual Domain/Endpoint Consistency:** Before writing, `zeek_observation_to_payload()` verifies that `src_scoped_id == scoped_ip_id(routing_domain_id, src_ip)`, `dst_scoped_id == scoped_ip_id(routing_domain_id, dst_ip)`, and both endpoints share the same IP version. Cross-domain attachments are rejected.
+- **No V1 Aggregate Mutation:** Zeek observations are never automatically converted into `COMMUNICATED_TO` edges.
+
+### Exact Temporal Storage Contract
+
+Neo4j does not natively store Python `Decimal`, and IEEE 754 `float` truncates nanosecond precision. All decimal canonicalization (`format_canonical_decimal()` / `canonicalize_event_timestamp()` / `format_exact_decimal()`), derived end-time addition (`add_exact_decimals()`), and integer nanosecond conversion (`decimal_epoch_to_ns()`) operate directly on `Decimal.as_tuple()` with exact Python integer arithmetic — **completely independent of Python's active `decimal.getcontext().prec`** (never relying on context-sensitive `Decimal.normalize()` or `Decimal` multiplication/addition). Every persisted `FlowObservation` stores:
+
+- **Authoritative lossless string properties:** `start_ts`, `end_ts`, `start_epoch_decimal`, `end_epoch_decimal`, `duration_decimal` (preserving every significant source digit, including inputs exceeding 28 significant digits).
+- **Optional exact 64-bit integer nanosecond index properties:** `start_epoch_ns`, `end_epoch_ns` derived via exact `Decimal.as_tuple()` integer scaling.
+  - Supported lossless precision: up to 9 fractional digits (nanoseconds, including trailing zeros past the 9th place) within signed 64-bit integer bounds (`-(2^63)` to `2^63 - 1`, covering Unix epoch `0` through `9223372036.854775807`, i.e., years 1970–2262).
+  - **Explicit non-truncation policy:** Timestamps with any nonzero fractional digit beyond the 9th decimal place (sub-nanosecond precision, even beyond 28 significant digits) or outside signed 64-bit bounds set `*_epoch_ns = None` rather than silently truncating, rounding, or overflowing, while retaining exact original strings in `start_ts` and `*_epoch_decimal`.
+- **Phase 1 Identity Compatibility:** Ordinary numeric timestamps (≤28 significant digits, including standard microsecond and nanosecond Unix epochs) and all ISO 8601 string timestamps produce **byte-identical** canonical strings and `observation_id` digests. Extreme-precision numeric inputs (>28 significant digits) that were previously silently rounded by `Decimal.normalize()` now preserve all significant digits so distinct events no longer collide.
+
+### Idempotency, Immutability & Conflict Policy
+
+- `Neo4jRepository.write_zeek_observations(observations, batch_size=...)` computes a deterministic `payload_digest` (SHA-256 over all immutable persisted fields) and uses `MERGE (fo:FlowObservation {observation_id: row.observation_id}) ON CREATE SET ...`.
+- Re-importing identical observations creates zero duplicate nodes, zero duplicate relationships, and never doubles directional byte/packet counters.
+- If an existing `observation_id` is re-submitted with conflicting properties (either intra-batch or against Neo4j), `ObservationConflictError` is raised and the offending batch rolls back without overwriting existing facts.
+
+### Streaming Batch Semantics & Entrypoint
+
+- Consumes any `Iterable[ZeekConnectionObservation]` lazily in bounded chunks (`O(batch_size)` RAM; never calls `list(observations)`).
+- Each batch commits inside its own retry-safe managed write transaction (`session.execute_write`). Earlier batches remain committed if a later batch fails; retrying the stream is idempotent for already-committed observations.
+- **Parser-to-Neo4j Entrypoint (`src/services/zeek_ingestion.py`):**
+  ```bash
+  python -m src.services.zeek_ingestion \
+    --file path/to/conn.log.jsonl \
+    --sensor-id zeek-edge-01 \
+    --routing-domain-id corp-prod \
+    --batch-size 500
+  ```
+  Programmatic API: `ingest_zeek_conn_file(file_path, sensor_id=..., routing_domain_id="default", source_provenance=None, batch_size=500)`. Verifies connectivity, calls `ensure_schema(driver)`, and refuses unsafe writes against unmigrated legacy V1 databases (`MigrationRequiredError`).
+
+### Read Capabilities & Workspace Replacement Safety
+
+- **Read Repository (`src/graph/read_repository.py`):**
+  - `get_flow_observation(observation_id)`: exact lookup by `observation_id`.
+  - `list_flow_observations(routing_domain_id=None, sensor_id=None, community_id=None, start_epoch_ns_min=None, start_epoch_ns_max=None, limit=50, offset=0)`: bounded paginated list with deterministic ordering (`start_epoch_ns ASC NULLS LAST, observation_id ASC`). Temporal bounds operate strictly on exact integer `start_epoch_ns` (never lexicographic string comparison), and observations sharing `flow_key` or `community_id` are never collapsed.
+- **Atomic Workspace Replacement:** `CYPHER_SCOPED_CLEANUP` includes `n:FlowObservation` alongside `:IPAddress`, `:Layer2Identifier`, `:AlertFact`, and `:RoutingDomain` so single-workspace replacement never leaves orphaned `FlowObservation` nodes, preserves unrelated external graph labels, and rolls back all prior `FlowObservation` nodes atomically if replacement fails.
+
+---
+
+## 8. Operational Limitations (Phase 3A Scope)
+
+- **Per-batch transaction boundary:** Streaming batch ingestion commits per batch (`O(batch_size)` memory) and does not provide file-wide multi-batch atomicity; recovery relies on idempotent retry by `observation_id`.
 - **JSONL format only:** Zeek tab-separated ASCII (`#fields`) logs are not parsed by this module.
-- **No Suricata / AlertEvent ingestion or Detection Engine:** Deferred to subsequent Phase 3 milestones.
-- **Single-pass streaming summary:** Streaming mode does not keep an in-memory set of seen `observation_id`s across a file (avoiding unbounded RAM growth); deduplication is achieved deterministically via `observation_id` during persistence.
+- **No Suricata / AlertEvent ingestion, public REST routes, or frontend UI yet:** Deferred to subsequent Phase 3 milestones.
+- **Sub-nanosecond range queries:** Observations whose timestamps exceed nanosecond precision (>9 fractional digits) retain exact string timestamps (`start_ts`, `start_epoch_decimal`) but have `start_epoch_ns = None` and are excluded from integer `start_epoch_ns` range filters rather than being truncated.

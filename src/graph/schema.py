@@ -64,6 +64,26 @@ POST_DROP_SCHEMA_STATEMENTS: List[str] = [
     # 7. AlertFact sid index for rule/signature queries
     "CREATE INDEX alert_fact_sid_index IF NOT EXISTS "
     "FOR (fact:AlertFact) ON (fact.sid)",
+
+    # 8. FlowObservation uniqueness constraint on deterministic observation_id
+    "CREATE CONSTRAINT flow_observation_unique IF NOT EXISTS "
+    "FOR (fo:FlowObservation) REQUIRE fo.observation_id IS UNIQUE",
+
+    # 9. FlowObservation non-unique lookup index on Community ID for cross-tool correlation
+    "CREATE INDEX flow_observation_community_id_index IF NOT EXISTS "
+    "FOR (fo:FlowObservation) ON (fo.community_id)",
+
+    # 10. FlowObservation lookup index on sensor_id
+    "CREATE INDEX flow_observation_sensor_id_index IF NOT EXISTS "
+    "FOR (fo:FlowObservation) ON (fo.sensor_id)",
+
+    # 11. FlowObservation lookup index on routing_domain_id
+    "CREATE INDEX flow_observation_routing_domain_index IF NOT EXISTS "
+    "FOR (fo:FlowObservation) ON (fo.routing_domain_id)",
+
+    # 12. FlowObservation numeric temporal index on lossless 64-bit epoch nanoseconds
+    "CREATE INDEX flow_observation_start_epoch_ns_index IF NOT EXISTS "
+    "FOR (fo:FlowObservation) ON (fo.start_epoch_ns)",
 ]
 
 # Neo4j 5.x constraint DDL statements (backed by RANGE indexes)
