@@ -15,6 +15,9 @@ from src.ingestion.v2_models import scoped_ip_id
 
 logger = logging.getLogger(__name__)
 
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
 
 class AmbiguousEndpointError(ValueError):
     """Raised when an address-only query matches multiple endpoints across different routing domains."""
@@ -1493,10 +1496,20 @@ class Neo4jReadRepository:
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError(f"offset must be an integer >= 0, got {offset!r}")
 
-        if start_epoch_ns_min is not None and (isinstance(start_epoch_ns_min, bool) or not isinstance(start_epoch_ns_min, int)):
-            raise ValueError(f"start_epoch_ns_min must be an integer or None, got {start_epoch_ns_min!r}")
-        if start_epoch_ns_max is not None and (isinstance(start_epoch_ns_max, bool) or not isinstance(start_epoch_ns_max, int)):
-            raise ValueError(f"start_epoch_ns_max must be an integer or None, got {start_epoch_ns_max!r}")
+        if start_epoch_ns_min is not None:
+            if isinstance(start_epoch_ns_min, bool) or not isinstance(start_epoch_ns_min, int):
+                raise ValueError(f"start_epoch_ns_min must be an integer or None, got {start_epoch_ns_min!r}")
+            if not (_INT64_MIN <= start_epoch_ns_min <= _INT64_MAX):
+                raise ValueError(
+                    f"start_epoch_ns_min must fit in signed 64-bit integer range [{_INT64_MIN}, {_INT64_MAX}]"
+                )
+        if start_epoch_ns_max is not None:
+            if isinstance(start_epoch_ns_max, bool) or not isinstance(start_epoch_ns_max, int):
+                raise ValueError(f"start_epoch_ns_max must be an integer or None, got {start_epoch_ns_max!r}")
+            if not (_INT64_MIN <= start_epoch_ns_max <= _INT64_MAX):
+                raise ValueError(
+                    f"start_epoch_ns_max must fit in signed 64-bit integer range [{_INT64_MIN}, {_INT64_MAX}]"
+                )
         if (
             start_epoch_ns_min is not None
             and start_epoch_ns_max is not None

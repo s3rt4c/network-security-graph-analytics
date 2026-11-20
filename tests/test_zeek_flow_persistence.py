@@ -3,7 +3,8 @@ Unit tests for Phase 3A.2 Zeek FlowObservation Neo4j persistence, schema, reads,
 """
 
 from dataclasses import replace
-from decimal import Decimal
+from decimal import Decimal, getcontext, localcontext
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
@@ -24,10 +25,14 @@ from src.graph.repository import (
 from src.graph.schema import MigrationRequiredError, SCHEMA_STATEMENTS
 from src.ingestion.v2_models import (
     ZeekConnectionObservation,
+    add_exact_decimals,
+    canonicalize_event_timestamp,
     compute_observation_id,
     compute_v2_flow_key,
+    format_canonical_decimal,
     scoped_ip_id,
 )
+from src.ingestion.zeek_conn_parser import iter_zeek_conn_lines
 from src.services.zeek_ingestion import ingest_zeek_conn_file, main as zeek_cli_main
 
 FIXTURE_STANDARD = Path(__file__).parent / "fixtures" / "zeek" / "conn_standard.jsonl"
@@ -688,3 +693,201 @@ def test_ingest_zeek_conn_file_closes_owned_driver_and_cli_exit_codes():
     # Missing file returns exit code 1 cleanly without touching Neo4j
     rc_err = zeek_cli_main(["--file", "nonexistent_conn.jsonl", "--sensor-id", "zeek-cli-01"])
     assert rc_err == 1
+
+
+# ---------------------------------------------------------------------------
+# Exact Lossless Decimal Precision Hardening Regression Tests (A - K)
+# ---------------------------------------------------------------------------
+
+def test_decimal_precision_a_b_c_nanosecond_picosecond_and_over_28_digits():
+    """Tests A, B, C: 9-digit ns, 10/12-digit sub-ns, and >28 significant digits never round."""
+    # A: 9-digit nanosecond precision -> exact string + exact int64 ns
+    ns_val = Decimal("1725148800.123456789")
+    assert format_exact_decimal(ns_val) == "1725148800.123456789"
+    assert canonicalize_event_timestamp(ns_val) == "1725148800.123456789"
+    assert decimal_epoch_to_ns(ns_val) == 1725148800123456789
+
+    # B: 10-digit and 12-digit fractional precision -> exact strings, ns index must be None
+    d10 = Decimal("1725148800.1234567895")
+    d12 = Decimal("1725148800.123456789012")
+    assert format_exact_decimal(d10) == "1725148800.1234567895"
+    assert format_exact_decimal(d12) == "1725148800.123456789012"
+    assert canonicalize_event_timestamp(d10) == "1725148800.1234567895"
+    assert canonicalize_event_timestamp(d12) == "1725148800.123456789012"
+    assert decimal_epoch_to_ns(d10) is None
+    assert decimal_epoch_to_ns(d12) is None
+
+    # C: 39 significant digits (> default prec=28) -> every single digit preserved
+    v39 = Decimal("1725148800.12345678901234567890123456789")
+    expected_39 = "1725148800.12345678901234567890123456789"
+    assert format_canonical_decimal(v39) == expected_39
+    assert format_exact_decimal(v39) == expected_39
+    assert canonicalize_event_timestamp(v39) == expected_39
+    assert canonicalize_event_timestamp(expected_39) == expected_39
+    assert decimal_epoch_to_ns(v39) is None
+
+
+def test_decimal_precision_d_distinct_beyond_28th_significant_digit_do_not_collapse():
+    """Test D: Timestamps differing only beyond the 28th significant digit stay distinct in ts and observation_id."""
+    ts_a = "1725148800.12345678901234567890123456781"
+    ts_b = "1725148800.12345678901234567890123456782"
+
+    assert canonicalize_event_timestamp(ts_a) == ts_a
+    assert canonicalize_event_timestamp(ts_b) == ts_b
+    assert canonicalize_event_timestamp(ts_a) != canonicalize_event_timestamp(ts_b)
+
+    obs_id_a = compute_observation_id("zeek", "sensor-1", "CUidExtreme", ts_a, "fk-1")
+    obs_id_b = compute_observation_id("zeek", "sensor-1", "CUidExtreme", ts_b, "fk-1")
+    assert obs_id_a != obs_id_b
+
+    lines = [
+        f'{{"ts":{ts_a},"uid":"CUidExtreme","id.orig_h":"10.0.0.1","id.orig_p":50000,"id.resp_h":"10.0.0.2","id.resp_p":443,"proto":"tcp"}}',
+        f'{{"ts":{ts_b},"uid":"CUidExtreme","id.orig_h":"10.0.0.1","id.orig_p":50000,"id.resp_h":"10.0.0.2","id.resp_p":443,"proto":"tcp"}}',
+    ]
+    recs = list(iter_zeek_conn_lines(lines, sensor_id="sensor-1"))
+    assert len(recs) == 2
+    assert recs[0].start_ts == ts_a
+    assert recs[1].start_ts == ts_b
+    assert recs[0].observation_id != recs[1].observation_id
+
+
+def test_decimal_precision_e_equivalent_numeric_representations():
+    """Test E: Equivalent numeric representations canonicalize identically, including long trailing zeros."""
+    assert canonicalize_event_timestamp("1725148800.1") == "1725148800.1"
+    assert canonicalize_event_timestamp("1725148800.100") == "1725148800.1"
+    assert format_exact_decimal(Decimal("1725148800.1")) == format_exact_decimal(Decimal("1725148800.100"))
+    assert format_exact_decimal(Decimal("1725148800.0000")) == "1725148800"
+    assert format_exact_decimal(Decimal("1.7251488001E+9")) == "1725148800.1"
+
+    # Trailing zeros past 9th fractional place ARE exact integer nanoseconds!
+    exact_ns_with_zeros = Decimal("1725148800.1234567890000000000000000000")
+    assert format_exact_decimal(exact_ns_with_zeros) == "1725148800.123456789"
+    assert decimal_epoch_to_ns(exact_ns_with_zeros) == 1725148800123456789
+
+
+def test_decimal_precision_f_context_independence_under_low_precision():
+    """Test F: Deliberately low Decimal context precision never rounds outputs or mutates global context."""
+    original_global_prec = getcontext().prec
+    ts_str = "1725148800.123456789"
+    dur_str = "0.000000001"
+    iso_ts = "2024-09-01T12:00:00.123456789Z"
+
+    line_num = (
+        f'{{"ts":{ts_str},"uid":"CLowPrec01","id.orig_h":"10.0.0.1","id.orig_p":50000,'
+        f'"id.resp_h":"10.0.0.2","id.resp_p":443,"proto":"tcp","duration":{dur_str}}}'
+    )
+    line_iso = json.dumps({
+        "ts": iso_ts,
+        "uid": "CLowPrecIso",
+        "id.orig_h": "10.0.0.1",
+        "id.orig_p": 50001,
+        "id.resp_h": "10.0.0.2",
+        "id.resp_p": 443,
+        "proto": "tcp",
+        "duration": "0.500000001",
+    })
+
+    # Parse under normal context as golden reference
+    ref_num = list(iter_zeek_conn_lines([line_num], sensor_id="s-ctx"))[0]
+    ref_iso = list(iter_zeek_conn_lines([line_iso], sensor_id="s-ctx"))[0]
+
+    # Repeat under deliberately tiny localcontext(prec=6)
+    with localcontext() as ctx:
+        ctx.prec = 6
+        assert canonicalize_event_timestamp(Decimal(ts_str)) == ts_str
+        assert format_exact_decimal(Decimal(ts_str)) == ts_str
+        assert decimal_epoch_to_ns(Decimal(ts_str)) == 1725148800123456789
+        assert add_exact_decimals(Decimal(ts_str), Decimal(dur_str)) == Decimal("1725148800.123456790")
+
+        low_num = list(iter_zeek_conn_lines([line_num], sensor_id="s-ctx"))[0]
+        low_iso = list(iter_zeek_conn_lines([line_iso], sensor_id="s-ctx"))[0]
+        low_payload = zeek_observation_to_payload(low_num)
+
+    assert getcontext().prec == original_global_prec
+    assert low_num.start_ts == ref_num.start_ts == ts_str
+    assert low_num.end_epoch == ref_num.end_epoch == Decimal("1725148800.123456790")
+    assert low_num.end_ts == ref_num.end_ts == "1725148800.12345679"
+    assert low_num.observation_id == ref_num.observation_id
+    assert low_payload["start_epoch_decimal"] == ts_str
+    assert low_payload["end_epoch_decimal"] == "1725148800.12345679"
+    assert low_payload["start_epoch_ns"] == 1725148800123456789
+    assert low_payload["end_epoch_ns"] == 1725148800123456790
+
+    assert low_iso.start_epoch == ref_iso.start_epoch == Decimal("1725192000.123456789")
+    assert low_iso.end_epoch == ref_iso.end_epoch == Decimal("1725192000.623456790")
+    assert low_iso.observation_id == ref_iso.observation_id
+
+
+def test_decimal_precision_g_sub_nanosecond_tiny_remainder_rejected_for_ns_index():
+    """Test G: Tiny nonzero digit far past the 9th fractional place must return None (never round to integer ns)."""
+    tiny_sub_ns = Decimal("1725148800.1234567890000000000000000001")
+    assert decimal_epoch_to_ns(tiny_sub_ns) is None
+    assert format_exact_decimal(tiny_sub_ns) == "1725148800.1234567890000000000000000001"
+
+    # Even smaller remainder at 60 fractional digits
+    ultra_tiny = Decimal("1725148800." + "0" * 59 + "1")
+    assert decimal_epoch_to_ns(ultra_tiny) is None
+    assert format_exact_decimal(ultra_tiny) == "1725148800." + "0" * 59 + "1"
+
+    # Pathological negative scientific exponent never crashes or truncates
+    assert decimal_epoch_to_ns(Decimal("1E-100000")) is None
+
+
+def test_decimal_precision_h_int64_upper_boundary_and_overflow():
+    """Test H: Exact INT64_MAX nanosecond boundary succeeds; INT64_MAX+1 and huge exponents return None."""
+    exact_max_epoch = Decimal("9223372036.854775807")
+    overflow_by_1ns = Decimal("9223372036.854775808")
+    overflow_by_sub_ns = Decimal("9223372036.8547758071")
+
+    assert decimal_epoch_to_ns(exact_max_epoch) == INT64_MAX
+    assert decimal_epoch_to_ns(overflow_by_1ns) is None
+    assert decimal_epoch_to_ns(overflow_by_sub_ns) is None
+    assert decimal_epoch_to_ns(Decimal("10000000000")) is None  # 10**19 ns > INT64_MAX
+    assert decimal_epoch_to_ns(Decimal("9000000000")) == 9_000_000_000_000_000_000
+    assert decimal_epoch_to_ns(Decimal("1E+100000")) is None
+
+    # Read repository also rejects out-of-int64 bounds explicitly
+    read_repo = Neo4jReadRepository(MagicMock())
+    with pytest.raises(ValueError, match="signed 64-bit integer range"):
+        read_repo.list_flow_observations(start_epoch_ns_min=INT64_MAX + 1)
+    with pytest.raises(ValueError, match="signed 64-bit integer range"):
+        read_repo.list_flow_observations(start_epoch_ns_max=-(2**63) - 1)
+
+
+def test_decimal_precision_i_j_k_exact_addition_stable_id_and_payload_without_leakage():
+    """Tests I, J, K: High-precision start_epoch + duration, stable observation_id across parses, no Decimal/float in payload."""
+    ts_hi = "1725148800.12345678901234567890123456781"
+    dur_hi = "0.00000000000000000000000000008"
+    expected_end = "1725148800.12345678901234567890123456789"
+
+    line = (
+        f'{{"ts":{ts_hi},"uid":"CHiAdd0001","id.orig_h":"10.1.0.5","id.orig_p":41000,'
+        f'"id.resp_h":"10.1.0.6","id.resp_p":443,"proto":"tcp","duration":{dur_hi}}}'
+    )
+
+    rec1 = list(iter_zeek_conn_lines([line], sensor_id="s-hi", routing_domain_id="corp"))[0]
+    with localcontext() as ctx:
+        ctx.prec = 8
+        rec2 = list(iter_zeek_conn_lines([line], sensor_id="s-hi", routing_domain_id="corp"))[0]
+        payload = zeek_observation_to_payload(rec2)
+
+    # I: Exact addition without rounding
+    assert rec1.end_epoch == Decimal(expected_end)
+    assert rec1.end_ts == expected_end
+    assert rec2.end_epoch == Decimal(expected_end)
+    assert rec2.end_ts == expected_end
+
+    # J: Identical stable observation_id across repeated parses and varying Decimal contexts
+    assert rec1.observation_id == rec2.observation_id
+
+    # K: Neo4j payload has zero Decimal/float leakage and exact lossless string fields
+    for k, v in payload.items():
+        assert not isinstance(v, Decimal), f"Payload field {k} leaked Decimal"
+        assert not isinstance(v, float), f"Payload field {k} leaked float"
+    assert payload["start_ts"] == ts_hi
+    assert payload["start_epoch_decimal"] == ts_hi
+    assert payload["duration_decimal"] == dur_hi
+    assert payload["end_ts"] == expected_end
+    assert payload["end_epoch_decimal"] == expected_end
+    assert payload["start_epoch_ns"] is None
+    assert payload["end_epoch_ns"] is None

@@ -142,12 +142,13 @@ Each discrete Zeek connection observation is persisted as a `(:FlowObservation)`
 
 ### Exact Temporal Storage Contract
 
-Neo4j does not natively store Python `Decimal`, and IEEE 754 `float` truncates nanosecond precision. Every persisted `FlowObservation` therefore stores:
+Neo4j does not natively store Python `Decimal`, and IEEE 754 `float` truncates nanosecond precision. All decimal canonicalization (`format_canonical_decimal()` / `canonicalize_event_timestamp()` / `format_exact_decimal()`), derived end-time addition (`add_exact_decimals()`), and integer nanosecond conversion (`decimal_epoch_to_ns()`) operate directly on `Decimal.as_tuple()` with exact Python integer arithmetic — **completely independent of Python's active `decimal.getcontext().prec`** (never relying on context-sensitive `Decimal.normalize()` or `Decimal` multiplication/addition). Every persisted `FlowObservation` stores:
 
-- **Authoritative lossless string properties:** `start_ts`, `end_ts`, `start_epoch_decimal`, `end_epoch_decimal`, `duration_decimal`.
-- **Optional exact 64-bit integer nanosecond index properties:** `start_epoch_ns`, `end_epoch_ns` computed via exact `Decimal` arithmetic (`epoch * 1_000_000_000`).
-  - Supported lossless precision: up to 9 fractional digits (nanoseconds) within signed 64-bit integer bounds (`-(2^63)` to `2^63 - 1`, covering Unix epoch years 1970–2262).
-  - **Explicit non-truncation policy:** Timestamps with sub-nanosecond precision (e.g., picoseconds / >9 fractional digits) or outside signed 64-bit bounds set `*_epoch_ns = None` rather than silently truncating or overflowing, while retaining exact original strings in `start_ts` and `*_epoch_decimal`.
+- **Authoritative lossless string properties:** `start_ts`, `end_ts`, `start_epoch_decimal`, `end_epoch_decimal`, `duration_decimal` (preserving every significant source digit, including inputs exceeding 28 significant digits).
+- **Optional exact 64-bit integer nanosecond index properties:** `start_epoch_ns`, `end_epoch_ns` derived via exact `Decimal.as_tuple()` integer scaling.
+  - Supported lossless precision: up to 9 fractional digits (nanoseconds, including trailing zeros past the 9th place) within signed 64-bit integer bounds (`-(2^63)` to `2^63 - 1`, covering Unix epoch `0` through `9223372036.854775807`, i.e., years 1970–2262).
+  - **Explicit non-truncation policy:** Timestamps with any nonzero fractional digit beyond the 9th decimal place (sub-nanosecond precision, even beyond 28 significant digits) or outside signed 64-bit bounds set `*_epoch_ns = None` rather than silently truncating, rounding, or overflowing, while retaining exact original strings in `start_ts` and `*_epoch_decimal`.
+- **Phase 1 Identity Compatibility:** Ordinary numeric timestamps (≤28 significant digits, including standard microsecond and nanosecond Unix epochs) and all ISO 8601 string timestamps produce **byte-identical** canonical strings and `observation_id` digests. Extreme-precision numeric inputs (>28 significant digits) that were previously silently rounded by `Decimal.normalize()` now preserve all significant digits so distinct events no longer collide.
 
 ### Idempotency, Immutability & Conflict Policy
 

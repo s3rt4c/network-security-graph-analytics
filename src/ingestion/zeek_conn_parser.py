@@ -11,7 +11,7 @@ ZeekConnectionObservation records with:
 - Bounded-memory line-by-line streaming with deterministic warning diagnostics
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import ipaddress
 import json
@@ -24,6 +24,7 @@ from src.ingestion.community_id import resolve_community_id
 from src.ingestion.models import IngestionSummary
 from src.ingestion.v2_models import (
     ZeekConnectionObservation,
+    add_exact_decimals,
     canonicalize_event_timestamp,
     compute_observation_id,
     compute_v2_flow_key,
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 MAX_SAMPLE_ERRORS = 10
 MAX_LOGGED_WARNINGS = MAX_SAMPLE_ERRORS
+_UNIX_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 # Supported transport protocols for Community ID tuple computation.
 _SUPPORTED_TRANSPORT_PROTOS = frozenset({"TCP", "UDP", "ICMP", "ICMP6", "ICMPV6", "SCTP"})
@@ -101,17 +103,22 @@ def _parse_zeek_timestamp(raw_ts: Any) -> Tuple[Optional[str], Optional[Decimal]
         dec_val = Decimal(raw_ts) if isinstance(raw_ts, int) else raw_ts
         if dec_val.is_nan() or dec_val.is_infinite() or dec_val < 0:
             return None, None, None
-        return canonicalize_event_timestamp(dec_val), dec_val, dec_val
+        try:
+            canon = canonicalize_event_timestamp(dec_val)
+        except ValueError:
+            return None, None, None
+        return canon, dec_val, dec_val
 
     if isinstance(raw_ts, float):
         # Fallback if a caller passes a pre-parsed Python dict containing float
         try:
             dec_val = Decimal(str(raw_ts))
-        except InvalidOperation:
+            if dec_val.is_nan() or dec_val.is_infinite() or dec_val < 0:
+                return None, None, None
+            canon = canonicalize_event_timestamp(dec_val)
+        except (InvalidOperation, ValueError):
             return None, None, None
-        if dec_val.is_nan() or dec_val.is_infinite() or dec_val < 0:
-            return None, None, None
-        return canonicalize_event_timestamp(dec_val), dec_val, dec_val
+        return canon, dec_val, dec_val
 
     if isinstance(raw_ts, str):
         trimmed = raw_ts.strip()
@@ -121,11 +128,16 @@ def _parse_zeek_timestamp(raw_ts: Any) -> Tuple[Optional[str], Optional[Decimal]
         # First try exact Decimal numeric epoch string
         try:
             dec_val = Decimal(trimmed)
+        except InvalidOperation:
+            dec_val = None
+        if dec_val is not None:
             if dec_val.is_nan() or dec_val.is_infinite() or dec_val < 0:
                 return None, None, None
-            return canonicalize_event_timestamp(dec_val), dec_val, dec_val
-        except InvalidOperation:
-            pass
+            try:
+                canon = canonicalize_event_timestamp(dec_val)
+            except ValueError:
+                return None, None, None
+            return canon, dec_val, dec_val
 
         # Otherwise validate strict ISO 8601 format (Python 3.10+ compatible)
         match = _ISO_TIMESTAMP_PATTERN.match(trimmed)
@@ -153,9 +165,10 @@ def _parse_zeek_timestamp(raw_ts: Any) -> Tuple[Optional[str], Optional[Decimal]
 
         start_epoch: Optional[Decimal] = None
         if dt.tzinfo is not None:
-            whole_seconds = Decimal(int(dt.timestamp()))
+            delta = dt - _UNIX_EPOCH_UTC
+            whole_seconds = Decimal(delta.days * 86400 + delta.seconds)
             frac_seconds = Decimal(f"0.{frac_part}") if frac_part else Decimal(0)
-            start_epoch = whole_seconds + frac_seconds
+            start_epoch = add_exact_decimals(whole_seconds, frac_seconds)
             if start_epoch < 0:
                 return None, None, None
 
@@ -456,10 +469,29 @@ class ZeekConnStream:
                     f"Line {line_no} has invalid 'duration': {raw_duration!r}",
                 )
             else:
-                duration = parsed_dur
                 if start_epoch is not None:
-                    end_epoch = start_epoch + duration
-                    end_ts = canonicalize_event_timestamp(end_epoch)
+                    try:
+                        derived_end_epoch = add_exact_decimals(start_epoch, parsed_dur)
+                        derived_end_ts = canonicalize_event_timestamp(derived_end_epoch)
+                    except ValueError:
+                        self._record_warning(
+                            "invalid_duration",
+                            f"Line {line_no} has out-of-range 'duration': {raw_duration!r}",
+                        )
+                    else:
+                        duration = parsed_dur
+                        end_epoch = derived_end_epoch
+                        end_ts = derived_end_ts
+                else:
+                    try:
+                        canonicalize_event_timestamp(parsed_dur)
+                    except ValueError:
+                        self._record_warning(
+                            "invalid_duration",
+                            f"Line {line_no} has out-of-range 'duration': {raw_duration!r}",
+                        )
+                    else:
+                        duration = parsed_dur
 
         # 7. Optional directional numeric metrics (preserve payload vs IP bytes; never invent 0)
         metric_values: Dict[str, Optional[int]] = {}

@@ -34,17 +34,113 @@ from typing import Optional, Union
 
 from src.ingestion.models import canonicalize_ip
 
+# Guard against pathological scientific-notation exponents during fixed-point expansion
+_MAX_EXACT_DECIMAL_EXPONENT = 10_000
+
+
+def format_canonical_decimal(value: Decimal) -> str:
+    """Format a finite Decimal as an exact canonical fixed-point string without context rounding.
+
+    Uses Decimal.as_tuple() directly so every significant source digit is preserved regardless
+    of the active decimal.getcontext().prec (never calls context-sensitive Decimal.normalize()).
+    """
+    if isinstance(value, bool) or not isinstance(value, Decimal):
+        raise ValueError(f"Expected Decimal, got {type(value).__name__}")
+    if value.is_nan() or value.is_infinite():
+        raise ValueError(f"Decimal value cannot be NaN or Infinite: {value}")
+
+    sign, digits, exp = value.as_tuple()
+    if not isinstance(exp, int):
+        raise ValueError(f"Decimal value cannot be NaN or Infinite: {value}")
+
+    if not digits or all(d == 0 for d in digits):
+        return "0"
+
+    digit_str = "".join(str(d) for d in digits).lstrip("0")
+    eff_digits = digit_str.rstrip("0")
+    eff_exp = exp + (len(digit_str) - len(eff_digits))
+
+    if abs(eff_exp) > _MAX_EXACT_DECIMAL_EXPONENT:
+        raise ValueError(
+            f"Decimal exponent {eff_exp} exceeds safe fixed-point serialization limit "
+            f"(+/-{_MAX_EXACT_DECIMAL_EXPONENT})"
+        )
+
+    prefix = "-" if sign else ""
+    if eff_exp >= 0:
+        return f"{prefix}{eff_digits}{'0' * eff_exp}"
+
+    frac_len = -eff_exp
+    if len(eff_digits) > frac_len:
+        split_idx = len(eff_digits) - frac_len
+        return f"{prefix}{eff_digits[:split_idx]}.{eff_digits[split_idx:]}"
+
+    leading_frac_zeros = "0" * (frac_len - len(eff_digits))
+    return f"{prefix}0.{leading_frac_zeros}{eff_digits}"
+
+
+def add_exact_decimals(left: Decimal, right: Decimal) -> Decimal:
+    """Add two finite Decimals with exact arbitrary precision, independent of Decimal context."""
+    if isinstance(left, bool) or not isinstance(left, Decimal):
+        raise ValueError(f"Expected Decimal for left operand, got {type(left).__name__}")
+    if isinstance(right, bool) or not isinstance(right, Decimal):
+        raise ValueError(f"Expected Decimal for right operand, got {type(right).__name__}")
+    if left.is_nan() or left.is_infinite() or right.is_nan() or right.is_infinite():
+        raise ValueError("add_exact_decimals operands cannot be NaN or Infinite")
+
+    sign_l, digits_l, exp_l = left.as_tuple()
+    sign_r, digits_r, exp_r = right.as_tuple()
+    if not isinstance(exp_l, int) or not isinstance(exp_r, int):
+        raise ValueError("add_exact_decimals operands cannot be NaN or Infinite")
+
+    str_l = "".join(str(d) for d in digits_l).lstrip("0")
+    str_r = "".join(str(d) for d in digits_r).lstrip("0")
+
+    if not str_l and not str_r:
+        return Decimal(0)
+    if not str_l:
+        return right
+    if not str_r:
+        return left
+
+    eff_l = str_l.rstrip("0")
+    eff_exp_l = exp_l + (len(str_l) - len(eff_l))
+    eff_r = str_r.rstrip("0")
+    eff_exp_r = exp_r + (len(str_r) - len(eff_r))
+
+    exp_gap = abs(eff_exp_l - eff_exp_r)
+    if exp_gap > _MAX_EXACT_DECIMAL_EXPONENT:
+        raise ValueError(
+            f"Decimal exponent gap {exp_gap} exceeds safe exact addition limit "
+            f"({_MAX_EXACT_DECIMAL_EXPONENT})"
+        )
+
+    int_l = -int(eff_l) if sign_l else int(eff_l)
+    int_r = -int(eff_r) if sign_r else int(eff_r)
+
+    common_exp = min(eff_exp_l, eff_exp_r)
+    scaled_l = int_l * (10 ** (eff_exp_l - common_exp))
+    scaled_r = int_r * (10 ** (eff_exp_r - common_exp))
+    total_int = scaled_l + scaled_r
+
+    if total_int == 0:
+        return Decimal(0)
+
+    total_sign = 1 if total_int < 0 else 0
+    total_digits = tuple(int(ch) for ch in str(abs(total_int)))
+    return Decimal((total_sign, total_digits, common_exp))
+
 
 def canonicalize_event_timestamp(timestamp: Union[float, int, str, Decimal]) -> str:
     """Canonicalize a telemetry event timestamp without loss of precision.
 
     Accepts:
         - Floating-point or integer epoch timestamps (e.g. 1725148800, 1725148800.123456)
-        - Numeric decimal epoch strings (e.g. '1725148800.123456789' from Zeek)
+        - Numeric decimal epoch strings or Decimals (e.g. '1725148800.123456789' from Zeek)
         - Standard ISO 8601 timestamp strings (e.g. '2024-09-01T12:00:00.123456+00:00' from Suricata)
 
     Contract:
-        - Preserves exact source precision (does not truncate or round nanoseconds to microseconds).
+        - Preserves exact source precision independent of Decimal context (no normalize() rounding).
         - Equates equivalent numeric representations (e.g. 1725148800.1 and 1725148800.100 produce '1725148800.1').
         - Distinct timestamps at any decimal precision remain distinct (preventing event collision).
         - Preserves ISO 8601 strings trimmed as-is without date manipulation.
@@ -55,6 +151,11 @@ def canonicalize_event_timestamp(timestamp: Union[float, int, str, Decimal]) -> 
     if timestamp is None:
         raise ValueError("timestamp cannot be None")
 
+    if isinstance(timestamp, Decimal):
+        if timestamp.is_nan() or timestamp.is_infinite():
+            raise ValueError(f"timestamp cannot be NaN or Infinite: {timestamp}")
+        return format_canonical_decimal(timestamp)
+
     raw = str(timestamp).strip()
     if not raw:
         raise ValueError("timestamp cannot be empty")
@@ -63,7 +164,7 @@ def canonicalize_event_timestamp(timestamp: Union[float, int, str, Decimal]) -> 
         d = Decimal(raw)
         if d.is_nan() or d.is_infinite():
             raise ValueError(f"timestamp cannot be NaN or Infinite: {raw}")
-        return format(d.normalize(), "f")
+        return format_canonical_decimal(d)
     except InvalidOperation:
         # Not a decimal number; treat as ISO 8601 or text timestamp string
         return raw

@@ -613,3 +613,73 @@ def test_live_zeek_h_observation_read_queries_and_pagination(live_driver):
             list({o.src_scoped_id for o in obs_all} | {o.dst_scoped_id for o in obs_all}),
             ["dom-read-1", "dom-read-2"],
         )
+
+
+# ---------------------------------------------------------------------------
+# TEST I (Regression L): Exact >28-digit & sub-ns timestamp Neo4j round-trip
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+def test_live_zeek_i_high_precision_decimal_roundtrip(live_driver):
+    """Regression L: >28-digit timestamps, tiny sub-ns remainders, and INT64_MAX boundary survive Neo4j round-trip."""
+    ts_39_a = "1725148800.12345678901234567890123456781"
+    ts_39_b = "1725148800.12345678901234567890123456782"
+    dur_39 = "0.00000000000000000000000000008"
+    end_39_a = "1725148800.12345678901234567890123456789"
+    ts_sub_ns_tiny = "1725148800.1234567890000000000000000001"
+    ts_int64_max = "9223372036.854775807"
+
+    lines = [
+        f'{{"ts":{ts_39_a},"uid":"CLiveExact001","id.orig_h":"198.51.100.111","id.orig_p":55001,"id.resp_h":"198.51.100.112","id.resp_p":443,"proto":"tcp","duration":{dur_39}}}',
+        f'{{"ts":{ts_39_b},"uid":"CLiveExact001","id.orig_h":"198.51.100.111","id.orig_p":55001,"id.resp_h":"198.51.100.112","id.resp_p":443,"proto":"tcp"}}',
+        f'{{"ts":{ts_sub_ns_tiny},"uid":"CLiveExact002","id.orig_h":"198.51.100.111","id.orig_p":55002,"id.resp_h":"198.51.100.112","id.resp_p":443,"proto":"tcp"}}',
+        f'{{"ts":{ts_int64_max},"uid":"CLiveExact003","id.orig_h":"198.51.100.111","id.orig_p":55003,"id.resp_h":"198.51.100.112","id.resp_p":443,"proto":"tcp"}}',
+    ]
+    obs_list = list(iter_zeek_conn_lines(lines, sensor_id="zeek-live-exact", routing_domain_id="corp-exact"))
+    assert len(obs_list) == 4
+    # Distinct >28-digit timestamps with identical UID/5-tuple must stay distinct!
+    assert obs_list[0].observation_id != obs_list[1].observation_id
+
+    repo = Neo4jRepository(live_driver, batch_size=10)
+    read_repo = Neo4jReadRepository(live_driver)
+
+    try:
+        summary = repo.write_zeek_observations(obs_list)
+        assert summary.created_count == 4
+
+        rec_a = read_repo.get_flow_observation(obs_list[0].observation_id)
+        rec_b = read_repo.get_flow_observation(obs_list[1].observation_id)
+        rec_tiny = read_repo.get_flow_observation(obs_list[2].observation_id)
+        rec_max = read_repo.get_flow_observation(obs_list[3].observation_id)
+
+        assert rec_a is not None and rec_b is not None and rec_tiny is not None and rec_max is not None
+
+        # Exact 39-digit string survival + exact derived end_epoch_decimal & duration_decimal
+        assert rec_a["start_ts"] == ts_39_a
+        assert rec_a["start_epoch_decimal"] == ts_39_a
+        assert rec_a["duration_decimal"] == dur_39
+        assert rec_a["end_ts"] == end_39_a
+        assert rec_a["end_epoch_decimal"] == end_39_a
+        assert rec_a["start_epoch_ns"] is None
+        assert rec_a["end_epoch_ns"] is None
+
+        assert rec_b["start_ts"] == ts_39_b
+        assert rec_b["start_epoch_decimal"] == ts_39_b
+        assert rec_b["start_epoch_ns"] is None
+
+        # Tiny sub-nanosecond remainder after 9th fractional place must remain None in ns index
+        assert rec_tiny["start_ts"] == ts_sub_ns_tiny
+        assert rec_tiny["start_epoch_decimal"] == ts_sub_ns_tiny
+        assert rec_tiny["start_epoch_ns"] is None
+
+        # Exact INT64_MAX nanosecond upper boundary survives Neo4j 64-bit integer storage
+        assert rec_max["start_ts"] == ts_int64_max
+        assert rec_max["start_epoch_decimal"] == ts_int64_max
+        assert rec_max["start_epoch_ns"] == (2**63 - 1)
+    finally:
+        _cleanup_test_entities(
+            live_driver,
+            [o.observation_id for o in obs_list],
+            [obs_list[0].src_scoped_id, obs_list[0].dst_scoped_id],
+            ["corp-exact"],
+        )

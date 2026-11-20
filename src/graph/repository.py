@@ -17,7 +17,11 @@ import logging
 from typing import Iterable, List, Dict, Any, Iterator, TypeVar, Optional, Tuple
 
 from src.ingestion.models import TrafficRecord, AlertRecord
-from src.ingestion.v2_models import ZeekConnectionObservation, scoped_ip_id
+from src.ingestion.v2_models import (
+    ZeekConnectionObservation,
+    format_canonical_decimal,
+    scoped_ip_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +29,6 @@ T = TypeVar("T")
 
 INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
-_NS_PER_SECOND = Decimal("1000000000")
 
 
 class ObservationConflictError(ValueError):
@@ -320,7 +323,10 @@ def iter_batches(items: Iterable[T], size: int) -> Iterator[List[T]]:
 
 
 def format_exact_decimal(value: Optional[Decimal], field_name: str = "value") -> Optional[str]:
-    """Serialize a non-negative finite Decimal to a lossless normalized decimal string."""
+    """Serialize a non-negative finite Decimal to a lossless canonical decimal string.
+
+    Independent of active decimal.getcontext().prec (never invokes Decimal.normalize()).
+    """
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, Decimal):
@@ -329,18 +335,17 @@ def format_exact_decimal(value: Optional[Decimal], field_name: str = "value") ->
         raise ValueError(f"'{field_name}' cannot be NaN or Infinite: {value}")
     if value < 0:
         raise ValueError(f"'{field_name}' must be non-negative, got {value}")
-    if value == 0:
-        return "0"
-    return format(value.normalize(), "f")
+    return format_canonical_decimal(value)
 
 
 def decimal_epoch_to_ns(epoch: Optional[Decimal], field_name: str = "epoch") -> Optional[int]:
     """Convert a non-negative Decimal Unix epoch (seconds) to exact signed 64-bit integer nanoseconds.
 
-    Lossless policy:
-    - Uses exact Decimal arithmetic (never IEEE 754 float).
-    - Returns None if the timestamp has sub-nanosecond precision (> 9 fractional digits) so higher
-      precision is NEVER silently truncated.
+    Lossless, context-independent policy:
+    - Inspects Decimal.as_tuple() and uses exact Python integer arithmetic (never float, never
+      context-sensitive Decimal multiplication or rounding).
+    - Returns None if ANY nonzero fractional digit exists beyond the 9th decimal place
+      (sub-nanosecond precision), ensuring higher precision is NEVER silently truncated.
     - Returns None if the integer nanosecond value falls outside signed 64-bit integer bounds
       [-(2**63), 2**63 - 1].
     Exact original timestamps always remain stored in start_ts / start_epoch_decimal / end_epoch_decimal.
@@ -354,11 +359,28 @@ def decimal_epoch_to_ns(epoch: Optional[Decimal], field_name: str = "epoch") -> 
     if epoch < 0:
         raise ValueError(f"'{field_name}' must be non-negative, got {epoch}")
 
-    scaled = epoch * _NS_PER_SECOND
-    if scaled != scaled.to_integral_value():
+    _, digits, exp = epoch.as_tuple()
+    if not isinstance(exp, int):
+        raise ValueError(f"'{field_name}' cannot be NaN or Infinite: {epoch}")
+
+    if not digits or all(d == 0 for d in digits):
+        return 0
+
+    digit_str = "".join(str(d) for d in digits).lstrip("0")
+    stripped = digit_str.rstrip("0")
+    trailing_zeros = len(digit_str) - len(stripped)
+
+    # Exact value is int(stripped) * 10**(exp + trailing_zeros + 9) nanoseconds
+    eff_ns_exp = exp + trailing_zeros + 9
+    if eff_ns_exp < 0:
+        # At least one nonzero digit exists beyond the 9th fractional decimal place
         return None
 
-    ns_int = int(scaled)
+    # Since int(stripped) >= 1, any eff_ns_exp >= 19 yields >= 10**19 > INT64_MAX (9.22e18)
+    if eff_ns_exp >= 19:
+        return None
+
+    ns_int = int(stripped) * (10 ** eff_ns_exp)
     if ns_int < INT64_MIN or ns_int > INT64_MAX:
         return None
     return ns_int
