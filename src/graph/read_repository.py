@@ -1370,3 +1370,216 @@ class Neo4jReadRepository:
 
         with self.driver.session() as session:
             return session.execute_read(_work)
+
+    @staticmethod
+    def _record_to_flow_observation(record) -> Dict[str, Any]:
+        """Materialize a FlowObservation Cypher record into a plain Python dictionary."""
+        return {
+            "observation_id": record["observation_id"],
+            "flow_key": record["flow_key"],
+            "zeek_uid": record["zeek_uid"],
+            "routing_domain_id": record["routing_domain_id"],
+            "src_scoped_id": record["src_scoped_id"],
+            "dst_scoped_id": record["dst_scoped_id"],
+            "src_ip": record["src_ip"],
+            "dst_ip": record["dst_ip"],
+            "protocol": record["protocol"],
+            "src_port": record["src_port"],
+            "dst_port": record["dst_port"],
+            "community_id": record["community_id"],
+            "start_ts": record["start_ts"],
+            "end_ts": record["end_ts"],
+            "start_epoch_decimal": record["start_epoch_decimal"],
+            "end_epoch_decimal": record["end_epoch_decimal"],
+            "duration_decimal": record["duration_decimal"],
+            "start_epoch_ns": record["start_epoch_ns"],
+            "end_epoch_ns": record["end_epoch_ns"],
+            "orig_bytes": record["orig_bytes"],
+            "resp_bytes": record["resp_bytes"],
+            "orig_pkts": record["orig_pkts"],
+            "resp_pkts": record["resp_pkts"],
+            "orig_ip_bytes": record["orig_ip_bytes"],
+            "resp_ip_bytes": record["resp_ip_bytes"],
+            "missed_bytes": record["missed_bytes"],
+            "service": record["service"],
+            "conn_state": record["conn_state"],
+            "history": record["history"],
+            "local_orig": record["local_orig"],
+            "local_resp": record["local_resp"],
+            "sensor_id": record["sensor_id"],
+            "source_type": record["source_type"],
+            "source_provenance": record["source_provenance"],
+        }
+
+    def get_flow_observation(self, observation_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a single discrete FlowObservation by its unique observation_id."""
+        if self.driver is None:
+            raise ConnectionError("Database driver unavailable")
+        if not isinstance(observation_id, str) or not observation_id.strip():
+            raise ValueError("observation_id must be a non-empty string")
+
+        clean_id = observation_id.strip()
+        cypher = """
+        MATCH (fo:FlowObservation {observation_id: $observation_id})
+        OPTIONAL MATCH (fo)-[:HAS_ORIGINATOR]->(orig:IPAddress)
+        OPTIONAL MATCH (fo)-[:HAS_RESPONDER]->(resp:IPAddress)
+        RETURN fo.observation_id AS observation_id,
+               fo.flow_key AS flow_key,
+               fo.zeek_uid AS zeek_uid,
+               fo.routing_domain_id AS routing_domain_id,
+               coalesce(orig.scoped_id, fo.src_scoped_id) AS src_scoped_id,
+               coalesce(resp.scoped_id, fo.dst_scoped_id) AS dst_scoped_id,
+               coalesce(orig.address, fo.src_ip) AS src_ip,
+               coalesce(resp.address, fo.dst_ip) AS dst_ip,
+               fo.protocol AS protocol,
+               fo.src_port AS src_port,
+               fo.dst_port AS dst_port,
+               fo.community_id AS community_id,
+               fo.start_ts AS start_ts,
+               fo.end_ts AS end_ts,
+               fo.start_epoch_decimal AS start_epoch_decimal,
+               fo.end_epoch_decimal AS end_epoch_decimal,
+               fo.duration_decimal AS duration_decimal,
+               fo.start_epoch_ns AS start_epoch_ns,
+               fo.end_epoch_ns AS end_epoch_ns,
+               fo.orig_bytes AS orig_bytes,
+               fo.resp_bytes AS resp_bytes,
+               fo.orig_pkts AS orig_pkts,
+               fo.resp_pkts AS resp_pkts,
+               fo.orig_ip_bytes AS orig_ip_bytes,
+               fo.resp_ip_bytes AS resp_ip_bytes,
+               fo.missed_bytes AS missed_bytes,
+               fo.service AS service,
+               fo.conn_state AS conn_state,
+               fo.history AS history,
+               fo.local_orig AS local_orig,
+               fo.local_resp AS local_resp,
+               fo.sensor_id AS sensor_id,
+               fo.source_type AS source_type,
+               fo.source_provenance AS source_provenance
+        """
+
+        def _work(tx) -> Optional[Dict[str, Any]]:
+            res = tx.run(cypher, observation_id=clean_id)
+            rec = res.single()
+            if not rec:
+                return None
+            return self._record_to_flow_observation(rec)
+
+        with self.driver.session() as session:
+            return session.execute_read(_work)
+
+    def list_flow_observations(
+        self,
+        routing_domain_id: Optional[str] = None,
+        sensor_id: Optional[str] = None,
+        community_id: Optional[str] = None,
+        start_epoch_ns_min: Optional[int] = None,
+        start_epoch_ns_max: Optional[int] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """List discrete FlowObservation nodes with deterministic pagination and exact filtering.
+
+        Temporal range filters (`start_epoch_ns_min`, `start_epoch_ns_max`) operate strictly on
+        the exact integer `start_epoch_ns` property (never lexicographic string comparisons).
+        Observations sharing `flow_key` or `community_id` are never collapsed.
+        """
+        if self.driver is None:
+            raise ConnectionError("Database driver unavailable")
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= 1000):
+            raise ValueError(f"limit must be an integer in 1..1000, got {limit!r}")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError(f"offset must be an integer >= 0, got {offset!r}")
+
+        if start_epoch_ns_min is not None and (isinstance(start_epoch_ns_min, bool) or not isinstance(start_epoch_ns_min, int)):
+            raise ValueError(f"start_epoch_ns_min must be an integer or None, got {start_epoch_ns_min!r}")
+        if start_epoch_ns_max is not None and (isinstance(start_epoch_ns_max, bool) or not isinstance(start_epoch_ns_max, int)):
+            raise ValueError(f"start_epoch_ns_max must be an integer or None, got {start_epoch_ns_max!r}")
+        if (
+            start_epoch_ns_min is not None
+            and start_epoch_ns_max is not None
+            and start_epoch_ns_min > start_epoch_ns_max
+        ):
+            raise ValueError("start_epoch_ns_min cannot be greater than start_epoch_ns_max")
+
+        norm_domain = routing_domain_id.strip().lower() if routing_domain_id and routing_domain_id.strip() else None
+        norm_sensor = sensor_id.strip().lower() if sensor_id and sensor_id.strip() else None
+        norm_cid = community_id.strip() if community_id and community_id.strip() else None
+
+        conditions: List[str] = []
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+
+        if norm_domain is not None:
+            conditions.append("fo.routing_domain_id = $routing_domain_id")
+            params["routing_domain_id"] = norm_domain
+        if norm_sensor is not None:
+            conditions.append("fo.sensor_id = $sensor_id")
+            params["sensor_id"] = norm_sensor
+        if norm_cid is not None:
+            conditions.append("fo.community_id = $community_id")
+            params["community_id"] = norm_cid
+        if start_epoch_ns_min is not None:
+            conditions.append("fo.start_epoch_ns IS NOT NULL AND fo.start_epoch_ns >= $start_epoch_ns_min")
+            params["start_epoch_ns_min"] = start_epoch_ns_min
+        if start_epoch_ns_max is not None:
+            conditions.append("fo.start_epoch_ns IS NOT NULL AND fo.start_epoch_ns <= $start_epoch_ns_max")
+            params["start_epoch_ns_max"] = start_epoch_ns_max
+
+        where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        count_cypher = f"MATCH (fo:FlowObservation) {where_clause} RETURN count(fo) AS total"
+        page_cypher = f"""
+        MATCH (fo:FlowObservation)
+        {where_clause}
+        OPTIONAL MATCH (fo)-[:HAS_ORIGINATOR]->(orig:IPAddress)
+        OPTIONAL MATCH (fo)-[:HAS_RESPONDER]->(resp:IPAddress)
+        RETURN fo.observation_id AS observation_id,
+               fo.flow_key AS flow_key,
+               fo.zeek_uid AS zeek_uid,
+               fo.routing_domain_id AS routing_domain_id,
+               coalesce(orig.scoped_id, fo.src_scoped_id) AS src_scoped_id,
+               coalesce(resp.scoped_id, fo.dst_scoped_id) AS dst_scoped_id,
+               coalesce(orig.address, fo.src_ip) AS src_ip,
+               coalesce(resp.address, fo.dst_ip) AS dst_ip,
+               fo.protocol AS protocol,
+               fo.src_port AS src_port,
+               fo.dst_port AS dst_port,
+               fo.community_id AS community_id,
+               fo.start_ts AS start_ts,
+               fo.end_ts AS end_ts,
+               fo.start_epoch_decimal AS start_epoch_decimal,
+               fo.end_epoch_decimal AS end_epoch_decimal,
+               fo.duration_decimal AS duration_decimal,
+               fo.start_epoch_ns AS start_epoch_ns,
+               fo.end_epoch_ns AS end_epoch_ns,
+               fo.orig_bytes AS orig_bytes,
+               fo.resp_bytes AS resp_bytes,
+               fo.orig_pkts AS orig_pkts,
+               fo.resp_pkts AS resp_pkts,
+               fo.orig_ip_bytes AS orig_ip_bytes,
+               fo.resp_ip_bytes AS resp_ip_bytes,
+               fo.missed_bytes AS missed_bytes,
+               fo.service AS service,
+               fo.conn_state AS conn_state,
+               fo.history AS history,
+               fo.local_orig AS local_orig,
+               fo.local_resp AS local_resp,
+               fo.sensor_id AS sensor_id,
+               fo.source_type AS source_type,
+               fo.source_provenance AS source_provenance
+        ORDER BY CASE WHEN fo.start_epoch_ns IS NULL THEN 1 ELSE 0 END ASC,
+                 fo.start_epoch_ns ASC,
+                 fo.observation_id ASC
+        SKIP $offset LIMIT $limit
+        """
+
+        def _work(tx) -> Tuple[List[Dict[str, Any]], int]:
+            total = int(tx.run(count_cypher, **params).single()["total"])
+            page_res = tx.run(page_cypher, **params)
+            items = [self._record_to_flow_observation(r) for r in page_res]
+            return items, total
+
+        with self.driver.session() as session:
+            return session.execute_read(_work)

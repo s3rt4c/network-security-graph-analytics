@@ -138,6 +138,11 @@ To support modern segmented networks and multi-tenant telemetry without false-po
 ```
 Layer 2 Frame Topology:
 (:Layer2Identifier) ──[:L2_COMMUNICATED_TO {protocol: str}]──▶ (:Layer2Identifier)
+
+Discrete Zeek Connection Observations (Phase 3A.2):
+(:FlowObservation {observation_id: str (UQ), ...})
+    ├──[:HAS_ORIGINATOR]──▶ (orig:IPAddress {scoped_id: str (UQ)})
+    └──[:HAS_RESPONDER]───▶ (resp:IPAddress {scoped_id: str (UQ)})
 ```
 
 ### Node Entities
@@ -145,6 +150,7 @@ Layer 2 Frame Topology:
 - **`:IPAddress`**: Scoped IPv4 or canonicalized IPv6 endpoint. Unique constraint on `scoped_id`. Non-unique index on `address`.
 - **`:Layer2Identifier`**: Observed Layer 2 hardware MAC address or resolved identifier. Unique constraint on `identifier`.
 - **`:AlertFact`**: Unique normalized alert fact binding source, target, and security rule metadata within a routing domain. Unique constraint on `fact_key`.
+- **`:FlowObservation`**: Discrete, immutable telemetry connection observation (e.g., Zeek `conn.log`). Unique constraint on `observation_id`; non-unique lookup indexes on `community_id`, `sensor_id`, `routing_domain_id`, and exact integer `start_epoch_ns`. Retains exact lossless decimal timestamp strings (`start_ts`, `end_ts`, `start_epoch_decimal`, `end_epoch_decimal`, `duration_decimal`) and distinct directional originator/responder payload vs IP-level metrics (`orig_bytes`/`resp_bytes`, `orig_ip_bytes`/`resp_ip_bytes`, `orig_pkts`/`resp_pkts`, `missed_bytes`). Distinct from `COMMUNICATED_TO` aggregates.
 
 ### Relationship Entities
 - **`(:IPAddress)-[:IN_DOMAIN]->(:RoutingDomain)`**: Logical membership connecting an IP address to its routing domain.
@@ -153,6 +159,8 @@ Layer 2 Frame Topology:
 - **`(:IPAddress)-[:OBSERVED_WITH]->(:Layer2Identifier)`**: Observed Layer 2 / Layer 3 association in captured traffic.
 - **`(:IPAddress)-[:SOURCE_OF]->(:AlertFact)`**: Connects the initiator/source IP to the alert fact.
 - **`(:AlertFact)-[:TARGETS]->(:IPAddress)`**: Connects the alert fact to the destination/target IP.
+- **`(:FlowObservation)-[:HAS_ORIGINATOR]->(:IPAddress)`**: Connects a discrete flow observation to its domain-scoped originator IP.
+- **`(:FlowObservation)-[:HAS_RESPONDER]->(:IPAddress)`**: Connects a discrete flow observation to its domain-scoped responder IP.
 
 ---
 
