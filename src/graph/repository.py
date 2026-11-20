@@ -18,7 +18,10 @@ from typing import Iterable, List, Dict, Any, Iterator, TypeVar, Optional, Tuple
 
 from src.ingestion.models import TrafficRecord, AlertRecord
 from src.ingestion.v2_models import (
+    SuricataAlertObservation,
     ZeekConnectionObservation,
+    alert_definition_id,
+    compute_v2_flow_key,
     format_canonical_decimal,
     scoped_ip_id,
 )
@@ -65,10 +68,46 @@ class ObservationPersistenceSummary:
     batches_committed: int
 
 
+class AlertEventConflictError(ValueError):
+    """Raised when a Suricata event_id already exists with conflicting immutable properties."""
+
+    def __init__(
+        self,
+        conflicting_event_ids: Iterable[str],
+        message: Optional[str] = None,
+        batches_committed: int = 0,
+    ):
+        self.conflicting_event_ids = tuple(sorted(set(str(x) for x in conflicting_event_ids)))
+        self.batches_committed = batches_committed
+        sample = ", ".join(self.conflicting_event_ids[:5])
+        extra = (
+            f" (+{len(self.conflicting_event_ids) - 5} more)"
+            if len(self.conflicting_event_ids) > 5
+            else ""
+        )
+        super().__init__(
+            message
+            or f"Conflicting AlertEvent payload for existing event_id(s): {sample}{extra}. "
+            "Existing alert events are immutable and were not overwritten."
+        )
+
+
+@dataclass(frozen=True)
+class AlertEventPersistenceSummary:
+    """Summary counters returned after streaming Suricata AlertEvent persistence."""
+
+    total_received: int
+    created_count: int
+    duplicate_matched_count: int
+    definitions_created_count: int
+    definitions_matched_count: int
+    batches_committed: int
+
+
 # Scoped deletion of all application-owned graph entities
 CYPHER_SCOPED_CLEANUP = """
 MATCH (n)
-WHERE n:IPAddress OR n:Layer2Identifier OR n:AlertFact OR n:RoutingDomain OR n:FlowObservation
+WHERE n:IPAddress OR n:Layer2Identifier OR n:AlertFact OR n:RoutingDomain OR n:FlowObservation OR n:AlertEvent OR n:AlertDefinition
 DETACH DELETE n
 """
 
@@ -222,6 +261,95 @@ FOREACH (_ IN CASE WHEN NOT is_conflict THEN [1] ELSE [] END |
 RETURN count(CASE WHEN NOT existed_before AND NOT is_conflict THEN 1 END) AS created_count,
        count(CASE WHEN existed_before AND NOT is_conflict THEN 1 END) AS matched_count,
        collect(CASE WHEN is_conflict THEN row.observation_id ELSE null END) AS conflicting_ids
+"""
+
+CYPHER_WRITE_SURICATA_ALERT_BATCH = """
+UNWIND $batch AS row
+OPTIONAL MATCH (pre_ev:AlertEvent {event_id: row.event_id})
+OPTIONAL MATCH (pre_def:AlertDefinition {definition_id: row.alert_definition_id})
+WITH collect({
+    row: row,
+    existed_ev_before: (pre_ev IS NOT NULL),
+    existed_def_before: (pre_def IS NOT NULL)
+}) AS items
+UNWIND items AS item
+WITH item.row AS row,
+     item.existed_ev_before AS existed_ev_before,
+     item.existed_def_before AS existed_def_before
+MERGE (ae:AlertEvent {event_id: row.event_id})
+ON CREATE SET
+    ae.payload_digest = row.payload_digest,
+    ae.alert_definition_id = row.alert_definition_id,
+    ae.source_record_id = row.source_record_id,
+    ae.log_source_id = row.log_source_id,
+    ae.sensor_id = row.sensor_id,
+    ae.ruleset_namespace = row.ruleset_namespace,
+    ae.routing_domain_id = row.routing_domain_id,
+    ae.flow_key = row.flow_key,
+    ae.src_scoped_id = row.src_scoped_id,
+    ae.dst_scoped_id = row.dst_scoped_id,
+    ae.src_ip = row.src_ip,
+    ae.dst_ip = row.dst_ip,
+    ae.timestamp_source = row.timestamp_source,
+    ae.timestamp_epoch_decimal = row.timestamp_epoch_decimal,
+    ae.timestamp_epoch_ns = row.timestamp_epoch_ns,
+    ae.protocol = row.protocol,
+    ae.src_port = row.src_port,
+    ae.dst_port = row.dst_port,
+    ae.flow_id = row.flow_id,
+    ae.community_id = row.community_id,
+    ae.gid = row.gid,
+    ae.sid = row.sid,
+    ae.rev = row.rev,
+    ae.signature = row.signature,
+    ae.category = row.category,
+    ae.severity = row.severity,
+    ae.action = row.action,
+    ae.app_proto = row.app_proto,
+    ae.direction = row.direction,
+    ae.tx_id = row.tx_id,
+    ae.pcap_cnt = row.pcap_cnt,
+    ae.source_type = row.source_type,
+    ae.source_provenance = row.source_provenance
+WITH ae, row, existed_ev_before, existed_def_before,
+     (ae.payload_digest IS NULL OR ae.payload_digest <> row.payload_digest) AS is_conflict
+FOREACH (_ IN CASE WHEN NOT is_conflict THEN [1] ELSE [] END |
+    MERGE (ad:AlertDefinition {definition_id: row.alert_definition_id})
+    ON CREATE SET
+        ad.engine = row.source_type,
+        ad.ruleset_namespace = row.ruleset_namespace,
+        ad.gid = row.gid,
+        ad.sid = row.sid
+    MERGE (rd:RoutingDomain {domain_id: row.routing_domain_id})
+    ON CREATE SET rd.name = CASE
+        WHEN row.routing_domain_id = 'default' THEN 'Default Routing Domain'
+        ELSE row.routing_domain_id
+    END
+    MERGE (src_ip:IPAddress {scoped_id: row.src_scoped_id})
+    ON CREATE SET
+        src_ip.address = row.src_ip,
+        src_ip.routing_domain_id = row.routing_domain_id
+    ON MATCH SET
+        src_ip.address = coalesce(src_ip.address, row.src_ip),
+        src_ip.routing_domain_id = coalesce(src_ip.routing_domain_id, row.routing_domain_id)
+    MERGE (src_ip)-[:IN_DOMAIN]->(rd)
+    MERGE (dst_ip:IPAddress {scoped_id: row.dst_scoped_id})
+    ON CREATE SET
+        dst_ip.address = row.dst_ip,
+        dst_ip.routing_domain_id = row.routing_domain_id
+    ON MATCH SET
+        dst_ip.address = coalesce(dst_ip.address, row.dst_ip),
+        dst_ip.routing_domain_id = coalesce(dst_ip.routing_domain_id, row.routing_domain_id)
+    MERGE (dst_ip)-[:IN_DOMAIN]->(rd)
+    MERGE (ae)-[:TRIGGERED_RULE]->(ad)
+    MERGE (ae)-[:HAS_SOURCE]->(src_ip)
+    MERGE (ae)-[:HAS_DESTINATION]->(dst_ip)
+)
+RETURN count(CASE WHEN NOT existed_ev_before AND NOT is_conflict THEN 1 END) AS created_count,
+       count(CASE WHEN existed_ev_before AND NOT is_conflict THEN 1 END) AS matched_count,
+       count(DISTINCT CASE WHEN NOT existed_def_before AND NOT is_conflict THEN row.alert_definition_id END) AS definitions_created_count,
+       count(DISTINCT CASE WHEN existed_def_before AND NOT is_conflict THEN row.alert_definition_id END) AS definitions_matched_count,
+       collect(CASE WHEN is_conflict THEN row.event_id ELSE null END) AS conflicting_ids
 """
 
 
@@ -386,37 +514,80 @@ def decimal_epoch_to_ns(epoch: Optional[Decimal], field_name: str = "epoch") -> 
     return ns_int
 
 
-def _validate_required_str(value: Any, field_name: str) -> str:
+def _validate_required_str(
+    value: Any,
+    field_name: str,
+    model_name: str = "ZeekConnectionObservation",
+) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"ZeekConnectionObservation.{field_name} must be a non-empty string")
+        raise ValueError(f"{model_name}.{field_name} must be a non-empty string")
     return value.strip()
 
 
-def _validate_optional_str(value: Any, field_name: str) -> Optional[str]:
+def _validate_optional_str(
+    value: Any,
+    field_name: str,
+    model_name: str = "ZeekConnectionObservation",
+) -> Optional[str]:
     if value is None:
         return None
-    if not isinstance(value, str):
-        raise ValueError(f"ZeekConnectionObservation.{field_name} must be a string or None")
-    cleaned = value.strip()
-    return cleaned if cleaned else None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned if cleaned else None
+    raise ValueError(f"{model_name}.{field_name} must be a string or None")
 
 
-def _validate_optional_port(value: Any, field_name: str) -> Optional[int]:
+def _validate_optional_port(
+    value: Any,
+    field_name: str,
+    model_name: str = "ZeekConnectionObservation",
+) -> Optional[int]:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= 65535):
-        raise ValueError(f"ZeekConnectionObservation.{field_name} must be an integer in 0..65535 or None, got {value!r}")
+        raise ValueError(f"{model_name}.{field_name} must be an integer in 0..65535 or None, got {value!r}")
     return value
 
 
-def _validate_optional_metric_int(value: Any, field_name: str) -> Optional[int]:
+def _validate_optional_metric_int(
+    value: Any,
+    field_name: str,
+    model_name: str = "ZeekConnectionObservation",
+) -> Optional[int]:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > INT64_MAX:
         raise ValueError(
-            f"ZeekConnectionObservation.{field_name} must be an integer in 0..{INT64_MAX} or None, got {value!r}"
+            f"{model_name}.{field_name} must be an integer in 0..{INT64_MAX} or None, got {value!r}"
         )
     return value
+
+
+def _validate_required_metric_int(
+    value: Any,
+    field_name: str,
+    model_name: str = "SuricataAlertObservation",
+) -> int:
+    if value is None or isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > INT64_MAX:
+        raise ValueError(
+            f"{model_name}.{field_name} must be an integer in 0..{INT64_MAX}, got {value!r}"
+        )
+    return value
+
+
+def _validate_optional_uint_str(
+    value: Any,
+    field_name: str,
+    model_name: str = "SuricataAlertObservation",
+) -> Optional[str]:
+    """Validate an optional unsigned integer (e.g. uint64 flow_id) and serialize losslessly."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"{model_name}.{field_name} must be a non-negative integer or None, got {value!r}"
+        )
+    return str(value)
 
 
 def _validate_optional_bool(value: Any, field_name: str) -> Optional[bool]:
@@ -533,6 +704,181 @@ def zeek_observation_to_payload(obs: ZeekConnectionObservation) -> Dict[str, Any
         "source_provenance": _validate_optional_str(obs.source_provenance, "source_provenance"),
     }
     payload["payload_digest"] = compute_observation_payload_digest(payload)
+    return payload
+
+
+def compute_alert_event_payload_digest(payload: Dict[str, Any]) -> str:
+    """Compute a deterministic SHA-256 digest over immutable Suricata AlertEvent properties."""
+    canonical_fields = {k: v for k, v in payload.items() if k != "payload_digest"}
+    serialized = json.dumps(
+        canonical_fields,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def suricata_alert_to_payload(obs: SuricataAlertObservation) -> Dict[str, Any]:
+    """Validate and convert a SuricataAlertObservation into a Neo4j Cypher parameter dictionary."""
+    if not isinstance(obs, SuricataAlertObservation):
+        raise TypeError(f"Expected SuricataAlertObservation, got {type(obs).__name__}")
+
+    event_id = _validate_required_str(obs.event_id, "event_id", model_name="SuricataAlertObservation")
+    alert_def_id = _validate_required_str(
+        obs.alert_definition_id, "alert_definition_id", model_name="SuricataAlertObservation"
+    )
+    source_record_id = _validate_required_str(
+        obs.source_record_id, "source_record_id", model_name="SuricataAlertObservation"
+    )
+    log_source_id = _validate_required_str(
+        obs.log_source_id, "log_source_id", model_name="SuricataAlertObservation"
+    )
+    sensor_id = _validate_required_str(obs.sensor_id, "sensor_id", model_name="SuricataAlertObservation").lower()
+    ruleset_namespace = _validate_required_str(
+        obs.ruleset_namespace, "ruleset_namespace", model_name="SuricataAlertObservation"
+    ).lower()
+    routing_domain_id = _validate_required_str(
+        obs.routing_domain_id, "routing_domain_id", model_name="SuricataAlertObservation"
+    ).lower()
+    if "#" in routing_domain_id:
+        raise ValueError(f"routing_domain_id cannot contain delimiter '#': '{routing_domain_id}'")
+
+    source_type = _validate_required_str(
+        obs.source_type, "source_type", model_name="SuricataAlertObservation"
+    ).lower()
+    flow_key = _validate_required_str(obs.flow_key, "flow_key", model_name="SuricataAlertObservation")
+    timestamp_source = _validate_required_str(
+        obs.timestamp_source, "timestamp_source", model_name="SuricataAlertObservation"
+    )
+
+    raw_src_ip = _validate_required_str(obs.src_ip, "src_ip", model_name="SuricataAlertObservation")
+    raw_dst_ip = _validate_required_str(obs.dst_ip, "dst_ip", model_name="SuricataAlertObservation")
+
+    try:
+        src_ip_obj = ipaddress.ip_address(raw_src_ip)
+    except ValueError as exc:
+        raise ValueError(f"Invalid src_ip '{raw_src_ip}': {exc}") from exc
+
+    try:
+        dst_ip_obj = ipaddress.ip_address(raw_dst_ip)
+    except ValueError as exc:
+        raise ValueError(f"Invalid dst_ip '{raw_dst_ip}': {exc}") from exc
+
+    if src_ip_obj.version != dst_ip_obj.version:
+        raise ValueError(
+            f"SuricataAlertObservation address family mismatch: "
+            f"IPv{src_ip_obj.version} -> IPv{dst_ip_obj.version}"
+        )
+
+    canon_src_ip = str(src_ip_obj)
+    canon_dst_ip = str(dst_ip_obj)
+
+    src_scoped_id = _validate_required_str(
+        obs.src_scoped_id, "src_scoped_id", model_name="SuricataAlertObservation"
+    )
+    dst_scoped_id = _validate_required_str(
+        obs.dst_scoped_id, "dst_scoped_id", model_name="SuricataAlertObservation"
+    )
+    expected_src_scoped = scoped_ip_id(routing_domain_id, canon_src_ip)
+    expected_dst_scoped = scoped_ip_id(routing_domain_id, canon_dst_ip)
+
+    if src_scoped_id != expected_src_scoped:
+        raise ValueError(
+            f"Inconsistent src_scoped_id '{src_scoped_id}' for routing_domain_id='{routing_domain_id}' "
+            f"and src_ip='{canon_src_ip}' (expected '{expected_src_scoped}')"
+        )
+    if dst_scoped_id != expected_dst_scoped:
+        raise ValueError(
+            f"Inconsistent dst_scoped_id '{dst_scoped_id}' for routing_domain_id='{routing_domain_id}' "
+            f"and dst_ip='{canon_dst_ip}' (expected '{expected_dst_scoped}')"
+        )
+
+    protocol_opt = _validate_optional_str(obs.protocol, "protocol", model_name="SuricataAlertObservation")
+    protocol = protocol_opt.upper() if protocol_opt is not None else None
+    src_port = _validate_optional_port(obs.src_port, "src_port", model_name="SuricataAlertObservation")
+    dst_port = _validate_optional_port(obs.dst_port, "dst_port", model_name="SuricataAlertObservation")
+
+    expected_flow_key = compute_v2_flow_key(
+        src_scoped_id=src_scoped_id,
+        dst_scoped_id=dst_scoped_id,
+        protocol=protocol or "UNKNOWN",
+        src_port=src_port,
+        dst_port=dst_port,
+    )
+    if flow_key != expected_flow_key:
+        raise ValueError(
+            f"Inconsistent flow_key '{flow_key}' for normalized tuple "
+            f"({src_scoped_id}, {dst_scoped_id}, {protocol or 'UNKNOWN'}, {src_port}, {dst_port})"
+        )
+
+    sid = _validate_required_metric_int(obs.sid, "sid", model_name="SuricataAlertObservation")
+    gid = _validate_optional_metric_int(obs.gid, "gid", model_name="SuricataAlertObservation")
+    rev = _validate_optional_metric_int(obs.rev, "rev", model_name="SuricataAlertObservation")
+    severity = _validate_optional_metric_int(obs.severity, "severity", model_name="SuricataAlertObservation")
+    tx_id = _validate_optional_metric_int(obs.tx_id, "tx_id", model_name="SuricataAlertObservation")
+    pcap_cnt = _validate_optional_metric_int(obs.pcap_cnt, "pcap_cnt", model_name="SuricataAlertObservation")
+
+    expected_def_id = alert_definition_id(
+        engine=source_type,
+        ruleset_namespace=ruleset_namespace,
+        gid=gid,
+        sid=sid,
+    )
+    if alert_def_id != expected_def_id:
+        raise ValueError(
+            f"Inconsistent alert_definition_id '{alert_def_id}' for engine='{source_type}', "
+            f"ruleset_namespace='{ruleset_namespace}', gid={gid}, sid={sid} "
+            f"(expected '{expected_def_id}')"
+        )
+
+    flow_id_str = _validate_optional_uint_str(obs.flow_id, "flow_id", model_name="SuricataAlertObservation")
+
+    payload: Dict[str, Any] = {
+        "event_id": event_id,
+        "alert_definition_id": alert_def_id,
+        "source_record_id": source_record_id,
+        "log_source_id": log_source_id,
+        "sensor_id": sensor_id,
+        "ruleset_namespace": ruleset_namespace,
+        "routing_domain_id": routing_domain_id,
+        "flow_key": flow_key,
+        "src_scoped_id": src_scoped_id,
+        "dst_scoped_id": dst_scoped_id,
+        "src_ip": canon_src_ip,
+        "dst_ip": canon_dst_ip,
+        "timestamp_source": timestamp_source,
+        "timestamp_epoch_decimal": format_exact_decimal(
+            obs.timestamp_epoch_decimal, "timestamp_epoch_decimal"
+        ),
+        "timestamp_epoch_ns": decimal_epoch_to_ns(
+            obs.timestamp_epoch_decimal, "timestamp_epoch_decimal"
+        ),
+        "protocol": protocol,
+        "src_port": src_port,
+        "dst_port": dst_port,
+        "flow_id": flow_id_str,
+        "community_id": _validate_optional_str(
+            obs.community_id, "community_id", model_name="SuricataAlertObservation"
+        ),
+        "gid": gid,
+        "sid": sid,
+        "rev": rev,
+        "signature": _validate_optional_str(obs.signature, "signature", model_name="SuricataAlertObservation"),
+        "category": _validate_optional_str(obs.category, "category", model_name="SuricataAlertObservation"),
+        "severity": severity,
+        "action": _validate_optional_str(obs.action, "action", model_name="SuricataAlertObservation"),
+        "app_proto": _validate_optional_str(obs.app_proto, "app_proto", model_name="SuricataAlertObservation"),
+        "direction": _validate_optional_str(obs.direction, "direction", model_name="SuricataAlertObservation"),
+        "tx_id": tx_id,
+        "pcap_cnt": pcap_cnt,
+        "source_type": source_type,
+        "source_provenance": _validate_optional_str(
+            obs.source_provenance, "source_provenance", model_name="SuricataAlertObservation"
+        ),
+    }
+    payload["payload_digest"] = compute_alert_event_payload_digest(payload)
     return payload
 
 
@@ -766,6 +1112,156 @@ class Neo4jRepository:
         matched_int = int(raw_matched) if isinstance(raw_matched, (int, float)) and not isinstance(raw_matched, bool) else 0
         return created_int, matched_int
 
+    def write_suricata_alert_events(
+        self,
+        alerts: Iterable[SuricataAlertObservation],
+        batch_size: Optional[int] = None,
+    ) -> AlertEventPersistenceSummary:
+        """Persist a bounded-memory stream of SuricataAlertObservation records in Neo4j.
+
+        Persists each distinct firing as an immutable :AlertEvent node linked via:
+        - (:AlertEvent)-[:TRIGGERED_RULE]->(:AlertDefinition)
+        - (:AlertEvent)-[:HAS_SOURCE]->(:IPAddress)
+        - (:AlertEvent)-[:HAS_DESTINATION]->(:IPAddress)
+
+        Atomicity semantics:
+        - Each batch executes inside a single Neo4j managed write transaction.
+        - Conflicting writes on an existing event_id raise AlertEventConflictError and
+          roll back the entire failing batch while preserving previously committed batches.
+        """
+        if batch_size is not None:
+            if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+                raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+            effective_batch_size = batch_size
+        else:
+            effective_batch_size = self.batch_size
+
+        total_received = 0
+        created_count = 0
+        duplicate_matched_count = 0
+        definitions_created_count = 0
+        definitions_matched_count = 0
+        batches_committed = 0
+
+        payload_stream = (suricata_alert_to_payload(alert) for alert in alerts)
+        batch_iter = iter_batches(payload_stream, effective_batch_size)
+
+        try:
+            first_batch = next(batch_iter)
+        except StopIteration:
+            logger.info("No Suricata alert events to persist.")
+            return AlertEventPersistenceSummary(
+                total_received=0,
+                created_count=0,
+                duplicate_matched_count=0,
+                definitions_created_count=0,
+                definitions_matched_count=0,
+                batches_committed=0,
+            )
+
+        def _process_batch(session, batch: List[Dict[str, Any]]) -> None:
+            nonlocal total_received, created_count, duplicate_matched_count
+            nonlocal definitions_created_count, definitions_matched_count, batches_committed
+
+            total_received += len(batch)
+
+            deduped_by_id: Dict[str, Dict[str, Any]] = {}
+            intra_batch_duplicates = 0
+            for row in batch:
+                ev_id = row["event_id"]
+                existing_row = deduped_by_id.get(ev_id)
+                if existing_row is None:
+                    deduped_by_id[ev_id] = row
+                elif existing_row["payload_digest"] != row["payload_digest"]:
+                    raise AlertEventConflictError(
+                        [ev_id],
+                        batches_committed=batches_committed,
+                    )
+                else:
+                    intra_batch_duplicates += 1
+
+            unique_batch = list(deduped_by_id.values())
+            try:
+                created, matched, defs_created, defs_matched = session.execute_write(
+                    self._execute_suricata_alert_batch,
+                    unique_batch,
+                )
+            except AlertEventConflictError as exc:
+                raise AlertEventConflictError(
+                    exc.conflicting_event_ids,
+                    batches_committed=batches_committed,
+                ) from exc
+
+            created_count += created
+            duplicate_matched_count += matched + intra_batch_duplicates
+            definitions_created_count += defs_created
+            definitions_matched_count += defs_matched
+            batches_committed += 1
+
+        with self.driver.session() as session:
+            _process_batch(session, first_batch)
+            for batch in batch_iter:
+                _process_batch(session, batch)
+
+        summary = AlertEventPersistenceSummary(
+            total_received=total_received,
+            created_count=created_count,
+            duplicate_matched_count=duplicate_matched_count,
+            definitions_created_count=definitions_created_count,
+            definitions_matched_count=definitions_matched_count,
+            batches_committed=batches_committed,
+        )
+        logger.info(
+            "Suricata alert event persistence complete: received=%d, created=%d, matched=%d, "
+            "defs_created=%d, defs_matched=%d, batches=%d.",
+            summary.total_received,
+            summary.created_count,
+            summary.duplicate_matched_count,
+            summary.definitions_created_count,
+            summary.definitions_matched_count,
+            summary.batches_committed,
+        )
+        return summary
+
+    @staticmethod
+    def _execute_suricata_alert_batch(tx, batch: List[Dict[str, Any]]) -> Tuple[int, int, int, int]:
+        result = tx.run(CYPHER_WRITE_SURICATA_ALERT_BATCH, batch=batch)
+        summary_row = result.single()
+        if summary_row is None:
+            return len(batch), 0, 0, 0
+
+        raw_created = summary_row["created_count"]
+        raw_matched = summary_row["matched_count"]
+        raw_defs_created = summary_row["definitions_created_count"]
+        raw_defs_matched = summary_row["definitions_matched_count"]
+        raw_conflicts = summary_row["conflicting_ids"] or []
+
+        conflicting_ids = [str(cid) for cid in raw_conflicts if cid is not None]
+        if conflicting_ids:
+            raise AlertEventConflictError(conflicting_ids)
+
+        created_int = (
+            int(raw_created)
+            if isinstance(raw_created, (int, float)) and not isinstance(raw_created, bool)
+            else len(batch)
+        )
+        matched_int = (
+            int(raw_matched)
+            if isinstance(raw_matched, (int, float)) and not isinstance(raw_matched, bool)
+            else 0
+        )
+        defs_created_int = (
+            int(raw_defs_created)
+            if isinstance(raw_defs_created, (int, float)) and not isinstance(raw_defs_created, bool)
+            else 0
+        )
+        defs_matched_int = (
+            int(raw_defs_matched)
+            if isinstance(raw_defs_matched, (int, float)) and not isinstance(raw_defs_matched, bool)
+            else 0
+        )
+        return created_int, matched_int, defs_created_int, defs_matched_int
+
     def replace_workspace_data(
         self,
         traffic_records: Optional[List[TrafficRecord]] = None,
@@ -775,7 +1271,8 @@ class Neo4jRepository:
         """Atomically replace the current analysis workspace in a single managed write transaction.
 
         1. Executes scoped deletion of all application-owned graph entities
-           (:IPAddress, :Layer2Identifier, :AlertFact, :RoutingDomain, :FlowObservation).
+           (:IPAddress, :Layer2Identifier, :AlertFact, :RoutingDomain, :FlowObservation,
+            :AlertEvent, :AlertDefinition).
         2. Recreates the target :RoutingDomain (default 'default').
         3. Writes all provided traffic records in batched UNWIND calls within the transaction.
         4. Writes all provided alert records in batched UNWIND calls within the transaction.

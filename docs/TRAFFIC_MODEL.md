@@ -143,6 +143,12 @@ Discrete Zeek Connection Observations (Phase 3A.2):
 (:FlowObservation {observation_id: str (UQ), ...})
     ├──[:HAS_ORIGINATOR]──▶ (orig:IPAddress {scoped_id: str (UQ)})
     └──[:HAS_RESPONDER]───▶ (resp:IPAddress {scoped_id: str (UQ)})
+
+Discrete Suricata Alert Events & Rules (Phase 3B.2):
+(:AlertEvent {event_id: str (UQ), ...})
+    ├──[:TRIGGERED_RULE]───▶ (:AlertDefinition {definition_id: str (UQ), engine, ruleset_namespace, gid, sid})
+    ├──[:HAS_SOURCE]───────▶ (src:IPAddress {scoped_id: str (UQ)})
+    └──[:HAS_DESTINATION]──▶ (dst:IPAddress {scoped_id: str (UQ)})
 ```
 
 ### Node Entities
@@ -151,6 +157,8 @@ Discrete Zeek Connection Observations (Phase 3A.2):
 - **`:Layer2Identifier`**: Observed Layer 2 hardware MAC address or resolved identifier. Unique constraint on `identifier`.
 - **`:AlertFact`**: Unique normalized alert fact binding source, target, and security rule metadata within a routing domain. Unique constraint on `fact_key`.
 - **`:FlowObservation`**: Discrete, immutable telemetry connection observation (e.g., Zeek `conn.log`). Unique constraint on `observation_id`; non-unique lookup indexes on `community_id`, `sensor_id`, `routing_domain_id`, and exact integer `start_epoch_ns`. Retains exact lossless decimal timestamp strings (`start_ts`, `end_ts`, `start_epoch_decimal`, `end_epoch_decimal`, `duration_decimal`) and distinct directional originator/responder payload vs IP-level metrics (`orig_bytes`/`resp_bytes`, `orig_ip_bytes`/`resp_ip_bytes`, `orig_pkts`/`resp_pkts`, `missed_bytes`). Distinct from `COMMUNICATED_TO` aggregates.
+- **`:AlertDefinition`**: Static rule/signature identity node (`definition_id` unique constraint). Stores strictly immutable identity fields (`definition_id`, `engine`, `ruleset_namespace`, `gid`, `sid`), leaving mutable rule metadata (`rev`, `signature`, `category`, `severity`, `action`) on individual `:AlertEvent` occurrences.
+- **`:AlertEvent`**: Discrete, immutable Suricata alert firing occurrence (`event_id` unique constraint; lookup indexes on `flow_key`, `community_id`, `flow_id`, `sensor_id`, `routing_domain_id`, `timestamp_epoch_ns`). Preserves verbatim `timestamp_source`, lossless `timestamp_epoch_decimal`, optional signed int64 `timestamp_epoch_ns`, canonical unsigned decimal string `flow_id`, and `payload_digest` conflict protection. Distinct from V1 `:AlertFact`.
 
 ### Relationship Entities
 - **`(:IPAddress)-[:IN_DOMAIN]->(:RoutingDomain)`**: Logical membership connecting an IP address to its routing domain.
@@ -161,6 +169,9 @@ Discrete Zeek Connection Observations (Phase 3A.2):
 - **`(:AlertFact)-[:TARGETS]->(:IPAddress)`**: Connects the alert fact to the destination/target IP.
 - **`(:FlowObservation)-[:HAS_ORIGINATOR]->(:IPAddress)`**: Connects a discrete flow observation to its domain-scoped originator IP.
 - **`(:FlowObservation)-[:HAS_RESPONDER]->(:IPAddress)`**: Connects a discrete flow observation to its domain-scoped responder IP.
+- **`(:AlertEvent)-[:TRIGGERED_RULE]->(:AlertDefinition)`**: Links a discrete alert firing event to its static rule definition.
+- **`(:AlertEvent)-[:HAS_SOURCE]->(:IPAddress)`**: Links a discrete alert event to its domain-scoped source IP.
+- **`(:AlertEvent)-[:HAS_DESTINATION]->(:IPAddress)`**: Links a discrete alert event to its domain-scoped destination IP.
 
 ---
 

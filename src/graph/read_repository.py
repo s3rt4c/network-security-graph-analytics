@@ -9,7 +9,7 @@ Supports V2 scoped IP identities and explicit ambiguity detection across Routing
 """
 
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 
 from src.ingestion.v2_models import scoped_ip_id
 
@@ -1592,6 +1592,253 @@ class Neo4jReadRepository:
             total = int(tx.run(count_cypher, **params).single()["total"])
             page_res = tx.run(page_cypher, **params)
             items = [self._record_to_flow_observation(r) for r in page_res]
+            return items, total
+
+        with self.driver.session() as session:
+            return session.execute_read(_work)
+
+    @staticmethod
+    def _record_to_alert_event(record) -> Dict[str, Any]:
+        """Materialize an AlertEvent Cypher record into a plain Python dictionary."""
+        return {
+            "event_id": record["event_id"],
+            "alert_definition_id": record["alert_definition_id"],
+            "source_record_id": record["source_record_id"],
+            "log_source_id": record["log_source_id"],
+            "sensor_id": record["sensor_id"],
+            "ruleset_namespace": record["ruleset_namespace"],
+            "routing_domain_id": record["routing_domain_id"],
+            "flow_key": record["flow_key"],
+            "src_scoped_id": record["src_scoped_id"],
+            "dst_scoped_id": record["dst_scoped_id"],
+            "src_ip": record["src_ip"],
+            "dst_ip": record["dst_ip"],
+            "timestamp_source": record["timestamp_source"],
+            "timestamp_epoch_decimal": record["timestamp_epoch_decimal"],
+            "timestamp_epoch_ns": record["timestamp_epoch_ns"],
+            "protocol": record["protocol"],
+            "src_port": record["src_port"],
+            "dst_port": record["dst_port"],
+            "flow_id": record["flow_id"],
+            "community_id": record["community_id"],
+            "gid": record["gid"],
+            "sid": record["sid"],
+            "rev": record["rev"],
+            "signature": record["signature"],
+            "category": record["category"],
+            "severity": record["severity"],
+            "action": record["action"],
+            "app_proto": record["app_proto"],
+            "direction": record["direction"],
+            "tx_id": record["tx_id"],
+            "pcap_cnt": record["pcap_cnt"],
+            "source_type": record["source_type"],
+            "source_provenance": record["source_provenance"],
+        }
+
+    def get_alert_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a single discrete AlertEvent by its unique event_id."""
+        if self.driver is None:
+            return None
+        if not event_id or not str(event_id).strip():
+            return None
+
+        cleaned_id = str(event_id).strip()
+        cypher = """
+        MATCH (ae:AlertEvent {event_id: $event_id})
+        RETURN ae.event_id AS event_id,
+               ae.alert_definition_id AS alert_definition_id,
+               ae.source_record_id AS source_record_id,
+               ae.log_source_id AS log_source_id,
+               ae.sensor_id AS sensor_id,
+               ae.ruleset_namespace AS ruleset_namespace,
+               ae.routing_domain_id AS routing_domain_id,
+               ae.flow_key AS flow_key,
+               ae.src_scoped_id AS src_scoped_id,
+               ae.dst_scoped_id AS dst_scoped_id,
+               ae.src_ip AS src_ip,
+               ae.dst_ip AS dst_ip,
+               ae.timestamp_source AS timestamp_source,
+               ae.timestamp_epoch_decimal AS timestamp_epoch_decimal,
+               ae.timestamp_epoch_ns AS timestamp_epoch_ns,
+               ae.protocol AS protocol,
+               ae.src_port AS src_port,
+               ae.dst_port AS dst_port,
+               ae.flow_id AS flow_id,
+               ae.community_id AS community_id,
+               ae.gid AS gid,
+               ae.sid AS sid,
+               ae.rev AS rev,
+               ae.signature AS signature,
+               ae.category AS category,
+               ae.severity AS severity,
+               ae.action AS action,
+               ae.app_proto AS app_proto,
+               ae.direction AS direction,
+               ae.tx_id AS tx_id,
+               ae.pcap_cnt AS pcap_cnt,
+               ae.source_type AS source_type,
+               ae.source_provenance AS source_provenance
+        LIMIT 1
+        """
+
+        def _work(tx) -> Optional[Dict[str, Any]]:
+            record = tx.run(cypher, event_id=cleaned_id).single()
+            if not record:
+                return None
+            return self._record_to_alert_event(record)
+
+        with self.driver.session() as session:
+            return session.execute_read(_work)
+
+    def list_alert_events(
+        self,
+        *,
+        routing_domain_id: Optional[str] = None,
+        sensor_id: Optional[str] = None,
+        flow_key: Optional[str] = None,
+        community_id: Optional[str] = None,
+        flow_id: Optional[Union[int, str]] = None,
+        sid: Optional[int] = None,
+        start_epoch_ns: Optional[int] = None,
+        end_epoch_ns: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """List discrete Suricata AlertEvent nodes with optional indexed filtering and pagination.
+
+        Temporal filtering operates strictly on lossless signed 64-bit integer
+        nanosecond property `timestamp_epoch_ns`. Events missing a resolved epoch
+        timestamp (e.g. timezone-naive timestamps) are excluded when temporal
+        bounds are provided and ordered last (`NULLS LAST`) otherwise.
+        """
+        if self.driver is None:
+            return [], 0
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError(f"limit must be a positive integer, got {limit!r}")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError(f"offset must be a non-negative integer, got {offset!r}")
+
+        if start_epoch_ns is not None:
+            if isinstance(start_epoch_ns, bool) or not isinstance(start_epoch_ns, int):
+                raise ValueError(f"start_epoch_ns must be an integer or None, got {start_epoch_ns!r}")
+            if not (_INT64_MIN <= start_epoch_ns <= _INT64_MAX):
+                raise ValueError(f"start_epoch_ns exceeds 64-bit signed integer range: {start_epoch_ns}")
+
+        if end_epoch_ns is not None:
+            if isinstance(end_epoch_ns, bool) or not isinstance(end_epoch_ns, int):
+                raise ValueError(f"end_epoch_ns must be an integer or None, got {end_epoch_ns!r}")
+            if not (_INT64_MIN <= end_epoch_ns <= _INT64_MAX):
+                raise ValueError(f"end_epoch_ns exceeds 64-bit signed integer range: {end_epoch_ns}")
+
+        if sid is not None:
+            if isinstance(sid, bool) or not isinstance(sid, int) or not (0 <= sid <= _INT64_MAX):
+                raise ValueError(f"sid must be an integer in 0..{_INT64_MAX} or None, got {sid!r}")
+
+        flow_id_str: Optional[str] = None
+        if flow_id is not None:
+            if isinstance(flow_id, bool):
+                raise ValueError(f"flow_id must be a non-negative integer or decimal string, got {flow_id!r}")
+            if isinstance(flow_id, int):
+                if flow_id < 0:
+                    raise ValueError(f"flow_id must be non-negative, got {flow_id!r}")
+                flow_id_str = str(flow_id)
+            elif isinstance(flow_id, str):
+                cleaned_flow_id = flow_id.strip()
+                if not cleaned_flow_id or not cleaned_flow_id.isascii() or not cleaned_flow_id.isdigit():
+                    raise ValueError(f"flow_id string must contain ASCII digits only, got {flow_id!r}")
+                flow_id_str = str(int(cleaned_flow_id))
+            else:
+                raise ValueError(f"flow_id must be an int, str, or None, got {flow_id!r}")
+
+        effective_limit = min(limit, 1000)
+        clauses: List[str] = []
+        params: Dict[str, Any] = {
+            "limit": effective_limit,
+            "offset": offset,
+        }
+
+        if routing_domain_id and routing_domain_id.strip():
+            clauses.append("ae.routing_domain_id = $routing_domain_id")
+            params["routing_domain_id"] = routing_domain_id.strip().lower()
+        if sensor_id and sensor_id.strip():
+            clauses.append("ae.sensor_id = $sensor_id")
+            params["sensor_id"] = sensor_id.strip().lower()
+        if flow_key and flow_key.strip():
+            clauses.append("ae.flow_key = $flow_key")
+            params["flow_key"] = flow_key.strip()
+        if community_id and community_id.strip():
+            clauses.append("ae.community_id = $community_id")
+            params["community_id"] = community_id.strip()
+        if flow_id_str is not None:
+            clauses.append("ae.flow_id = $flow_id")
+            params["flow_id"] = flow_id_str
+        if sid is not None:
+            clauses.append("ae.sid = $sid")
+            params["sid"] = sid
+        if start_epoch_ns is not None:
+            clauses.append("ae.timestamp_epoch_ns IS NOT NULL AND ae.timestamp_epoch_ns >= $start_epoch_ns")
+            params["start_epoch_ns"] = start_epoch_ns
+        if end_epoch_ns is not None:
+            clauses.append("ae.timestamp_epoch_ns IS NOT NULL AND ae.timestamp_epoch_ns <= $end_epoch_ns")
+            params["end_epoch_ns"] = end_epoch_ns
+
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        count_cypher = f"""
+        MATCH (ae:AlertEvent)
+        {where_clause}
+        RETURN count(ae) AS total
+        """
+
+        page_cypher = f"""
+        MATCH (ae:AlertEvent)
+        {where_clause}
+        RETURN ae.event_id AS event_id,
+               ae.alert_definition_id AS alert_definition_id,
+               ae.source_record_id AS source_record_id,
+               ae.log_source_id AS log_source_id,
+               ae.sensor_id AS sensor_id,
+               ae.ruleset_namespace AS ruleset_namespace,
+               ae.routing_domain_id AS routing_domain_id,
+               ae.flow_key AS flow_key,
+               ae.src_scoped_id AS src_scoped_id,
+               ae.dst_scoped_id AS dst_scoped_id,
+               ae.src_ip AS src_ip,
+               ae.dst_ip AS dst_ip,
+               ae.timestamp_source AS timestamp_source,
+               ae.timestamp_epoch_decimal AS timestamp_epoch_decimal,
+               ae.timestamp_epoch_ns AS timestamp_epoch_ns,
+               ae.protocol AS protocol,
+               ae.src_port AS src_port,
+               ae.dst_port AS dst_port,
+               ae.flow_id AS flow_id,
+               ae.community_id AS community_id,
+               ae.gid AS gid,
+               ae.sid AS sid,
+               ae.rev AS rev,
+               ae.signature AS signature,
+               ae.category AS category,
+               ae.severity AS severity,
+               ae.action AS action,
+               ae.app_proto AS app_proto,
+               ae.direction AS direction,
+               ae.tx_id AS tx_id,
+               ae.pcap_cnt AS pcap_cnt,
+               ae.source_type AS source_type,
+               ae.source_provenance AS source_provenance
+        ORDER BY CASE WHEN ae.timestamp_epoch_ns IS NULL THEN 1 ELSE 0 END ASC,
+                 ae.timestamp_epoch_ns ASC,
+                 ae.event_id ASC
+        SKIP $offset
+        LIMIT $limit
+        """
+
+        def _work(tx) -> Tuple[List[Dict[str, Any]], int]:
+            total = int(tx.run(count_cypher, **params).single()["total"])
+            page_res = tx.run(page_cypher, **params)
+            items = [self._record_to_alert_event(r) for r in page_res]
             return items, total
 
         with self.driver.session() as session:
