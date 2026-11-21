@@ -30,6 +30,15 @@ from src.graph.repository import (
     CYPHER_WRITE_SURICATA_ALERT_BATCH,
 )
 from src.graph.read_repository import Neo4jReadRepository, AmbiguousEndpointError
+from src.graph.correlation_repository import (
+    CORRELATION_REL_TYPE,
+    AlertCorrelationOutcome,
+    CandidateRetrievalResult,
+    CorrelationBatchResult,
+    Neo4jCorrelationRepository,
+    build_correlation_edge_properties,
+    compute_correlation_evidence_digest,
+)
 
 __all__ = [
     "ensure_schema",
@@ -44,6 +53,13 @@ __all__ = [
     "AlertEventPersistenceSummary",
     "Neo4jReadRepository",
     "AmbiguousEndpointError",
+    "CORRELATION_REL_TYPE",
+    "AlertCorrelationOutcome",
+    "CandidateRetrievalResult",
+    "CorrelationBatchResult",
+    "Neo4jCorrelationRepository",
+    "build_correlation_edge_properties",
+    "compute_correlation_evidence_digest",
     "canonicalize_ip",
     "compute_alert_fact_key",
     "compute_alert_event_payload_digest",
