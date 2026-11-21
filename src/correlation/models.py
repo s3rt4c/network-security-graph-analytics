@@ -17,15 +17,20 @@ Guarantees:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 import hashlib
+import ipaddress
 import json
-from typing import Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
-from src.ingestion.v2_models import format_canonical_decimal
+from src.ingestion.v2_models import format_canonical_decimal, scoped_ip_id
 
 EVIDENCE_VERSION = "v1"
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+_ALERT_SOURCE_TYPE = "suricata"
+_FLOW_SOURCE_TYPE = "zeek"
 
 
 class CorrelationStatus(str, Enum):
@@ -409,6 +414,208 @@ class CorrelationPolicy:
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def _exact_decimal_epoch_to_ns(epoch: Optional[Decimal]) -> Optional[int]:
+    """Losslessly convert a non-negative finite Decimal epoch to signed int64 ns, or None.
+
+    Mirrors repository.decimal_epoch_to_ns without importing Neo4j persistence modules:
+    returns None if any nonzero fractional digit exists beyond 9 decimal places or if
+    the nanosecond value exceeds signed 64-bit integer bounds.
+    """
+    if epoch is None:
+        return None
+    if isinstance(epoch, bool) or not isinstance(epoch, Decimal):
+        raise ValueError(f"epoch must be a finite non-negative Decimal or None, got {epoch!r}")
+    if epoch.is_nan() or epoch.is_infinite() or epoch < 0:
+        raise ValueError(f"epoch must be a finite non-negative Decimal or None, got {epoch!r}")
+    sign, digits, exp = epoch.as_tuple()
+    if not isinstance(exp, int):
+        return None
+    if not digits or all(d == 0 for d in digits):
+        return 0
+    if sign:
+        return None
+    digit_str = "".join(str(d) for d in digits).lstrip("0")
+    stripped = digit_str.rstrip("0")
+    trailing_zeros = len(digit_str) - len(stripped)
+    eff_ns_exp = exp + trailing_zeros + 9
+    if eff_ns_exp < 0 or eff_ns_exp >= 19 or (len(stripped) + eff_ns_exp) > 19:
+        return None
+    ns_int = int(stripped) * (10 ** eff_ns_exp)
+    if ns_int < _INT64_MIN or ns_int > _INT64_MAX:
+        return None
+    return ns_int
+
+
+def _parse_required_str(raw: Any, field_name: str) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{field_name} must be a non-empty string, got {raw!r}")
+    return raw.strip()
+
+
+def _parse_optional_str(raw: Any, field_name: str) -> Optional[str]:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(f"{field_name} must be a string or None, got {raw!r}")
+    cleaned = raw.strip()
+    return cleaned if cleaned else None
+
+
+def _parse_allow_empty_str(raw: Any, field_name: str) -> str:
+    if not isinstance(raw, str):
+        raise ValueError(f"{field_name} must be a string, got {raw!r}")
+    return raw.strip()
+
+
+def _parse_routing_domain(raw: Any, field_name: str) -> str:
+    domain = _parse_required_str(raw, field_name).lower()
+    if "#" in domain:
+        raise ValueError(f"{field_name} cannot contain '#': {domain!r}")
+    return domain
+
+
+def _parse_expected_source_type(raw: Any, expected: str, field_name: str) -> str:
+    norm = _parse_required_str(raw, field_name).lower()
+    if norm != expected:
+        raise ValueError(
+            f"{field_name} must be {expected!r} for Zeek-Suricata correlation, got {raw!r}"
+        )
+    return norm
+
+
+def _parse_optional_port(raw: Any, field_name: str) -> Optional[int]:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or not (0 <= raw <= 65535):
+        raise ValueError(f"{field_name} must be an int in 0..65535 or None, got {raw!r}")
+    return raw
+
+
+def _parse_optional_epoch_decimal(
+    raw: Any,
+    field_name: str,
+    *,
+    allow_str_or_int: bool = True,
+) -> Optional[Decimal]:
+    """Validate an optional authoritative non-negative finite Decimal epoch without float coercion."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise ValueError(f"{field_name} cannot be a bool: {raw!r}")
+    if isinstance(raw, float):
+        raise ValueError(
+            f"{field_name} cannot be a float (authoritative timestamps must be exact Decimal/str): {raw!r}"
+        )
+    if isinstance(raw, Decimal):
+        val = raw
+    elif allow_str_or_int and isinstance(raw, int):
+        val = Decimal(raw)
+    elif allow_str_or_int and isinstance(raw, str):
+        cleaned = raw.strip()
+        if not cleaned:
+            return None
+        try:
+            val = Decimal(cleaned)
+        except InvalidOperation as exc:
+            raise ValueError(f"{field_name} is not a valid Decimal string: {raw!r}") from exc
+    else:
+        expected_types = (
+            "Decimal, int, decimal str, or None" if allow_str_or_int else "Decimal or None"
+        )
+        raise ValueError(f"{field_name} must be {expected_types}, got {type(raw).__name__}")
+
+    if val.is_nan() or val.is_infinite() or val < 0:
+        raise ValueError(f"{field_name} must be a finite non-negative Decimal, got {raw!r}")
+    format_canonical_decimal(val)
+    return val
+
+
+def _validate_epoch_ns(
+    raw_ns: Any,
+    epoch_decimal: Optional[Decimal],
+    field_name: str,
+) -> Optional[int]:
+    """Validate that an optional nanosecond index field exactly matches its Decimal epoch."""
+    if raw_ns is not None and (isinstance(raw_ns, bool) or not isinstance(raw_ns, int)):
+        raise ValueError(f"{field_name} must be int or None, got {raw_ns!r}")
+    expected_ns = _exact_decimal_epoch_to_ns(epoch_decimal)
+    if raw_ns != expected_ns:
+        raise ValueError(
+            f"Inconsistent {field_name}: got {raw_ns!r}, expected {expected_ns!r} "
+            f"for exact decimal epoch {epoch_decimal!r}"
+        )
+    return expected_ns
+
+
+def _validate_ip_version(raw_version: Any, expected_version: int, field_name: str) -> int:
+    if isinstance(raw_version, bool) or not isinstance(raw_version, int) or raw_version not in (4, 6):
+        raise ValueError(f"{field_name} must be 4 or 6, got {raw_version!r}")
+    if raw_version != expected_version:
+        raise ValueError(
+            f"Inconsistent {field_name}: got IPv{raw_version}, expected IPv{expected_version}"
+        )
+    return raw_version
+
+
+def _parse_ip_pair(
+    raw_src: Any,
+    raw_dst: Any,
+    routing_domain_id: str,
+    raw_src_scoped: Any,
+    raw_dst_scoped: Any,
+    label: str,
+    *,
+    require_src_scoped: bool = False,
+    require_dst_scoped: bool = False,
+    raw_ip_version: Any = None,
+    require_ip_version: bool = False,
+) -> Tuple[str, str, int, str, str]:
+    src_str = _parse_required_str(raw_src, f"{label}.src_ip")
+    dst_str = _parse_required_str(raw_dst, f"{label}.dst_ip")
+    try:
+        src_obj = ipaddress.ip_address(src_str)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {label}.src_ip {src_str!r}: {exc}") from exc
+    try:
+        dst_obj = ipaddress.ip_address(dst_str)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {label}.dst_ip {dst_str!r}: {exc}") from exc
+    if src_obj.version != dst_obj.version:
+        raise ValueError(
+            f"{label} IP version mismatch: IPv{src_obj.version} -> IPv{dst_obj.version}"
+        )
+
+    if require_ip_version or raw_ip_version is not None:
+        _validate_ip_version(raw_ip_version, src_obj.version, f"{label}.ip_version")
+
+    canon_src = str(src_obj)
+    canon_dst = str(dst_obj)
+    expected_src_scoped = scoped_ip_id(routing_domain_id, canon_src)
+    expected_dst_scoped = scoped_ip_id(routing_domain_id, canon_dst)
+
+    if require_src_scoped or raw_src_scoped is not None:
+        src_scoped = _parse_required_str(raw_src_scoped, f"{label}.src_scoped_id")
+        if src_scoped != expected_src_scoped:
+            raise ValueError(
+                f"Inconsistent {label}.src_scoped_id {src_scoped!r} "
+                f"(expected {expected_src_scoped!r} for domain={routing_domain_id!r}, ip={canon_src!r})"
+            )
+    else:
+        src_scoped = expected_src_scoped
+
+    if require_dst_scoped or raw_dst_scoped is not None:
+        dst_scoped = _parse_required_str(raw_dst_scoped, f"{label}.dst_scoped_id")
+        if dst_scoped != expected_dst_scoped:
+            raise ValueError(
+                f"Inconsistent {label}.dst_scoped_id {dst_scoped!r} "
+                f"(expected {expected_dst_scoped!r} for domain={routing_domain_id!r}, ip={canon_dst!r})"
+            )
+    else:
+        dst_scoped = expected_dst_scoped
+
+    return canon_src, canon_dst, src_obj.version, src_scoped, dst_scoped
+
+
 @dataclass(frozen=True)
 class AlertSnapshot:
     """Normalized, Neo4j-independent Suricata alert representation for correlation."""
@@ -432,6 +639,63 @@ class AlertSnapshot:
     source_provenance: Optional[str] = None
     log_source_id: Optional[str] = None
     alert_definition_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        event_id = _parse_required_str(self.event_id, "alert.event_id")
+        domain = _parse_routing_domain(self.routing_domain_id, "alert.routing_domain_id")
+        sensor = _parse_required_str(self.sensor_id, "alert.sensor_id").lower()
+        src_ip, dst_ip, ip_ver, src_scoped, dst_scoped = _parse_ip_pair(
+            self.src_ip,
+            self.dst_ip,
+            domain,
+            self.src_scoped_id,
+            self.dst_scoped_id,
+            "alert",
+            require_src_scoped=True,
+            require_dst_scoped=True,
+            raw_ip_version=self.ip_version,
+            require_ip_version=True,
+        )
+        proto_opt = _parse_optional_str(self.protocol, "alert.protocol")
+        protocol = proto_opt.upper() if proto_opt is not None else None
+        src_port = _parse_optional_port(self.src_port, "alert.src_port")
+        dst_port = _parse_optional_port(self.dst_port, "alert.dst_port")
+        community_id = _parse_optional_str(self.community_id, "alert.community_id")
+        timestamp_source = _parse_allow_empty_str(self.timestamp_source, "alert.timestamp_source")
+        epoch_dec = _parse_optional_epoch_decimal(
+            self.timestamp_epoch_decimal,
+            "alert.timestamp_epoch_decimal",
+            allow_str_or_int=False,
+        )
+        epoch_ns = _validate_epoch_ns(
+            self.timestamp_epoch_ns, epoch_dec, "alert.timestamp_epoch_ns"
+        )
+        source_type = _parse_expected_source_type(
+            self.source_type, _ALERT_SOURCE_TYPE, "alert.source_type"
+        )
+        source_provenance = _parse_optional_str(self.source_provenance, "alert.source_provenance")
+        log_source_id = _parse_optional_str(self.log_source_id, "alert.log_source_id")
+        alert_def_id = _parse_optional_str(self.alert_definition_id, "alert.alert_definition_id")
+
+        object.__setattr__(self, "event_id", event_id)
+        object.__setattr__(self, "routing_domain_id", domain)
+        object.__setattr__(self, "sensor_id", sensor)
+        object.__setattr__(self, "src_ip", src_ip)
+        object.__setattr__(self, "dst_ip", dst_ip)
+        object.__setattr__(self, "ip_version", ip_ver)
+        object.__setattr__(self, "src_scoped_id", src_scoped)
+        object.__setattr__(self, "dst_scoped_id", dst_scoped)
+        object.__setattr__(self, "protocol", protocol)
+        object.__setattr__(self, "src_port", src_port)
+        object.__setattr__(self, "dst_port", dst_port)
+        object.__setattr__(self, "community_id", community_id)
+        object.__setattr__(self, "timestamp_source", timestamp_source)
+        object.__setattr__(self, "timestamp_epoch_decimal", epoch_dec)
+        object.__setattr__(self, "timestamp_epoch_ns", epoch_ns)
+        object.__setattr__(self, "source_type", source_type)
+        object.__setattr__(self, "source_provenance", source_provenance)
+        object.__setattr__(self, "log_source_id", log_source_id)
+        object.__setattr__(self, "alert_definition_id", alert_def_id)
 
 
 @dataclass(frozen=True)
@@ -459,6 +723,72 @@ class FlowSnapshot:
     end_epoch_ns: Optional[int]
     source_type: str = "zeek"
     source_provenance: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        observation_id = _parse_required_str(self.observation_id, "flow.observation_id")
+        zeek_uid = _parse_allow_empty_str(self.zeek_uid, "flow.zeek_uid")
+        domain = _parse_routing_domain(self.routing_domain_id, "flow.routing_domain_id")
+        sensor = _parse_required_str(self.sensor_id, "flow.sensor_id").lower()
+        src_ip, dst_ip, ip_ver, src_scoped, dst_scoped = _parse_ip_pair(
+            self.src_ip,
+            self.dst_ip,
+            domain,
+            self.src_scoped_id,
+            self.dst_scoped_id,
+            "flow",
+            require_src_scoped=True,
+            require_dst_scoped=True,
+            raw_ip_version=self.ip_version,
+            require_ip_version=True,
+        )
+        protocol = _parse_required_str(self.protocol, "flow.protocol").upper()
+        src_port = _parse_optional_port(self.src_port, "flow.src_port")
+        dst_port = _parse_optional_port(self.dst_port, "flow.dst_port")
+        community_id = _parse_optional_str(self.community_id, "flow.community_id")
+        start_ts = _parse_allow_empty_str(self.start_ts, "flow.start_ts")
+        start_dec = _parse_optional_epoch_decimal(
+            self.start_epoch_decimal,
+            "flow.start_epoch_decimal",
+            allow_str_or_int=False,
+        )
+        end_dec = _parse_optional_epoch_decimal(
+            self.end_epoch_decimal,
+            "flow.end_epoch_decimal",
+            allow_str_or_int=False,
+        )
+        dur_dec = _parse_optional_epoch_decimal(
+            self.duration_decimal,
+            "flow.duration_decimal",
+            allow_str_or_int=False,
+        )
+        start_ns = _validate_epoch_ns(self.start_epoch_ns, start_dec, "flow.start_epoch_ns")
+        end_ns = _validate_epoch_ns(self.end_epoch_ns, end_dec, "flow.end_epoch_ns")
+        source_type = _parse_expected_source_type(
+            self.source_type, _FLOW_SOURCE_TYPE, "flow.source_type"
+        )
+        source_provenance = _parse_optional_str(self.source_provenance, "flow.source_provenance")
+
+        object.__setattr__(self, "observation_id", observation_id)
+        object.__setattr__(self, "zeek_uid", zeek_uid)
+        object.__setattr__(self, "routing_domain_id", domain)
+        object.__setattr__(self, "sensor_id", sensor)
+        object.__setattr__(self, "src_ip", src_ip)
+        object.__setattr__(self, "dst_ip", dst_ip)
+        object.__setattr__(self, "ip_version", ip_ver)
+        object.__setattr__(self, "src_scoped_id", src_scoped)
+        object.__setattr__(self, "dst_scoped_id", dst_scoped)
+        object.__setattr__(self, "protocol", protocol)
+        object.__setattr__(self, "src_port", src_port)
+        object.__setattr__(self, "dst_port", dst_port)
+        object.__setattr__(self, "community_id", community_id)
+        object.__setattr__(self, "start_ts", start_ts)
+        object.__setattr__(self, "start_epoch_decimal", start_dec)
+        object.__setattr__(self, "end_epoch_decimal", end_dec)
+        object.__setattr__(self, "duration_decimal", dur_dec)
+        object.__setattr__(self, "start_epoch_ns", start_ns)
+        object.__setattr__(self, "end_epoch_ns", end_ns)
+        object.__setattr__(self, "source_type", source_type)
+        object.__setattr__(self, "source_provenance", source_provenance)
 
 
 @dataclass(frozen=True)

@@ -23,7 +23,9 @@ This document specifies the Phase 4A pure-Python, Neo4j-independent correlation 
 - **`SensorPairingPolicy`**:
   - `ANY_IN_DOMAIN` (default), `SAME_SENSOR_ID`, or `EXPLICIT_PAIRS` (explicit `{suricata_sensor_id: [zeek_sensor_ids]}` mapping with optional exact `Decimal` per-pair clock offsets). Never infers a global sensor topology or assumes sensor names imply equal network vantage.
 - **`CandidateCompleteness`**:
-  - Explicit completeness signal (`COMPLETE`, `TRUNCATED`, `RETRIEVAL_ERROR`, `UNKNOWN`). Automatic `STRONG` promotion is strictly forbidden whenever completeness is not `COMPLETE` or `candidate_cap` is exceeded.
+  - Explicit completeness signal (`COMPLETE`, `TRUNCATED`, `RETRIEVAL_ERROR`, `UNKNOWN`). `correlate_alert_to_flows()` defaults `candidate_completeness` to **`CandidateCompleteness.UNKNOWN`** (fail-closed) so omitting completeness never silently authorizes automatic correlation. Only explicitly `COMPLETE` candidate sets within `candidate_cap` may produce `STRONG`.
+- **`AlertSnapshot` & `FlowSnapshot` Trust Boundaries**:
+  - Both snapshots enforce a single shared validation and canonicalization path at construction time (`__post_init__`) and across all adapter inputs (`SuricataAlertObservation`, `ZeekConnectionObservation`, read-repository `Mapping`, and direct `Snapshot` instances): `routing_domain_id` and `sensor_id` normalization, canonical IPv4/IPv6 + `ip_version` consistency, `src_scoped_id`/`dst_scoped_id` integrity, transport port bounds (`0..65535`), finite non-negative exact `Decimal` timestamps (rejecting `float`), exact `*_epoch_ns` consistency against `_exact_decimal_epoch_to_ns`, and strict `source_type == "suricata"` (alerts) / `source_type == "zeek"` (flows).
 - **`CorrelationCandidateEvidence` & `CorrelationDecision`**:
   - Deterministic audit objects recording machine-readable reason codes, orientation, tuple completeness, Community ID status, exact `Decimal` temporal delta (`temporal_delta_decimal`), and `used_decimal_fallback`.
 

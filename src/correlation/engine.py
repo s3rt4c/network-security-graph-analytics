@@ -17,11 +17,12 @@ Key guarantees:
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
-import ipaddress
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 from src.correlation.models import (
+    _ALERT_SOURCE_TYPE,
+    _FLOW_SOURCE_TYPE,
     AlertSnapshot,
     CandidateCompleteness,
     CandidateStrength,
@@ -37,6 +38,12 @@ from src.correlation.models import (
     TemporalRelation,
     TupleCompleteness,
     TupleOrientation,
+    _exact_decimal_epoch_to_ns,
+    _parse_ip_pair,
+    _parse_optional_epoch_decimal,
+    _parse_optional_str,
+    _parse_required_str,
+    _parse_routing_domain,
 )
 from src.ingestion.community_id import compute_community_id
 from src.ingestion.v2_models import (
@@ -44,7 +51,6 @@ from src.ingestion.v2_models import (
     ZeekConnectionObservation,
     add_exact_decimals,
     format_canonical_decimal,
-    scoped_ip_id,
 )
 
 AlertInput = Union[AlertSnapshot, SuricataAlertObservation, Mapping[str, Any]]
@@ -52,8 +58,6 @@ FlowInput = Union[FlowSnapshot, ZeekConnectionObservation, Mapping[str, Any]]
 
 _PORT_PROTOCOLS = frozenset({"TCP", "UDP", "SCTP"})
 _ICMP_PROTOCOLS = frozenset({"ICMP", "ICMP6"})
-_INT64_MIN = -(2**63)
-_INT64_MAX = 2**63 - 1
 
 
 def _subtract_exact_decimals(left: Decimal, right: Decimal) -> Decimal:
@@ -62,145 +66,39 @@ def _subtract_exact_decimals(left: Decimal, right: Decimal) -> Decimal:
     return add_exact_decimals(left, right.copy_negate())
 
 
-def _exact_decimal_epoch_to_ns(epoch: Optional[Decimal]) -> Optional[int]:
-    """Losslessly convert a non-negative finite Decimal epoch to signed int64 ns, or None.
+def alert_to_snapshot(alert: AlertInput) -> AlertSnapshot:
+    """Validate and normalize a SuricataAlertObservation, read-repository dict, or AlertSnapshot.
 
-    Mirrors repository.decimal_epoch_to_ns without importing Neo4j persistence modules:
-    returns None if any nonzero fractional digit exists beyond 9 decimal places or if
-    the nanosecond value exceeds signed 64-bit integer bounds.
+    All supported input types pass through AlertSnapshot's single shared validation path
+    (enforcing routing_domain_id normalization, canonical IPv4/IPv6 + ip_version parity,
+    scoped ID integrity, port bounds, exact finite non-negative Decimal timestamps,
+    nanosecond index consistency, and strict source_type='suricata').
     """
-    if epoch is None:
-        return None
-    _, digits, exp = epoch.as_tuple()
-    if not isinstance(exp, int):
-        return None
-    if not digits or all(d == 0 for d in digits):
-        return 0
-    digit_str = "".join(str(d) for d in digits).lstrip("0")
-    stripped = digit_str.rstrip("0")
-    trailing_zeros = len(digit_str) - len(stripped)
-    eff_ns_exp = exp + trailing_zeros + 9
-    if eff_ns_exp < 0 or eff_ns_exp >= 19:
-        return None
-    ns_int = int(stripped) * (10 ** eff_ns_exp)
-    if ns_int < _INT64_MIN or ns_int > _INT64_MAX:
-        return None
-    return ns_int
-
-
-def _parse_optional_epoch_decimal(raw: Any, field_name: str) -> Optional[Decimal]:
-    """Parse an optional authoritative non-negative finite Decimal epoch without float coercion."""
-    if raw is None:
-        return None
-    if isinstance(raw, bool):
-        raise ValueError(f"{field_name} cannot be a bool: {raw!r}")
-    if isinstance(raw, float):
-        raise ValueError(f"{field_name} cannot be a float (authoritative timestamps must be exact Decimal/str): {raw!r}")
-    if isinstance(raw, Decimal):
-        val = raw
-    elif isinstance(raw, int):
-        val = Decimal(raw)
-    elif isinstance(raw, str):
-        cleaned = raw.strip()
-        if not cleaned:
-            return None
-        try:
-            val = Decimal(cleaned)
-        except InvalidOperation as exc:
-            raise ValueError(f"{field_name} is not a valid Decimal string: {raw!r}") from exc
-    else:
-        raise ValueError(f"{field_name} must be Decimal, int, decimal str, or None, got {type(raw).__name__}")
-
-    if val.is_nan() or val.is_infinite() or val < 0:
-        raise ValueError(f"{field_name} must be a finite non-negative Decimal, got {raw!r}")
-    format_canonical_decimal(val)
-    return val
-
-
-def _parse_optional_port(raw: Any, field_name: str) -> Optional[int]:
-    if raw is None:
-        return None
-    if isinstance(raw, bool) or not isinstance(raw, int) or not (0 <= raw <= 65535):
-        raise ValueError(f"{field_name} must be an int in 0..65535 or None, got {raw!r}")
-    return raw
-
-
-def _parse_required_str(raw: Any, field_name: str) -> str:
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValueError(f"{field_name} must be a non-empty string, got {raw!r}")
-    return raw.strip()
-
-
-def _parse_optional_str(raw: Any, field_name: str) -> Optional[str]:
-    if raw is None:
-        return None
-    if not isinstance(raw, str):
-        raise ValueError(f"{field_name} must be a string or None, got {raw!r}")
-    cleaned = raw.strip()
-    return cleaned if cleaned else None
-
-
-def _parse_ip_pair(
-    raw_src: Any,
-    raw_dst: Any,
-    routing_domain_id: str,
-    raw_src_scoped: Any,
-    raw_dst_scoped: Any,
-    label: str,
-) -> Tuple[str, str, int, str, str]:
-    src_str = _parse_required_str(raw_src, f"{label}.src_ip")
-    dst_str = _parse_required_str(raw_dst, f"{label}.dst_ip")
-    try:
-        src_obj = ipaddress.ip_address(src_str)
-    except ValueError as exc:
-        raise ValueError(f"Invalid {label}.src_ip {src_str!r}: {exc}") from exc
-    try:
-        dst_obj = ipaddress.ip_address(dst_str)
-    except ValueError as exc:
-        raise ValueError(f"Invalid {label}.dst_ip {dst_str!r}: {exc}") from exc
-    if src_obj.version != dst_obj.version:
-        raise ValueError(
-            f"{label} IP version mismatch: IPv{src_obj.version} -> IPv{dst_obj.version}"
+    if isinstance(alert, AlertSnapshot):
+        return AlertSnapshot(
+            event_id=alert.event_id,
+            routing_domain_id=alert.routing_domain_id,
+            sensor_id=alert.sensor_id,
+            src_ip=alert.src_ip,
+            dst_ip=alert.dst_ip,
+            ip_version=alert.ip_version,
+            src_scoped_id=alert.src_scoped_id,
+            dst_scoped_id=alert.dst_scoped_id,
+            protocol=alert.protocol,
+            src_port=alert.src_port,
+            dst_port=alert.dst_port,
+            community_id=alert.community_id,
+            timestamp_source=alert.timestamp_source,
+            timestamp_epoch_decimal=alert.timestamp_epoch_decimal,
+            timestamp_epoch_ns=alert.timestamp_epoch_ns,
+            source_type=alert.source_type,
+            source_provenance=alert.source_provenance,
+            log_source_id=alert.log_source_id,
+            alert_definition_id=alert.alert_definition_id,
         )
 
-    canon_src = str(src_obj)
-    canon_dst = str(dst_obj)
-    expected_src_scoped = scoped_ip_id(routing_domain_id, canon_src)
-    expected_dst_scoped = scoped_ip_id(routing_domain_id, canon_dst)
-
-    if raw_src_scoped is not None:
-        src_scoped = _parse_required_str(raw_src_scoped, f"{label}.src_scoped_id")
-        if src_scoped != expected_src_scoped:
-            raise ValueError(
-                f"Inconsistent {label}.src_scoped_id {src_scoped!r} "
-                f"(expected {expected_src_scoped!r} for domain={routing_domain_id!r}, ip={canon_src!r})"
-            )
-    else:
-        src_scoped = expected_src_scoped
-
-    if raw_dst_scoped is not None:
-        dst_scoped = _parse_required_str(raw_dst_scoped, f"{label}.dst_scoped_id")
-        if dst_scoped != expected_dst_scoped:
-            raise ValueError(
-                f"Inconsistent {label}.dst_scoped_id {dst_scoped!r} "
-                f"(expected {expected_dst_scoped!r} for domain={routing_domain_id!r}, ip={canon_dst!r})"
-            )
-    else:
-        dst_scoped = expected_dst_scoped
-
-    return canon_src, canon_dst, src_obj.version, src_scoped, dst_scoped
-
-
-def alert_to_snapshot(alert: AlertInput) -> AlertSnapshot:
-    """Normalize a SuricataAlertObservation, read-repository dict, or AlertSnapshot."""
-    if isinstance(alert, AlertSnapshot):
-        return alert
-
     if isinstance(alert, SuricataAlertObservation):
-        domain = _parse_required_str(alert.routing_domain_id, "alert.routing_domain_id").lower()
-        if "#" in domain:
-            raise ValueError(f"alert.routing_domain_id cannot contain '#': {domain!r}")
-        sensor = _parse_required_str(alert.sensor_id, "alert.sensor_id").lower()
+        domain = _parse_routing_domain(alert.routing_domain_id, "alert.routing_domain_id")
         src_ip, dst_ip, ip_ver, src_scoped, dst_scoped = _parse_ip_pair(
             alert.src_ip,
             alert.dst_ip,
@@ -208,38 +106,38 @@ def alert_to_snapshot(alert: AlertInput) -> AlertSnapshot:
             alert.src_scoped_id,
             alert.dst_scoped_id,
             "alert",
+            require_src_scoped=True,
+            require_dst_scoped=True,
         )
-        proto_opt = _parse_optional_str(alert.protocol, "alert.protocol")
         epoch_dec = _parse_optional_epoch_decimal(
-            alert.timestamp_epoch_decimal, "alert.timestamp_epoch_decimal"
+            alert.timestamp_epoch_decimal,
+            "alert.timestamp_epoch_decimal",
+            allow_str_or_int=False,
         )
         return AlertSnapshot(
-            event_id=_parse_required_str(alert.event_id, "alert.event_id"),
+            event_id=alert.event_id,
             routing_domain_id=domain,
-            sensor_id=sensor,
+            sensor_id=alert.sensor_id,
             src_ip=src_ip,
             dst_ip=dst_ip,
             ip_version=ip_ver,
             src_scoped_id=src_scoped,
             dst_scoped_id=dst_scoped,
-            protocol=proto_opt.upper() if proto_opt is not None else None,
-            src_port=_parse_optional_port(alert.src_port, "alert.src_port"),
-            dst_port=_parse_optional_port(alert.dst_port, "alert.dst_port"),
-            community_id=_parse_optional_str(alert.community_id, "alert.community_id"),
+            protocol=alert.protocol,
+            src_port=alert.src_port,
+            dst_port=alert.dst_port,
+            community_id=alert.community_id,
             timestamp_source=_parse_required_str(alert.timestamp_source, "alert.timestamp_source"),
             timestamp_epoch_decimal=epoch_dec,
             timestamp_epoch_ns=_exact_decimal_epoch_to_ns(epoch_dec),
-            source_type=_parse_required_str(alert.source_type, "alert.source_type").lower(),
-            source_provenance=_parse_optional_str(alert.source_provenance, "alert.source_provenance"),
-            log_source_id=_parse_optional_str(alert.log_source_id, "alert.log_source_id"),
-            alert_definition_id=_parse_optional_str(alert.alert_definition_id, "alert.alert_definition_id"),
+            source_type=alert.source_type,
+            source_provenance=alert.source_provenance,
+            log_source_id=alert.log_source_id,
+            alert_definition_id=alert.alert_definition_id,
         )
 
     if isinstance(alert, Mapping):
-        domain = _parse_required_str(alert.get("routing_domain_id"), "alert.routing_domain_id").lower()
-        if "#" in domain:
-            raise ValueError(f"alert.routing_domain_id cannot contain '#': {domain!r}")
-        sensor = _parse_required_str(alert.get("sensor_id"), "alert.sensor_id").lower()
+        domain = _parse_routing_domain(alert.get("routing_domain_id"), "alert.routing_domain_id")
         src_ip, dst_ip, ip_ver, src_scoped, dst_scoped = _parse_ip_pair(
             alert.get("src_ip"),
             alert.get("dst_ip"),
@@ -247,54 +145,85 @@ def alert_to_snapshot(alert: AlertInput) -> AlertSnapshot:
             alert.get("src_scoped_id"),
             alert.get("dst_scoped_id"),
             "alert",
+            require_src_scoped="src_scoped_id" in alert,
+            require_dst_scoped="dst_scoped_id" in alert,
+            raw_ip_version=alert.get("ip_version"),
+            require_ip_version="ip_version" in alert,
         )
-        proto_opt = _parse_optional_str(alert.get("protocol"), "alert.protocol")
         epoch_dec = _parse_optional_epoch_decimal(
-            alert.get("timestamp_epoch_decimal"), "alert.timestamp_epoch_decimal"
+            alert.get("timestamp_epoch_decimal"),
+            "alert.timestamp_epoch_decimal",
+            allow_str_or_int=True,
         )
-        raw_ns = alert.get("timestamp_epoch_ns")
-        if raw_ns is not None and (isinstance(raw_ns, bool) or not isinstance(raw_ns, int)):
-            raise ValueError(f"alert.timestamp_epoch_ns must be int or None, got {raw_ns!r}")
-        derived_ns = raw_ns if "timestamp_epoch_ns" in alert else _exact_decimal_epoch_to_ns(epoch_dec)
+        epoch_ns = (
+            alert["timestamp_epoch_ns"]
+            if "timestamp_epoch_ns" in alert
+            else _exact_decimal_epoch_to_ns(epoch_dec)
+        )
         ts_src = _parse_optional_str(alert.get("timestamp_source"), "alert.timestamp_source") or ""
-        src_type = (_parse_optional_str(alert.get("source_type"), "alert.source_type") or "suricata").lower()
+        src_type = alert["source_type"] if "source_type" in alert else _ALERT_SOURCE_TYPE
         return AlertSnapshot(
-            event_id=_parse_required_str(alert.get("event_id"), "alert.event_id"),
+            event_id=alert.get("event_id"),
             routing_domain_id=domain,
-            sensor_id=sensor,
+            sensor_id=alert.get("sensor_id"),
             src_ip=src_ip,
             dst_ip=dst_ip,
             ip_version=ip_ver,
             src_scoped_id=src_scoped,
             dst_scoped_id=dst_scoped,
-            protocol=proto_opt.upper() if proto_opt is not None else None,
-            src_port=_parse_optional_port(alert.get("src_port"), "alert.src_port"),
-            dst_port=_parse_optional_port(alert.get("dst_port"), "alert.dst_port"),
-            community_id=_parse_optional_str(alert.get("community_id"), "alert.community_id"),
+            protocol=alert.get("protocol"),
+            src_port=alert.get("src_port"),
+            dst_port=alert.get("dst_port"),
+            community_id=alert.get("community_id"),
             timestamp_source=ts_src,
             timestamp_epoch_decimal=epoch_dec,
-            timestamp_epoch_ns=derived_ns,
+            timestamp_epoch_ns=epoch_ns,
             source_type=src_type,
-            source_provenance=_parse_optional_str(alert.get("source_provenance"), "alert.source_provenance"),
-            log_source_id=_parse_optional_str(alert.get("log_source_id"), "alert.log_source_id"),
-            alert_definition_id=_parse_optional_str(
-                alert.get("alert_definition_id"), "alert.alert_definition_id"
-            ),
+            source_provenance=alert.get("source_provenance"),
+            log_source_id=alert.get("log_source_id"),
+            alert_definition_id=alert.get("alert_definition_id"),
         )
 
-    raise TypeError(f"Expected AlertSnapshot, SuricataAlertObservation, or Mapping, got {type(alert).__name__}")
+    raise TypeError(
+        f"Expected AlertSnapshot, SuricataAlertObservation, or Mapping, got {type(alert).__name__}"
+    )
 
 
 def flow_to_snapshot(flow: FlowInput) -> FlowSnapshot:
-    """Normalize a ZeekConnectionObservation, read-repository dict, or FlowSnapshot."""
+    """Validate and normalize a ZeekConnectionObservation, read-repository dict, or FlowSnapshot.
+
+    All supported input types pass through FlowSnapshot's single shared validation path
+    (enforcing routing_domain_id normalization, canonical IPv4/IPv6 + ip_version parity,
+    scoped ID integrity, port bounds, exact finite non-negative Decimal timestamps,
+    nanosecond index consistency, and strict source_type='zeek').
+    """
     if isinstance(flow, FlowSnapshot):
-        return flow
+        return FlowSnapshot(
+            observation_id=flow.observation_id,
+            zeek_uid=flow.zeek_uid,
+            routing_domain_id=flow.routing_domain_id,
+            sensor_id=flow.sensor_id,
+            src_ip=flow.src_ip,
+            dst_ip=flow.dst_ip,
+            ip_version=flow.ip_version,
+            src_scoped_id=flow.src_scoped_id,
+            dst_scoped_id=flow.dst_scoped_id,
+            protocol=flow.protocol,
+            src_port=flow.src_port,
+            dst_port=flow.dst_port,
+            community_id=flow.community_id,
+            start_ts=flow.start_ts,
+            start_epoch_decimal=flow.start_epoch_decimal,
+            end_epoch_decimal=flow.end_epoch_decimal,
+            duration_decimal=flow.duration_decimal,
+            start_epoch_ns=flow.start_epoch_ns,
+            end_epoch_ns=flow.end_epoch_ns,
+            source_type=flow.source_type,
+            source_provenance=flow.source_provenance,
+        )
 
     if isinstance(flow, ZeekConnectionObservation):
-        domain = _parse_required_str(flow.routing_domain_id, "flow.routing_domain_id").lower()
-        if "#" in domain:
-            raise ValueError(f"flow.routing_domain_id cannot contain '#': {domain!r}")
-        sensor = _parse_required_str(flow.sensor_id, "flow.sensor_id").lower()
+        domain = _parse_routing_domain(flow.routing_domain_id, "flow.routing_domain_id")
         src_ip, dst_ip, ip_ver, src_scoped, dst_scoped = _parse_ip_pair(
             flow.src_ip,
             flow.dst_ip,
@@ -302,40 +231,44 @@ def flow_to_snapshot(flow: FlowInput) -> FlowSnapshot:
             flow.src_scoped_id,
             flow.dst_scoped_id,
             "flow",
+            require_src_scoped=True,
+            require_dst_scoped=True,
         )
-        proto = _parse_required_str(flow.protocol, "flow.protocol").upper()
-        start_dec = _parse_optional_epoch_decimal(flow.start_epoch, "flow.start_epoch")
-        end_dec = _parse_optional_epoch_decimal(flow.end_epoch, "flow.end_epoch")
-        dur_dec = _parse_optional_epoch_decimal(flow.duration, "flow.duration")
+        start_dec = _parse_optional_epoch_decimal(
+            flow.start_epoch, "flow.start_epoch", allow_str_or_int=False
+        )
+        end_dec = _parse_optional_epoch_decimal(
+            flow.end_epoch, "flow.end_epoch", allow_str_or_int=False
+        )
+        dur_dec = _parse_optional_epoch_decimal(
+            flow.duration, "flow.duration", allow_str_or_int=False
+        )
         return FlowSnapshot(
-            observation_id=_parse_required_str(flow.observation_id, "flow.observation_id"),
+            observation_id=flow.observation_id,
             zeek_uid=_parse_required_str(flow.zeek_uid, "flow.zeek_uid"),
             routing_domain_id=domain,
-            sensor_id=sensor,
+            sensor_id=flow.sensor_id,
             src_ip=src_ip,
             dst_ip=dst_ip,
             ip_version=ip_ver,
             src_scoped_id=src_scoped,
             dst_scoped_id=dst_scoped,
-            protocol=proto,
-            src_port=_parse_optional_port(flow.src_port, "flow.src_port"),
-            dst_port=_parse_optional_port(flow.dst_port, "flow.dst_port"),
-            community_id=_parse_optional_str(flow.community_id, "flow.community_id"),
+            protocol=flow.protocol,
+            src_port=flow.src_port,
+            dst_port=flow.dst_port,
+            community_id=flow.community_id,
             start_ts=_parse_required_str(flow.start_ts, "flow.start_ts"),
             start_epoch_decimal=start_dec,
             end_epoch_decimal=end_dec,
             duration_decimal=dur_dec,
             start_epoch_ns=_exact_decimal_epoch_to_ns(start_dec),
             end_epoch_ns=_exact_decimal_epoch_to_ns(end_dec),
-            source_type=_parse_required_str(flow.source_type, "flow.source_type").lower(),
-            source_provenance=_parse_optional_str(flow.source_provenance, "flow.source_provenance"),
+            source_type=flow.source_type,
+            source_provenance=flow.source_provenance,
         )
 
     if isinstance(flow, Mapping):
-        domain = _parse_required_str(flow.get("routing_domain_id"), "flow.routing_domain_id").lower()
-        if "#" in domain:
-            raise ValueError(f"flow.routing_domain_id cannot contain '#': {domain!r}")
-        sensor = _parse_required_str(flow.get("sensor_id"), "flow.sensor_id").lower()
+        domain = _parse_routing_domain(flow.get("routing_domain_id"), "flow.routing_domain_id")
         src_ip, dst_ip, ip_ver, src_scoped, dst_scoped = _parse_ip_pair(
             flow.get("src_ip"),
             flow.get("dst_ip"),
@@ -343,55 +276,69 @@ def flow_to_snapshot(flow: FlowInput) -> FlowSnapshot:
             flow.get("src_scoped_id"),
             flow.get("dst_scoped_id"),
             "flow",
+            require_src_scoped="src_scoped_id" in flow,
+            require_dst_scoped="dst_scoped_id" in flow,
+            raw_ip_version=flow.get("ip_version"),
+            require_ip_version="ip_version" in flow,
         )
-        proto = _parse_required_str(flow.get("protocol"), "flow.protocol").upper()
 
-        raw_start = flow["start_epoch_decimal"] if "start_epoch_decimal" in flow else flow.get("start_epoch")
+        raw_start = (
+            flow["start_epoch_decimal"] if "start_epoch_decimal" in flow else flow.get("start_epoch")
+        )
         raw_end = flow["end_epoch_decimal"] if "end_epoch_decimal" in flow else flow.get("end_epoch")
         raw_dur = flow["duration_decimal"] if "duration_decimal" in flow else flow.get("duration")
 
-        start_dec = _parse_optional_epoch_decimal(raw_start, "flow.start_epoch_decimal")
-        end_dec = _parse_optional_epoch_decimal(raw_end, "flow.end_epoch_decimal")
-        dur_dec = _parse_optional_epoch_decimal(raw_dur, "flow.duration_decimal")
+        start_dec = _parse_optional_epoch_decimal(
+            raw_start, "flow.start_epoch_decimal", allow_str_or_int=True
+        )
+        end_dec = _parse_optional_epoch_decimal(
+            raw_end, "flow.end_epoch_decimal", allow_str_or_int=True
+        )
+        dur_dec = _parse_optional_epoch_decimal(
+            raw_dur, "flow.duration_decimal", allow_str_or_int=True
+        )
 
-        raw_start_ns = flow.get("start_epoch_ns")
-        if raw_start_ns is not None and (isinstance(raw_start_ns, bool) or not isinstance(raw_start_ns, int)):
-            raise ValueError(f"flow.start_epoch_ns must be int or None, got {raw_start_ns!r}")
-        raw_end_ns = flow.get("end_epoch_ns")
-        if raw_end_ns is not None and (isinstance(raw_end_ns, bool) or not isinstance(raw_end_ns, int)):
-            raise ValueError(f"flow.end_epoch_ns must be int or None, got {raw_end_ns!r}")
-
-        derived_start_ns = raw_start_ns if "start_epoch_ns" in flow else _exact_decimal_epoch_to_ns(start_dec)
-        derived_end_ns = raw_end_ns if "end_epoch_ns" in flow else _exact_decimal_epoch_to_ns(end_dec)
+        start_ns = (
+            flow["start_epoch_ns"]
+            if "start_epoch_ns" in flow
+            else _exact_decimal_epoch_to_ns(start_dec)
+        )
+        end_ns = (
+            flow["end_epoch_ns"]
+            if "end_epoch_ns" in flow
+            else _exact_decimal_epoch_to_ns(end_dec)
+        )
 
         zeek_uid = _parse_optional_str(flow.get("zeek_uid"), "flow.zeek_uid") or ""
         start_ts = _parse_optional_str(flow.get("start_ts"), "flow.start_ts") or ""
-        src_type = (_parse_optional_str(flow.get("source_type"), "flow.source_type") or "zeek").lower()
+        src_type = flow["source_type"] if "source_type" in flow else _FLOW_SOURCE_TYPE
         return FlowSnapshot(
-            observation_id=_parse_required_str(flow.get("observation_id"), "flow.observation_id"),
+            observation_id=flow.get("observation_id"),
             zeek_uid=zeek_uid,
             routing_domain_id=domain,
-            sensor_id=sensor,
+            sensor_id=flow.get("sensor_id"),
             src_ip=src_ip,
             dst_ip=dst_ip,
             ip_version=ip_ver,
             src_scoped_id=src_scoped,
             dst_scoped_id=dst_scoped,
-            protocol=proto,
-            src_port=_parse_optional_port(flow.get("src_port"), "flow.src_port"),
-            dst_port=_parse_optional_port(flow.get("dst_port"), "flow.dst_port"),
-            community_id=_parse_optional_str(flow.get("community_id"), "flow.community_id"),
+            protocol=flow.get("protocol"),
+            src_port=flow.get("src_port"),
+            dst_port=flow.get("dst_port"),
+            community_id=flow.get("community_id"),
             start_ts=start_ts,
             start_epoch_decimal=start_dec,
             end_epoch_decimal=end_dec,
             duration_decimal=dur_dec,
-            start_epoch_ns=derived_start_ns,
-            end_epoch_ns=derived_end_ns,
+            start_epoch_ns=start_ns,
+            end_epoch_ns=end_ns,
             source_type=src_type,
-            source_provenance=_parse_optional_str(flow.get("source_provenance"), "flow.source_provenance"),
+            source_provenance=flow.get("source_provenance"),
         )
 
-    raise TypeError(f"Expected FlowSnapshot, ZeekConnectionObservation, or Mapping, got {type(flow).__name__}")
+    raise TypeError(
+        f"Expected FlowSnapshot, ZeekConnectionObservation, or Mapping, got {type(flow).__name__}"
+    )
 
 
 def normalize_correlation_protocol(protocol: Optional[str], ip_version: int) -> Optional[str]:
@@ -401,8 +348,12 @@ def normalize_correlation_protocol(protocol: Optional[str], ip_version: int) -> 
     `proto="ICMP"` on IPv6 connections while Suricata logs `proto="IPv6-ICMP"`
     or `"ICMPV6"`.
     """
+    if isinstance(ip_version, bool) or not isinstance(ip_version, int) or ip_version not in (4, 6):
+        raise ValueError(f"ip_version must be 4 or 6, got {ip_version!r}")
     if protocol is None:
         return None
+    if not isinstance(protocol, str):
+        raise ValueError(f"protocol must be a string or None, got {protocol!r}")
     cleaned = protocol.strip().upper()
     if not cleaned:
         return None
@@ -542,6 +493,7 @@ def _evaluate_community_id(
         can_reproduce = True
     elif (
         norm_proto in _ICMP_PROTOCOLS
+        and tuple_completeness == TupleCompleteness.ICMP_VIA_CID
         and flow.src_port is not None
         and flow.dst_port is not None
         and 0 <= flow.src_port <= 255
@@ -702,15 +654,12 @@ def _evaluate_temporal(
     )
 
 
-def evaluate_candidate(
-    alert: AlertInput,
-    flow: FlowInput,
-    policy: Optional[CorrelationPolicy] = None,
+def _evaluate_candidate_snapshots(
+    a_snap: AlertSnapshot,
+    f_snap: FlowSnapshot,
+    active_policy: CorrelationPolicy,
 ) -> CorrelationCandidateEvidence:
-    """Evaluate a single (AlertEvent, FlowObservation) pair against hard gates G1–G7."""
-    active_policy = policy if policy is not None else CorrelationPolicy()
-    a_snap = alert_to_snapshot(alert)
-    f_snap = flow_to_snapshot(flow)
+    """Evaluate already-validated (AlertSnapshot, FlowSnapshot) against hard gates G1–G7."""
 
     hard_reject_reasons: List[str] = []
     insufficient_reasons: List[str] = []
@@ -848,6 +797,18 @@ def evaluate_candidate(
     )
 
 
+def evaluate_candidate(
+    alert: AlertInput,
+    flow: FlowInput,
+    policy: Optional[CorrelationPolicy] = None,
+) -> CorrelationCandidateEvidence:
+    """Validate and evaluate a single (AlertEvent, FlowObservation) pair against gates G1–G7."""
+    active_policy = policy if policy is not None else CorrelationPolicy()
+    a_snap = alert_to_snapshot(alert)
+    f_snap = flow_to_snapshot(flow)
+    return _evaluate_candidate_snapshots(a_snap, f_snap, active_policy)
+
+
 def _alert_precondition_failures(
     alert: AlertSnapshot,
     policy: CorrelationPolicy,
@@ -892,12 +853,15 @@ def correlate_alert_to_flows(
     candidates: Iterable[FlowInput],
     *,
     policy: Optional[CorrelationPolicy] = None,
-    candidate_completeness: CandidateCompleteness = CandidateCompleteness.COMPLETE,
+    candidate_completeness: CandidateCompleteness = CandidateCompleteness.UNKNOWN,
 ) -> CorrelationDecision:
     """Conservatively evaluate an AlertEvent against a candidate set of FlowObservations.
 
     Decision invariants:
-    - Never promotes STRONG from a non-COMPLETE or cap-exceeded candidate set.
+    - Defaults `candidate_completeness` to `CandidateCompleteness.UNKNOWN` (fail-closed):
+      omitted completeness can NEVER silently authorize automatic `STRONG` correlation.
+    - Only explicitly `CandidateCompleteness.COMPLETE` candidate sets (within `candidate_cap`)
+      may produce `STRONG`.
     - Never filters out missing-CID flows when another candidate has a matching CID.
     - Never breaks ties arbitrarily among >=2 STRONG candidates or between 1 STRONG
       candidate and >=1 unresolved plausible rival (returns AMBIGUOUS).
@@ -931,7 +895,7 @@ def correlate_alert_to_flows(
     # Order deterministically by observation_id so output never depends on input iteration order
     ordered_flows = [unique_flows[obs_id] for obs_id in sorted(unique_flows.keys())]
     evaluated: List[CorrelationCandidateEvidence] = [
-        evaluate_candidate(a_snap, f_snap, policy=active_policy) for f_snap in ordered_flows
+        _evaluate_candidate_snapshots(a_snap, f_snap, active_policy) for f_snap in ordered_flows
     ]
 
     strong = [ev for ev in evaluated if ev.is_strong]
