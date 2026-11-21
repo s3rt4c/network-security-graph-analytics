@@ -84,6 +84,38 @@ POST_DROP_SCHEMA_STATEMENTS: List[str] = [
     # 12. FlowObservation numeric temporal index on lossless 64-bit epoch nanoseconds
     "CREATE INDEX flow_observation_start_epoch_ns_index IF NOT EXISTS "
     "FOR (fo:FlowObservation) ON (fo.start_epoch_ns)",
+
+    # 13. Suricata AlertDefinition unique rule identity constraint
+    "CREATE CONSTRAINT alert_definition_unique IF NOT EXISTS "
+    "FOR (ad:AlertDefinition) REQUIRE ad.definition_id IS UNIQUE",
+
+    # 14. Suricata AlertEvent unique immutable event identity constraint
+    "CREATE CONSTRAINT alert_event_unique IF NOT EXISTS "
+    "FOR (ae:AlertEvent) REQUIRE ae.event_id IS UNIQUE",
+
+    # 15. AlertEvent lookup index on normalized 5-tuple flow_key
+    "CREATE INDEX alert_event_flow_key_index IF NOT EXISTS "
+    "FOR (ae:AlertEvent) ON (ae.flow_key)",
+
+    # 16. AlertEvent lookup index on Flow/Suricata Community ID
+    "CREATE INDEX alert_event_community_id_index IF NOT EXISTS "
+    "FOR (ae:AlertEvent) ON (ae.community_id)",
+
+    # 17. AlertEvent lookup index on canonical unsigned decimal flow_id string
+    "CREATE INDEX alert_event_flow_id_index IF NOT EXISTS "
+    "FOR (ae:AlertEvent) ON (ae.flow_id)",
+
+    # 18. AlertEvent lookup index on sensor_id
+    "CREATE INDEX alert_event_sensor_id_index IF NOT EXISTS "
+    "FOR (ae:AlertEvent) ON (ae.sensor_id)",
+
+    # 19. AlertEvent lookup index on routing_domain_id
+    "CREATE INDEX alert_event_routing_domain_index IF NOT EXISTS "
+    "FOR (ae:AlertEvent) ON (ae.routing_domain_id)",
+
+    # 20. AlertEvent numeric temporal index on lossless 64-bit epoch nanoseconds
+    "CREATE INDEX alert_event_timestamp_epoch_ns_index IF NOT EXISTS "
+    "FOR (ae:AlertEvent) ON (ae.timestamp_epoch_ns)",
 ]
 
 # Neo4j 5.x constraint DDL statements (backed by RANGE indexes)

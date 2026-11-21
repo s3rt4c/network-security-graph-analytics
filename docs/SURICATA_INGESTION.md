@@ -151,12 +151,38 @@ To keep streaming memory strictly `O(1)` without an unbounded in-memory set:
 
 ---
 
-## 7. Diagnostics, Error Handling & Unsupported Features (Phase 3B.1 Scope)
+## 7. Diagnostics, Error Handling & Deferred Scope
 
 - **Summary Accounting:** `SuricataIngestionSummary` satisfies `total_raw_records == valid_records + skipped_records + ignored_non_alert_records`.
 - **Bounded Warning Logging:** Individual `logger.warning` lines are capped at `MAX_LOGGED_WARNINGS` (`10`) plus one suppression notice per stream, and `sample_errors` is capped at `MAX_SAMPLE_ERRORS` (`10`), while `warning_counts` always retains exact totals across arbitrarily large logs.
-- **Deferred to Phase 3B.2 and Beyond:**
-  - Neo4j `AlertDefinition` and `AlertEvent` graph persistence (Phase 3B.2).
+- **Deferred Beyond Phase 3B.2:**
   - Suricata `flow`, `dns`, `http`, `tls`, and `stats` event persistence.
   - Zeek `FlowObservation` ↔ Suricata `AlertEvent` correlation logic, Detection Engine, REST API endpoints, and frontend UI.
   - V1 Snort/IDS JSON array parser (`src/ingestion/alert_parser.py`) remains completely unchanged and isolated.
+
+---
+
+## Phase 3B.2: Neo4j Graph Persistence & CLI Ingestion
+
+Suricata `AlertEvent` and `AlertDefinition` graph persistence builds directly on the normalized `SuricataAlertObservation` contract:
+
+- **Schema Constraints & Indexes (`src/graph/schema.py`)**:
+  - `alert_definition_unique`: Unique constraint on `AlertDefinition.definition_id`.
+  - `alert_event_unique`: Unique constraint on `AlertEvent.event_id`.
+  - Lookup indexes on `AlertEvent.flow_key`, `AlertEvent.community_id`, `AlertEvent.flow_id`, `AlertEvent.sensor_id`, `AlertEvent.routing_domain_id`, and `AlertEvent.timestamp_epoch_ns`.
+- **Graph Model (`src/graph/repository.py`)**:
+  - `(:AlertEvent)-[:TRIGGERED_RULE]->(:AlertDefinition)`
+  - `(:AlertEvent)-[:HAS_SOURCE]->(:IPAddress)-[:IN_DOMAIN]->(:RoutingDomain)`
+  - `(:AlertEvent)-[:HAS_DESTINATION]->(:IPAddress)-[:IN_DOMAIN]->(:RoutingDomain)`
+  - `AlertDefinition` holds only stable rule identity fields (`definition_id`, `engine`, `ruleset_namespace`, `gid`, `sid`), while per-event evaluation metadata (`rev`, `signature`, `category`, `severity`, `action`, `app_proto`, `direction`, `tx_id`, `pcap_cnt`) lives exclusively on each immutable `:AlertEvent`.
+- **Immutability, Lossless Precision & Batch Atomicity**:
+  - Streaming writes (`Neo4jRepository.write_suricata_alert_events`) execute per-batch managed transactions (`session.execute_write`).
+  - Conflicting payloads on an existing `event_id` raise `AlertEventConflictError`, rolling back the entire failing batch.
+  - `flow_id` values (unsigned 64-bit integers potentially exceeding Neo4j signed 64-bit `INT64_MAX`) are stored uniformly as canonical decimal strings (`str(flow_id)`).
+  - High-precision timestamps store verbatim `timestamp_source`, lossless `timestamp_epoch_decimal`, and exact signed 64-bit `timestamp_epoch_ns` (or `None` for timezone-naive timestamps).
+- **Read API (`src/graph/read_repository.py`)**:
+  - `get_alert_event(event_id)` and `list_alert_events(...)` provide exact-match filtering on `routing_domain_id`, `sensor_id`, `flow_key`, `community_id`, lossless unsigned `flow_id`, `sid`, `alert_definition_id` (via `(:AlertEvent)-[:TRIGGERED_RULE]->(:AlertDefinition)` using the unique definition constraint), `severity`, and numeric `timestamp_epoch_ns` windowing with deterministic `NULLS LAST` pagination.
+- **Persistence Summary Counters**:
+  - In sequential single-writer runs, `created_count`, `duplicate_matched_count`, and `definitions_created_count` reflect exact committed node creations/matches, while `definitions_matched_count` sums per-batch distinct pre-existing definitions referenced to maintain O(`batch_size`) streaming memory. Under concurrent writers or ambiguous post-commit retries, created vs. matched counters are best-effort Read Committed snapshots while graph uniqueness and event immutability remain strictly enforced.
+- **Streaming Service & CLI (`src/services/suricata_ingestion.py`)**:
+  - `ingest_suricata_eve_file(...)` and `python -m src.services.suricata_ingestion` enforce `ensure_schema()` / `MigrationRequiredError` before persisting batches in O(`batch_size`) memory.

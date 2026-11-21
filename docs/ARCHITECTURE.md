@@ -43,18 +43,29 @@ C. Streaming Zeek Ingestion (python -m src.services.zeek_ingestion)
      - Immutable :FlowObservation nodes with conflict detection & lossless timestamps
      - :HAS_ORIGINATOR / :HAS_RESPONDER links to domain-scoped :IPAddress nodes
                             │
+D. Streaming Suricata Ingestion (python -m src.services.suricata_ingestion)
+   Suricata EVE (JSONL) ──▶ src/ingestion/suricata_eve_parser.py (O(1) streaming parser)
+                                               │
+                                               ▼
+                                 src/graph/repository.py
+     - Bounded per-batch UNWIND persistence (write_suricata_alert_events)
+     - Immutable :AlertEvent + static :AlertDefinition (:TRIGGERED_RULE / :HAS_SOURCE / :HAS_DESTINATION)
+                            │
                             ▼
                    Neo4j Graph Database
        ┌─────────────────────────────────────────┐
        │  (:RoutingDomain)                       │
        │  (:IPAddress)  (:Layer2Identifier)      │
        │  (:AlertFact)  (:FlowObservation)       │
+       │  (:AlertDefinition)  (:AlertEvent)      │
        │  [:IN_DOMAIN]                           │
        │  [:COMMUNICATED_TO]                     │
        │  [:L2_COMMUNICATED_TO]                  │
        │  [:OBSERVED_WITH]                       │
        │  [:SOURCE_OF]  [:TARGETS]               │
        │  [:HAS_ORIGINATOR]  [:HAS_RESPONDER]    │
+       │  [:TRIGGERED_RULE]                      │
+       │  [:HAS_SOURCE]  [:HAS_DESTINATION]      │
        └─────────────────────────────────────────┘
                             ▲
                             │ session.execute_read
@@ -121,6 +132,9 @@ frontend/src/
   - `flow_observation_sensor_id_index`: RANGE INDEX on `FlowObservation.sensor_id`
   - `flow_observation_routing_domain_index`: RANGE INDEX on `FlowObservation.routing_domain_id`
   - `flow_observation_start_epoch_ns_index`: RANGE INDEX on `FlowObservation.start_epoch_ns`
+  - `alert_definition_unique`: UNIQUE `AlertDefinition.definition_id`
+  - `alert_event_unique`: UNIQUE `AlertEvent.event_id`
+  - `alert_event_flow_key_index`, `alert_event_community_id_index`, `alert_event_flow_id_index`, `alert_event_sensor_id_index`, `alert_event_routing_domain_index`, `alert_event_timestamp_epoch_ns_index`: RANGE INDEXes on `:AlertEvent`
   - **Preflight Safety**: `ensure_schema(driver)` refuses and raises `MigrationRequiredError` if unmigrated legacy nodes exist (`scoped_id IS NULL`), preventing premature removal of the legacy constraint.
   - `migrate_ip_identity_to_scoped()`: Automated preflight migration backfilling legacy IP nodes to the `default` routing domain and backfilling historical `AlertFact` nodes.
 - **`repository.py`**: Executes batched Cypher writes using parameterized `UNWIND` blocks inside managed write transactions (`session.execute_write`).
@@ -128,7 +142,8 @@ frontend/src/
   - Merges `(:IPAddress {scoped_id: $scoped_id})` and links with `[:IN_DOMAIN]` to `(:RoutingDomain)`.
   - **Domain-Isolated Alert Facts**: Generates domain-aware `fact_key` hashes via `compute_alert_fact_key(alert, domain_id)`, preventing cross-domain alert collisions.
   - **Discrete Zeek Flow Observations**: `write_zeek_observations()` streams bounded batches into immutable `(:FlowObservation)` nodes with exact lossless decimal timestamp strings, optional exact 64-bit nanosecond indexes, separate directional payload/IP metrics, conflict rejection (`ObservationConflictError`), and `[:HAS_ORIGINATOR]`/`[:HAS_RESPONDER]` links.
-  - Contains `replace_workspace_data` for atomic workspace clearing (including `:FlowObservation`) and re-ingestion with rollback protection, recreating the target routing domain.
+  - **Discrete Suricata Alert Events & Definitions**: `write_suricata_alert_events()` streams bounded batches into immutable `(:AlertEvent)` nodes and static identity-only `(:AlertDefinition)` nodes with conflict rejection (`AlertEventConflictError`), lossless uint64 `flow_id` decimal strings, exact decimal/nanosecond timestamps, and `[:TRIGGERED_RULE]`/`[:HAS_SOURCE]`/`[:HAS_DESTINATION]` links.
+  - Contains `replace_workspace_data` for atomic workspace clearing (including `:FlowObservation`, `:AlertEvent`, `:AlertDefinition`) and re-ingestion with rollback protection, recreating the target routing domain.
 
 ### 3. Read Query Layer (`src/graph/read_repository.py`)
 - Executes optimized Cypher read queries using managed read transactions (`session.execute_read`).
@@ -138,7 +153,7 @@ frontend/src/
     - If `domain` and `address` are supplied, resolves deterministically via `scoped_ip_id(domain, address)`.
     - If only `address` is supplied and exactly one IP node exists across all domains, returns it seamlessly (preserving 100% single-domain backwards compatibility).
     - If only `address` is supplied and multiple IP nodes exist with that address across different routing domains, raises `AmbiguousEndpointError`.
-- Provides aggregated analytics summaries, paginated endpoint volume rankings, filtered communication queries, bounded graph neighborhood traversals, directional shortest-path computations, and discrete `FlowObservation` lookup/paginated reads (`get_flow_observation`, `list_flow_observations`).
+- Provides aggregated analytics summaries, paginated endpoint volume rankings, filtered communication queries, bounded graph neighborhood traversals, directional shortest-path computations, discrete `FlowObservation` lookup/paginated reads (`get_flow_observation`, `list_flow_observations`), and discrete `AlertEvent` lookup/paginated reads (`get_alert_event`, `list_alert_events`).
 
 ### 4. REST API Backend (`src/api/`)
 - Built with **FastAPI** and **Pydantic v2**.
