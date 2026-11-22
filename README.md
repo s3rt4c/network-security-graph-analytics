@@ -22,7 +22,7 @@ Graph-based cybersecurity analysis platform transforming network traffic exports
 - **Dual-Mode Traffic Ingestion Pipeline:** Seamlessly ingests both basic 7-column network exports and rich 14-column tshark/Wireshark observation profiles with wire frame bytes and observation timestamps.
 - **Normalized Fact-Based Graph Model:** Persists Layer 3 communication aggregates, Layer 2 Ethernet frame topology, Layer 2/3 associations, and normalized `:AlertFact` entities using batched `UNWIND` Cypher operations with Neo4j 5.x constraints.
 - **Read-Oriented FastAPI REST API:** High-performance backend providing OpenAPI (Swagger/ReDoc) documentation, Pydantic v2 schemas, and dedicated endpoints for traffic volume metrics, endpoint rankings, and graph traversals.
-- **Interactive Graph Visualizer & Inspectors:** React 19 + TypeScript + Cytoscape.js interface supporting multiple layouts, parallel edge rendering, edge inspection drawer (`CommunicationEdgePanel`), and IP context drawer (`IPDetailPanel`).
+- **Interactive Graph Visualizer & Inspectors:** React 19 + TypeScript + Cytoscape.js interface supporting multiple layouts, parallel edge rendering, edge inspection drawer (`CommunicationEdgePanel`), IP context drawer (`IPDetailPanel`), and a read-only **Alert–Flow Correlations** tab (`frontend/README.md`) exposing persisted V2 Zeek–Suricata evidence separately from legacy V1 co-occurrence records.
 - **Atomic Browser Data Import:** Gated single active workspace replacement (`DATA_IMPORT_ENABLED=true`) with stateless multi-file validation, size limits, pre-flight diagnostics, and transactional rollback protection.
 - **Rigorous Verification & CI:** Comprehensive test suite with 150+ pytest and vitest test cases, opt-in live Neo4j integration testing with disposable containers, and multi-version Python CI (3.10 and 3.14).
 
@@ -125,7 +125,7 @@ Flow-aware correlation table pairing observed communications with security alert
 
 - **Backend Unit & API Tests:** `pytest` (145+ unit tests covering dual-mode parsers, models, and FastAPI routes).
 - **Opt-In Live Neo4j Integration:** Real graph persistence, constraint enforcement, and atomic rollback verification against disposable Neo4j containers (`pytest -m integration`).
-- **Frontend Quality:** 52 Vitest component tests, TypeScript type checks, oxlint, and production build verification.
+- **Frontend Quality:** Vitest component and API client tests, TypeScript type checks, oxlint, and production build verification.
 - **Continuous Integration:** GitHub Actions matrix verifying Python 3.10, Python 3.14, Node 24, and live Neo4j on every pull request.
 
 ---
