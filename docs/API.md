@@ -79,18 +79,20 @@ Finds the shortest Layer 3 communication path between `source` and `target`. Whe
 - **Epistemic Boundary:** A `CORRELATED_WITH` edge records a conservative observational association from a prior correlation run. It does **not** prove maliciousness, compromise, causation, or attacker/victim attribution.
 
 #### Query Parameters & Pagination
-Both V2 endpoints return `PaginatedResponse[AlertFlowCorrelationResponse]` (`items`, `total`, `limit`, `offset`) deterministically ordered by `(event_id ASC, observation_id ASC, coalesce(evidence_digest, '') ASC)`:
-- `routing_domain_id` *(optional string)*: Normalized (trimmed lowercase); values containing `#` return **HTTP 422**. Prevents cross-domain leakage on both list and detail queries (a cross-domain detail request returns **404**).
+Both V2 endpoints return `PaginatedResponse[AlertFlowCorrelationResponse]` (`items`, `total`, `limit`, `offset`) deterministically ordered by `(event_id ASC, observation_id ASC, coalesce(evidence_digest, '') ASC, coalesce(decided_at_utc, '') ASC)` with an internal non-exposed relationship tie-breaker so even duplicate parallel edges page deterministically without leaking Neo4j `elementId`:
+- `routing_domain_id` *(optional string)*: Normalized (trimmed lowercase); empty/whitespace values or values containing `#` return **HTTP 422** (failing closed rather than dropping the domain filter). Prevents cross-domain leakage on both list and detail queries (a cross-domain detail request returns **404**).
 - `event_id` *(list query filter or detail path param)*: 64-character lowercase hex SHA-256 `AlertEvent.event_id` (invalid format returns **HTTP 422**).
 - `observation_id` *(list query filter only)*: 64-character lowercase hex SHA-256 `FlowObservation.observation_id` (invalid format returns **HTTP 422**).
 - `include_unverified` *(optional boolean, safe default `false`)*: By default (`false` or omitted), edges marked `unverified_incomplete` are excluded. Set `include_unverified=true` to inspect both `verified` and `unverified_incomplete` edges.
-- `verification_status` *(optional `"verified" | "unverified_incomplete"`)*: Exact filter on persisted verification status. Combining `include_unverified=false` with `verification_status=unverified_incomplete` returns **HTTP 422**.
-- `limit` *(int, default `50`, `1..200`)* & `offset` *(int, default `0`, `>= 0`)*.
+- `verification_status` *(optional `"verified" | "unverified_incomplete"`)*: Exact filter on persisted verification status. Combining `include_unverified=false` with `verification_status=unverified_incomplete` returns **HTTP 422**; combining `include_unverified=true` with `verification_status=verified` narrows results to `"verified"`.
+- `limit` *(int, default `50`, `1..200`)* & `offset` *(int, default `0`, `0..9223372036854775807`, Neo4j signed 64-bit integer ceiling; values `>= 2^63` return **HTTP 422**, and offsets at or beyond `total` return **HTTP 200** with an empty `items` list)*.
+- **Concurrent Pagination Consistency (Read Committed):** Count and page queries (and the AlertEvent existence check on the detail endpoint) execute sequentially within one `session.execute_read()` transaction. On an unchanged dataset, `total` and `items` agree exactly with zero duplicate or skipped rows across pages. Under Neo4j Read Committed isolation, however, repeatable-read/snapshot consistency is **not** guaranteed if another transaction concurrently creates, deletes, or re-marks `:CORRELATED_WITH` edges between those statements.
 
 #### Verification Status Semantics & Persisted Truth vs. Real-Time State
 - **`verified`**: A prior complete Phase 4B evaluation selected this flow uniquely under the recorded `policy_fingerprint`.
 - **`unverified_incomplete`**: An earlier correlation edge preserved across a later incomplete/truncated evaluation (`last_incomplete_reason` and `last_incomplete_at_utc` populated). Never promoted silently to `verified`.
-- **Legacy compatibility:** Any legacy `:CORRELATED_WITH` edge missing a `verification_status` property is coalesced to `"verified"` by the read repository (this reflects legacy compatibility, not a fresh revalidation).
+- **Legacy compatibility:** Any legacy `:CORRELATED_WITH` edge missing a `verification_status` property (`NULL`) is coalesced to `"verified"` by the read repository (this reflects legacy compatibility, not a fresh revalidation).
+- **Unknown / Corrupted Persisted Statuses:** Non-null unrecognized `verification_status` values are never promoted to `"verified"` (excluded by default and by exact status filters), and strict Pydantic serialization (`ConfigDict(strict=True)`) fails closed with a sanitized **HTTP 500** rather than silently coercing malformed database properties into misleading HTTP 200 responses.
 - **No Live Recalculation on GET:** Persisted verification status reflects the **last persisted correlation evaluation**, not a real-time re-check against newly arrived Zeek flows. Under Neo4j Read Committed isolation, flows ingested after the last correlation run are not evaluated on HTTP `GET`.
 
 #### Missing-Correlation Semantics (Detail Endpoint)

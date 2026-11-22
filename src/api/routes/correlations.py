@@ -21,6 +21,19 @@ from src.graph.read_repository import Neo4jReadRepository
 router = APIRouter(prefix="/api/v1/correlations", tags=["Correlations"])
 
 _SHA256_HEX_PATTERN = r"^[0-9a-f]{64}$"
+_MAX_OFFSET = 2**63 - 1
+
+
+def _validate_optional_routing_domain_id(routing_domain_id: Optional[str]) -> Optional[str]:
+    """Validate optional V2 routing_domain_id filter, failing closed on explicit blank values."""
+    if routing_domain_id is None:
+        return None
+    if not routing_domain_id.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid routing_domain_id: must not be empty when specified",
+        )
+    return validate_routing_domain(routing_domain_id)
 
 
 def _resolve_verification_filters(
@@ -88,11 +101,16 @@ def list_alert_flow_correlations(
         description="Optional exact filter on persisted verification_status ('verified' or 'unverified_incomplete')",
     ),
     limit: int = Query(default=50, ge=1, le=200, description="Max items per page"),
-    offset: int = Query(default=0, ge=0, description="Offset starting index"),
+    offset: int = Query(
+        default=0,
+        ge=0,
+        le=_MAX_OFFSET,
+        description="Offset starting index (0..9223372036854775807)",
+    ),
     repo: Neo4jCorrelationRepository = Depends(get_correlation_repository),
 ) -> PaginatedResponse[AlertFlowCorrelationResponse]:
     """Retrieve persisted V2 Suricata AlertEvent to Zeek FlowObservation correlations (read-only)."""
-    norm_domain = validate_routing_domain(routing_domain_id)
+    norm_domain = _validate_optional_routing_domain_id(routing_domain_id)
     effective_include_unverified, effective_status = _resolve_verification_filters(
         include_unverified,
         verification_status,
@@ -137,11 +155,16 @@ def get_alert_flow_correlations(
         description="Optional exact filter on persisted verification_status ('verified' or 'unverified_incomplete')",
     ),
     limit: int = Query(default=50, ge=1, le=200, description="Max items per page"),
-    offset: int = Query(default=0, ge=0, description="Offset starting index"),
+    offset: int = Query(
+        default=0,
+        ge=0,
+        le=_MAX_OFFSET,
+        description="Offset starting index (0..9223372036854775807)",
+    ),
     repo: Neo4jCorrelationRepository = Depends(get_correlation_repository),
 ) -> PaginatedResponse[AlertFlowCorrelationResponse]:
     """Retrieve persisted V2 correlations for a specific Suricata AlertEvent (read-only)."""
-    norm_domain = validate_routing_domain(routing_domain_id)
+    norm_domain = _validate_optional_routing_domain_id(routing_domain_id)
     effective_include_unverified, effective_status = _resolve_verification_filters(
         include_unverified,
         verification_status,

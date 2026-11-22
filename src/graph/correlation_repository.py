@@ -274,8 +274,10 @@ _CORRELATION_EDGE_FILTER_WHERE = """
 WHERE ae.source_type = 'suricata'
   AND fo.source_type = 'zeek'
   AND ae.routing_domain_id IS NOT NULL
+  AND trim(ae.routing_domain_id) <> ''
+  AND NOT ae.routing_domain_id CONTAINS '#'
   AND fo.routing_domain_id = ae.routing_domain_id
-  AND coalesce(r.routing_domain_id, ae.routing_domain_id) = ae.routing_domain_id
+  AND (r.routing_domain_id IS NULL OR r.routing_domain_id = ae.routing_domain_id)
   AND ($event_id IS NULL OR ae.event_id = $event_id)
   AND ($observation_id IS NULL OR fo.observation_id = $observation_id)
   AND ($routing_domain_id IS NULL OR ae.routing_domain_id = $routing_domain_id)
@@ -294,6 +296,14 @@ RETURN count(r) AS total
 CYPHER_LIST_ALERT_FLOW_CORRELATIONS = f"""
 MATCH (ae:AlertEvent)-[r:CORRELATED_WITH]->(fo:FlowObservation)
 {_CORRELATION_EDGE_FILTER_WHERE}
+WITH ae, r, fo
+ORDER BY ae.event_id ASC,
+         fo.observation_id ASC,
+         coalesce(r.evidence_digest, '') ASC,
+         coalesce(r.decided_at_utc, '') ASC,
+         elementId(r) ASC
+SKIP $offset
+LIMIT $limit
 RETURN ae.event_id AS event_id,
        fo.observation_id AS observation_id,
        fo.zeek_uid AS zeek_uid,
@@ -312,14 +322,14 @@ RETURN ae.event_id AS event_id,
        r.last_incomplete_reason AS last_incomplete_reason,
        r.last_incomplete_at_utc AS last_incomplete_at_utc,
        r.decided_at_utc AS decided_at_utc
-ORDER BY ae.event_id ASC, fo.observation_id ASC, coalesce(r.evidence_digest, '') ASC
-SKIP $offset
-LIMIT $limit
 """
 
 CYPHER_CHECK_SURICATA_ALERT_EVENT_EXISTS = """
 MATCH (ae:AlertEvent {event_id: $event_id})
 WHERE ae.source_type = 'suricata'
+  AND ae.routing_domain_id IS NOT NULL
+  AND trim(ae.routing_domain_id) <> ''
+  AND NOT ae.routing_domain_id CONTAINS '#'
   AND ($routing_domain_id IS NULL OR ae.routing_domain_id = $routing_domain_id)
 RETURN ae.event_id AS event_id
 LIMIT 1
@@ -661,8 +671,10 @@ def _validate_correlation_query_params(
 
     if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= 1000):
         raise ValueError(f"limit must be an integer in 1..1000, got {limit!r}")
-    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-        raise ValueError(f"offset must be a non-negative integer, got {offset!r}")
+    if isinstance(offset, bool) or not isinstance(offset, int) or not (0 <= offset <= _INT64_MAX):
+        raise ValueError(
+            f"offset must be an integer in 0..{_INT64_MAX}, got {offset!r}"
+        )
 
     norm_domain: Optional[str] = None
     if routing_domain_id is not None:
@@ -671,18 +683,20 @@ def _validate_correlation_query_params(
                 f"routing_domain_id must be a string or None, got {routing_domain_id!r}"
             )
         cleaned_domain = routing_domain_id.strip().lower()
-        if cleaned_domain:
-            if "#" in cleaned_domain:
-                raise ValueError(f"routing_domain_id cannot contain '#': {cleaned_domain!r}")
-            norm_domain = cleaned_domain
+        if not cleaned_domain:
+            raise ValueError("routing_domain_id must not be empty when specified")
+        if "#" in cleaned_domain:
+            raise ValueError(f"routing_domain_id cannot contain '#': {cleaned_domain!r}")
+        norm_domain = cleaned_domain
 
     norm_event: Optional[str] = None
     if event_id is not None:
         if not isinstance(event_id, str):
             raise ValueError(f"event_id must be a string or None, got {event_id!r}")
         cleaned_event = event_id.strip()
-        if cleaned_event:
-            norm_event = cleaned_event
+        if not cleaned_event:
+            raise ValueError("event_id must not be empty when specified")
+        norm_event = cleaned_event
 
     norm_obs: Optional[str] = None
     if observation_id is not None:
@@ -691,8 +705,9 @@ def _validate_correlation_query_params(
                 f"observation_id must be a string or None, got {observation_id!r}"
             )
         cleaned_obs = observation_id.strip()
-        if cleaned_obs:
-            norm_obs = cleaned_obs
+        if not cleaned_obs:
+            raise ValueError("observation_id must not be empty when specified")
+        norm_obs = cleaned_obs
 
     return norm_domain, norm_event, norm_obs, include_unverified, norm_status
 
@@ -1254,7 +1269,13 @@ class Neo4jCorrelationRepository:
         Defaults to `include_unverified=False` so callers only receive `verified` edges
         unless unverified records are explicitly requested. Legacy edges lacking a
         `verification_status` property are treated as `'verified'` for backward
-        compatibility. Returns `(items, total)` from a single `execute_read` transaction.
+        compatibility.
+
+        Note on isolation: count and page queries execute sequentially inside one
+        `execute_read` transaction. Under Neo4j Read Committed isolation, `total` and
+        `items` agree exactly on an unchanged dataset, but snapshot/repeatable-read
+        consistency is NOT guaranteed if concurrent writes mutate correlations between
+        the count and page statements.
         """
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
@@ -1282,6 +1303,8 @@ class Neo4jCorrelationRepository:
         def _work(tx) -> Tuple[List[Dict[str, Any]], int]:
             count_rec = tx.run(CYPHER_COUNT_ALERT_FLOW_CORRELATIONS, **filter_params).single()
             total = int(count_rec["total"]) if count_rec else 0
+            if total == 0 or offset >= total or offset > _INT64_MAX - limit:
+                return [], total
             page_res = tx.run(
                 CYPHER_LIST_ALERT_FLOW_CORRELATIONS,
                 **filter_params,
@@ -1311,6 +1334,10 @@ class Neo4jCorrelationRepository:
               if specified).
             - `(items, total)` when the `AlertEvent` exists, including `([], 0)` when it has
               zero matching `CORRELATED_WITH` edges.
+
+        Note on isolation: existence, count, and page queries run inside one `execute_read`
+        transaction. Under Neo4j Read Committed isolation, results are exact on an unchanged
+        dataset, but snapshot consistency is NOT guaranteed against concurrent writes.
 
         Raises:
             ConnectionError: When the database driver is unavailable.
@@ -1353,6 +1380,8 @@ class Neo4jCorrelationRepository:
 
             count_rec = tx.run(CYPHER_COUNT_ALERT_FLOW_CORRELATIONS, **filter_params).single()
             total = int(count_rec["total"]) if count_rec else 0
+            if total == 0 or offset >= total or offset > _INT64_MAX - limit:
+                return [], total
             page_res = tx.run(
                 CYPHER_LIST_ALERT_FLOW_CORRELATIONS,
                 **filter_params,

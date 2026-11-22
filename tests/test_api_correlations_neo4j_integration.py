@@ -742,3 +742,276 @@ def test_02_persisted_status_vs_concurrent_ingestion_no_live_recalculation(seede
                 "MATCH (fo:FlowObservation {observation_id: $oid}) DETACH DELETE fo",
                 oid=competing_flow.observation_id,
             ).consume()
+
+
+def test_03_extreme_offset_blank_domain_and_filter_combinations_live(seeded_api_env):
+    """Verify INT64_MAX boundary, INT64_MAX+1 422, out-of-range offset, blank domain 422, and filter combo live."""
+    client = seeded_api_env["client"]
+    a1 = seeded_api_env["a1"]
+    int64_max = 2**63 - 1
+    int64_overflow = 2**63
+
+    # INT64_MAX + 1 returns 422 (no PackStream OverflowError -> 500)
+    assert client.get(f"/api/v1/correlations/alert-flows?offset={int64_overflow}").status_code == 422
+    assert (
+        client.get(f"/api/v1/correlations/alert-flows/{a1.event_id}?offset={int64_overflow}").status_code
+        == 422
+    )
+
+    # Explicit blank/whitespace routing_domain_id returns 422 instead of dropping tenant scope
+    assert client.get("/api/v1/correlations/alert-flows?routing_domain_id=%20%20").status_code == 422
+    assert (
+        client.get(f"/api/v1/correlations/alert-flows/{a1.event_id}?routing_domain_id=%20%20").status_code
+        == 422
+    )
+
+    # Legal INT64_MAX and out-of-range offsets return 200 with empty items and accurate total
+    r_max = client.get(
+        f"/api/v1/correlations/alert-flows?routing_domain_id={_DOM_A}&offset={int64_max}&limit=50"
+    )
+    assert r_max.status_code == 200
+    assert r_max.json() == {"items": [], "total": 3, "limit": 50, "offset": int64_max}
+
+    r_far = client.get(
+        f"/api/v1/correlations/alert-flows?routing_domain_id={_DOM_A}&offset=1000&limit=50"
+    )
+    assert r_far.status_code == 200
+    assert r_far.json() == {"items": [], "total": 3, "limit": 50, "offset": 1000}
+
+    # include_unverified=true + verification_status=verified narrows strictly to verified edges
+    r_combo = client.get(
+        f"/api/v1/correlations/alert-flows?routing_domain_id={_DOM_A}"
+        f"&include_unverified=true&verification_status=verified"
+    )
+    assert r_combo.status_code == 200
+    assert r_combo.json()["total"] == 3
+    assert [row["event_id"] for row in r_combo.json()["items"]] == seeded_api_env["dom_a_verified_ids"]
+
+
+def test_04_legacy_null_and_unknown_verification_status_live(live_driver):
+    """Verify legacy NULL verification_status coalesces to verified while unknown statuses fail closed."""
+    dom = "api4c-dom-status"
+    write_repo = Neo4jRepository(live_driver, batch_size=100)
+    corr_repo = Neo4jCorrelationRepository(live_driver)
+
+    f_leg = _make_flow(tag="leg", domain=dom, src_ip="10.250.1.10", dst_ip="10.250.1.20", src_port=56001)
+    a_leg = _make_alert(tag="leg", domain=dom, src_ip="10.250.1.10", dst_ip="10.250.1.20", src_port=56001)
+    f_unk = _make_flow(tag="unk", domain=dom, src_ip="10.250.1.11", dst_ip="10.250.1.21", src_port=56002)
+    a_unk = _make_alert(tag="unk", domain=dom, src_ip="10.250.1.11", dst_ip="10.250.1.21", src_port=56002)
+
+    write_repo.write_zeek_observations([f_leg, f_unk])
+    write_repo.write_suricata_alert_events([a_leg, a_unk])
+    res = corr_repo.correlate_alert_batch([a_leg.event_id, a_unk.event_id])
+    assert res.correlations_created == 2
+
+    try:
+        with live_driver.session() as session:
+            session.run(
+                "MATCH (:AlertEvent {event_id: $eid})-[r:CORRELATED_WITH]->(:FlowObservation) "
+                "REMOVE r.verification_status",
+                eid=a_leg.event_id,
+            ).consume()
+            session.run(
+                "MATCH (:AlertEvent {event_id: $eid})-[r:CORRELATED_WITH]->(:FlowObservation) "
+                "SET r.verification_status = 'unknown_corrupt'",
+                eid=a_unk.event_id,
+            ).consume()
+
+        app = create_app()
+        app.dependency_overrides[get_correlation_repository] = lambda: corr_repo
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Default GET returns legacy NULL edge as 'verified' and excludes 'unknown_corrupt'
+        r_def = client.get(f"/api/v1/correlations/alert-flows?routing_domain_id={dom}")
+        assert r_def.status_code == 200
+        assert r_def.json()["total"] == 1
+        assert r_def.json()["items"][0]["event_id"] == a_leg.event_id
+        assert r_def.json()["items"][0]["verification_status"] == VERIFICATION_STATUS_VERIFIED
+
+        # Exact verification_status=verified also excludes 'unknown_corrupt'
+        r_ver = client.get(
+            f"/api/v1/correlations/alert-flows?routing_domain_id={dom}&verification_status=verified"
+        )
+        assert r_ver.status_code == 200
+        assert r_ver.json()["total"] == 1
+        assert r_ver.json()["items"][0]["event_id"] == a_leg.event_id
+
+        # Exact verification_status=unverified_incomplete excludes both legacy NULL and unknown_corrupt
+        r_unv = client.get(
+            f"/api/v1/correlations/alert-flows?routing_domain_id={dom}"
+            f"&verification_status=unverified_incomplete"
+        )
+        assert r_unv.status_code == 200
+        assert r_unv.json()["total"] == 0
+        assert r_unv.json()["items"] == []
+
+        # Detail route on unknown_corrupt alert returns empty under default (never promoted to verified)
+        r_unk_def = client.get(f"/api/v1/correlations/alert-flows/{a_unk.event_id}")
+        assert r_unk_def.status_code == 200
+        assert r_unk_def.json()["total"] == 0
+
+        # include_unverified=true hitting unknown_corrupt fails closed with sanitized 500 (never 200)
+        r_unk_inc = client.get(
+            f"/api/v1/correlations/alert-flows/{a_unk.event_id}?include_unverified=true"
+        )
+        assert r_unk_inc.status_code == 500
+        assert r_unk_inc.json()["detail"] == "Internal server error"
+        assert "unknown_corrupt" not in r_unk_inc.text
+    finally:
+        _cleanup_synthetic(
+            live_driver,
+            event_ids=[a_leg.event_id, a_unk.event_id],
+            obs_ids=[f_leg.observation_id, f_unk.observation_id],
+            def_ids={a_leg.alert_definition_id, a_unk.alert_definition_id},
+            scoped_ids={a_leg.src_scoped_id, a_leg.dst_scoped_id, a_unk.src_scoped_id, a_unk.dst_scoped_id},
+            domain_ids=[dom],
+            v1_l2s=[],
+        )
+
+
+def test_05_duplicate_parallel_relationships_deterministic_pagination_live(live_driver):
+    """Verify duplicate parallel CORRELATED_WITH edges paginate deterministically without exposing elementId."""
+    dom = "api4c-dom-dup"
+    write_repo = Neo4jRepository(live_driver, batch_size=100)
+    corr_repo = Neo4jCorrelationRepository(live_driver)
+
+    f_dup = _make_flow(tag="dup", domain=dom, src_ip="10.250.2.10", dst_ip="10.250.2.20", src_port=57001)
+    a_dup = _make_alert(tag="dup", domain=dom, src_ip="10.250.2.10", dst_ip="10.250.2.20", src_port=57001)
+
+    write_repo.write_zeek_observations([f_dup])
+    write_repo.write_suricata_alert_events([a_dup])
+    assert corr_repo.correlate_alert_event(a_dup.event_id).action == "created"
+
+    try:
+        # Simulate corrupted pre-existing parallel edges sharing identical
+        # (event_id, observation_id, evidence_digest, decided_at_utc) to exercise elementId(r) tie-breaker
+        with live_driver.session() as session:
+            session.run(
+                "MATCH (ae:AlertEvent {event_id: $eid})-[r:CORRELATED_WITH]->(fo:FlowObservation {observation_id: $oid}) "
+                "WITH ae, fo, properties(r) AS props "
+                "CREATE (ae)-[r2:CORRELATED_WITH]->(fo) SET r2 = props, r2.decided_at_utc = '2026-11-22T12:00:01Z', r2.sensor_context = 'tie-edge-2' "
+                "CREATE (ae)-[r3:CORRELATED_WITH]->(fo) SET r3 = props, r3.decided_at_utc = '2026-11-22T12:00:01Z', r3.sensor_context = 'tie-edge-3'",
+                eid=a_dup.event_id,
+                oid=f_dup.observation_id,
+            ).consume()
+
+        app = create_app()
+        app.dependency_overrides[get_correlation_repository] = lambda: corr_repo
+        client = TestClient(app)
+
+        def _fetch_all_pages():
+            pages = []
+            for offset in (0, 1, 2):
+                resp = client.get(
+                    f"/api/v1/correlations/alert-flows/{a_dup.event_id}?limit=1&offset={offset}"
+                )
+                assert resp.status_code == 200
+                body = resp.json()
+                assert body["total"] == 3
+                assert len(body["items"]) == 1
+                assert "elementId" not in body["items"][0]
+                assert "rel_id" not in body["items"][0]
+                pages.append(
+                    (body["items"][0]["decided_at_utc"], body["items"][0]["sensor_context"])
+                )
+            return pages
+
+        run1 = _fetch_all_pages()
+        run2 = _fetch_all_pages()
+        assert run1 == run2
+        assert len(set(run1)) == 3
+        assert {ctx for _, ctx in run1} == {
+            "ALLOWED_ANY_IN_DOMAIN:suricata-4c->zeek-4c",
+            "tie-edge-2",
+            "tie-edge-3",
+        }
+    finally:
+        _cleanup_synthetic(
+            live_driver,
+            event_ids=[a_dup.event_id],
+            obs_ids=[f_dup.observation_id],
+            def_ids={a_dup.alert_definition_id},
+            scoped_ids={a_dup.src_scoped_id, a_dup.dst_scoped_id},
+            domain_ids=[dom],
+            v1_l2s=[],
+        )
+
+
+def test_06_overlapping_rfc1918_and_corrupted_domain_source_isolation_live(live_driver):
+    """Verify overlapping RFC1918 isolation, corrupted cross-domain edge exclusion, and non-Zeek flow exclusion."""
+    dom_a = "api4c-rfc1918-a"
+    dom_b = "api4c-rfc1918-b"
+    write_repo = Neo4jRepository(live_driver, batch_size=100)
+    corr_repo = Neo4jCorrelationRepository(live_driver)
+
+    f_a = _make_flow(tag="rfc-a", domain=dom_a, src_ip="10.250.4.10", dst_ip="10.250.4.20", src_port=58001)
+    a_a = _make_alert(tag="rfc-a", domain=dom_a, src_ip="10.250.4.10", dst_ip="10.250.4.20", src_port=58001)
+    f_b = _make_flow(tag="rfc-b", domain=dom_b, src_ip="10.250.4.10", dst_ip="10.250.4.20", src_port=58001)
+    a_b = _make_alert(tag="rfc-b", domain=dom_b, src_ip="10.250.4.10", dst_ip="10.250.4.20", src_port=58001)
+
+    # Extra alert/flow pair for corrupted relationship domain + non-Zeek FlowObservation tests
+    f_bad_rel = _make_flow(tag="rfc-badrel", domain=dom_a, src_ip="10.250.4.30", dst_ip="10.250.4.40", src_port=58002)
+    a_bad_rel = _make_alert(tag="rfc-badrel", domain=dom_a, src_ip="10.250.4.30", dst_ip="10.250.4.40", src_port=58002)
+    f_non_zeek = _make_flow(tag="rfc-nonzeek", domain=dom_a, src_ip="10.250.4.50", dst_ip="10.250.4.60", src_port=58003)
+    a_non_zeek = _make_alert(tag="rfc-nonzeek", domain=dom_a, src_ip="10.250.4.50", dst_ip="10.250.4.60", src_port=58003)
+
+    write_repo.write_zeek_observations([f_a, f_b, f_bad_rel, f_non_zeek])
+    write_repo.write_suricata_alert_events([a_a, a_b, a_bad_rel, a_non_zeek])
+    assert corr_repo.correlate_alert_batch(
+        [a_a.event_id, a_b.event_id, a_bad_rel.event_id, a_non_zeek.event_id]
+    ).correlations_created == 4
+
+    try:
+        with live_driver.session() as session:
+            # Corrupt r.routing_domain_id on a_bad_rel to contradict endpoint domain
+            session.run(
+                "MATCH (:AlertEvent {event_id: $eid})-[r:CORRELATED_WITH]->(:FlowObservation) "
+                "SET r.routing_domain_id = $wrong_dom",
+                eid=a_bad_rel.event_id,
+                wrong_dom=dom_b,
+            ).consume()
+            # Change FlowObservation source_type away from 'zeek'
+            session.run(
+                "MATCH (fo:FlowObservation {observation_id: $oid}) SET fo.source_type = 'tshark'",
+                oid=f_non_zeek.observation_id,
+            ).consume()
+
+        app = create_app()
+        app.dependency_overrides[get_correlation_repository] = lambda: corr_repo
+        client = TestClient(app)
+
+        # dom_a returns ONLY a_a (excludes a_b from dom_b, corrupted r.routing_domain_id, and non-zeek flow)
+        r_a = client.get(f"/api/v1/correlations/alert-flows?routing_domain_id={dom_a}")
+        assert r_a.status_code == 200
+        assert r_a.json()["total"] == 1
+        assert r_a.json()["items"][0]["event_id"] == a_a.event_id
+        assert r_a.json()["items"][0]["routing_domain_id"] == dom_a
+
+        # dom_b returns ONLY a_b (corrupted r.routing_domain_id=dom_b on dom_a nodes cannot leak into dom_b!)
+        r_b = client.get(f"/api/v1/correlations/alert-flows?routing_domain_id={dom_b}")
+        assert r_b.status_code == 200
+        assert r_b.json()["total"] == 1
+        assert r_b.json()["items"][0]["event_id"] == a_b.event_id
+        assert r_b.json()["items"][0]["routing_domain_id"] == dom_b
+
+        # Cross-domain detail check returns 404 (no identifier leak)
+        assert (
+            client.get(f"/api/v1/correlations/alert-flows/{a_a.event_id}?routing_domain_id={dom_b}").status_code
+            == 404
+        )
+        assert (
+            client.get(f"/api/v1/correlations/alert-flows/{a_b.event_id}?routing_domain_id={dom_a}").status_code
+            == 404
+        )
+    finally:
+        all_a = [a_a, a_b, a_bad_rel, a_non_zeek]
+        all_f = [f_a, f_b, f_bad_rel, f_non_zeek]
+        _cleanup_synthetic(
+            live_driver,
+            event_ids=[a.event_id for a in all_a],
+            obs_ids=[f.observation_id for f in all_f],
+            def_ids={a.alert_definition_id for a in all_a},
+            scoped_ids={a.src_scoped_id for a in all_a} | {a.dst_scoped_id for a in all_a},
+            domain_ids=[dom_a, dom_b],
+            v1_l2s=[],
+        )

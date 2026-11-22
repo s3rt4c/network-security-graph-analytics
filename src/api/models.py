@@ -244,6 +244,8 @@ class TrafficAlertCorrelationResponse(BaseModel):
 class AlertFlowCorrelationResponse(BaseModel):
     """Persisted V2 Suricata AlertEvent to Zeek FlowObservation observational correlation."""
 
+    model_config = ConfigDict(strict=True)
+
     event_id: str = Field(description="Deterministic 64-character SHA-256 Suricata AlertEvent identifier")
     observation_id: str = Field(description="Deterministic 64-character SHA-256 Zeek FlowObservation identifier")
     zeek_uid: Optional[str] = Field(default=None, description="Native Zeek connection UID from FlowObservation")
