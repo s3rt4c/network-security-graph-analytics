@@ -36,6 +36,9 @@ from src.graph.repository import (
 from src.graph.read_repository import Neo4jReadRepository, AmbiguousEndpointError
 from src.graph.correlation_repository import (
     CORRELATION_REL_TYPE,
+    CYPHER_CHECK_SURICATA_ALERT_EVENT_EXISTS,
+    CYPHER_COUNT_ALERT_FLOW_CORRELATIONS,
+    CYPHER_LIST_ALERT_FLOW_CORRELATIONS,
     VERIFICATION_STATUS_UNVERIFIED_INCOMPLETE,
     VERIFICATION_STATUS_VERIFIED,
     AlertCorrelationOutcome,
@@ -66,6 +69,9 @@ __all__ = [
     "Neo4jReadRepository",
     "AmbiguousEndpointError",
     "CORRELATION_REL_TYPE",
+    "CYPHER_CHECK_SURICATA_ALERT_EVENT_EXISTS",
+    "CYPHER_COUNT_ALERT_FLOW_CORRELATIONS",
+    "CYPHER_LIST_ALERT_FLOW_CORRELATIONS",
     "VERIFICATION_STATUS_VERIFIED",
     "VERIFICATION_STATUS_UNVERIFIED_INCOMPLETE",
     "AlertCorrelationOutcome",

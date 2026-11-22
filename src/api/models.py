@@ -241,6 +241,48 @@ class TrafficAlertCorrelationResponse(BaseModel):
     alert_protocol: Optional[str] = Field(default=None, description="Alert record protocol")
 
 
+class AlertFlowCorrelationResponse(BaseModel):
+    """Persisted V2 Suricata AlertEvent to Zeek FlowObservation observational correlation."""
+
+    model_config = ConfigDict(strict=True)
+
+    event_id: str = Field(description="Deterministic 64-character SHA-256 Suricata AlertEvent identifier")
+    observation_id: str = Field(description="Deterministic 64-character SHA-256 Zeek FlowObservation identifier")
+    zeek_uid: Optional[str] = Field(default=None, description="Native Zeek connection UID from FlowObservation")
+    routing_domain_id: str = Field(description="Isolated Layer 3 RoutingDomain identifier")
+    correlation_method: Optional[str] = Field(default=None, description="Factual correlation method label derived from verified evidence")
+    evidence_version: Optional[str] = Field(default=None, description="Version identifier of the correlation evidence schema")
+    policy_fingerprint: Optional[str] = Field(default=None, description="SHA-256 fingerprint of the CorrelationPolicy active when decided")
+    evidence_digest: Optional[str] = Field(default=None, description="Deterministic SHA-256 digest of persisted evidence and policy")
+    tuple_orientation: Optional[str] = Field(default=None, description="Matched endpoint orientation (FORWARD, REVERSE, or SYMMETRIC)")
+    community_id_agreement: Optional[str] = Field(default=None, description="Community ID comparison classification")
+    temporal_relation: Optional[str] = Field(default=None, description="Exact Decimal temporal relationship classification")
+    temporal_delta_decimal: Optional[str] = Field(
+        default=None,
+        description="Exact canonical Decimal temporal delta string in seconds (never coerced to float)",
+    )
+    used_decimal_fallback: Optional[bool] = Field(
+        default=None,
+        description="Whether exact Decimal comparison bypassed null nanosecond index fields",
+    )
+    sensor_context: Optional[str] = Field(default=None, description="Factual sensor pairing provenance string")
+    verification_status: Literal["verified", "unverified_incomplete"] = Field(
+        description="Persisted edge verification lifecycle status ('verified' or 'unverified_incomplete')",
+    )
+    last_incomplete_reason: Optional[str] = Field(
+        default=None,
+        description="Persisted reason code when an incomplete reevaluation marked an existing edge unverified_incomplete",
+    )
+    last_incomplete_at_utc: Optional[str] = Field(
+        default=None,
+        description="UTC ISO-8601 timestamp when an existing edge was marked unverified_incomplete",
+    )
+    decided_at_utc: Optional[str] = Field(
+        default=None,
+        description="UTC ISO-8601 timestamp when the verified correlation edge was persisted or updated",
+    )
+
+
 # --- Graph Traversal & Topology Schemas ---
 
 class GraphNodeResponse(BaseModel):

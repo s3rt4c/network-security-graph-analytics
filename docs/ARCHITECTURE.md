@@ -66,12 +66,13 @@ D. Streaming Suricata Ingestion (python -m src.services.suricata_ingestion)
        │  [:HAS_ORIGINATOR]  [:HAS_RESPONDER]    │
        │  [:TRIGGERED_RULE]                      │
        │  [:HAS_SOURCE]  [:HAS_DESTINATION]      │
+       │  [:CORRELATED_WITH]                     │
        └─────────────────────────────────────────┘
                             ▲
                             │ session.execute_read
                             │
-                src/graph/read_repository.py
-     - Scoped IP resolution & AmbiguousEndpointError
+       src/graph/read_repository.py & correlation_repository.py
+     - Scoped IP resolution, AmbiguousEndpointError, & V2 correlation reads
                             ▲
                             │ dependency injection
                             │
@@ -81,7 +82,7 @@ src/api/routes/
   ├── import_data.py   (GET /api/v1/import/status, POST /validate, POST /import)
   ├── network.py       (GET /api/v1/network/*, including /analytics/summary and /analytics/endpoints)
   ├── alerts.py        (GET /api/v1/alerts/*)
-  ├── correlations.py  (GET /api/v1/correlations/*)
+  ├── correlations.py  (GET /api/v1/correlations/traffic-alerts [V1], /alert-flows* [V2])
   └── graph.py         (GET /api/v1/graph/*)
                             ▲
                             │ REST / JSON (Vite Dev Proxy)
@@ -144,6 +145,7 @@ frontend/src/
   - **Discrete Zeek Flow Observations**: `write_zeek_observations()` streams bounded batches into immutable `(:FlowObservation)` nodes with exact lossless decimal timestamp strings, optional exact 64-bit nanosecond indexes, separate directional payload/IP metrics, conflict rejection (`ObservationConflictError`), and `[:HAS_ORIGINATOR]`/`[:HAS_RESPONDER]` links.
   - **Discrete Suricata Alert Events & Definitions**: `write_suricata_alert_events()` streams bounded batches into immutable `(:AlertEvent)` nodes and static identity-only `(:AlertDefinition)` nodes with conflict rejection (`AlertEventConflictError`), lossless uint64 `flow_id` decimal strings, exact decimal/nanosecond timestamps, and `[:TRIGGERED_RULE]`/`[:HAS_SOURCE]`/`[:HAS_DESTINATION]` links.
   - Contains `replace_workspace_data` for atomic workspace clearing (including `:FlowObservation`, `:AlertEvent`, `:AlertDefinition`) and re-ingestion with rollback protection, recreating the target routing domain.
+- **`correlation_repository.py`**: Implements bounded dual-path candidate retrieval, Phase 4A correlation edge reconciliation (`[:CORRELATED_WITH]`), verification lifecycle tracking (`verified` vs `unverified_incomplete`), and read-only paginated queries (`list_alert_flow_correlations()`, `get_alert_event_correlations()`) for V2 API exposure.
 
 ### 3. Read Query Layer (`src/graph/read_repository.py`)
 - Executes optimized Cypher read queries using managed read transactions (`session.execute_read`).
@@ -213,10 +215,12 @@ neo4j_project/
 │   │   ├── app.py                 # FastAPI application factory and error handlers
 │   │   ├── models.py              # Pydantic v2 API response models
 │   │   └── routes/                # Modular route endpoints
-│   ├── services/                  # Business logic services (import validation & staging)
+│   ├── services/                  # Business logic services (import validation & correlation runner)
+│   │   └── correlation_service.py # Bounded Phase 4B correlation orchestration service & CLI
 │   ├── graph/                     # Graph persistence, schema & read repositories
 │   │   ├── schema.py              # V2 schema constraints, indexes & safe migration
 │   │   ├── repository.py          # Neo4j write repository & atomic workspace replacement
+│   │   ├── correlation_repository.py # Bounded Phase 4B reconciliation & Phase 4C correlation reads
 │   │   └── read_repository.py     # Neo4j read repository & ambiguity-safe queries
 │   └── ingestion/                 # Parsers, V2 identity models & Community ID
 │       ├── community_id.py        # Core Community ID hash implementation
