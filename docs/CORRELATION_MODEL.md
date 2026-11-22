@@ -121,3 +121,15 @@ Edges are created strictly for `COMPLETE` + `STRONG` (`auto_correlate_allowed=Tr
   python -m src.services.correlation_service --routing-domain-id corp --max-alerts 500 --after-cursor '{"event_id":"...","timestamp_epoch_ns":1795200110000000000}'
   python -m src.services.correlation_service --routing-domain-id corp --only-uncorrelated --max-alerts 500
   ```
+
+---
+
+## 6. Phase 4C — Read-Only Correlation Query API (`src/api/routes/correlations.py`)
+
+Phase 4C exposes persisted V2 `(:AlertEvent)-[:CORRELATED_WITH]->(:FlowObservation)` edges over read-only REST endpoints without altering legacy V1 `/api/v1/correlations/traffic-alerts` semantics:
+
+- **Endpoints:**
+  - `GET /api/v1/correlations/alert-flows` (bounded list with `routing_domain_id`, `event_id`, `observation_id`, `include_unverified`, `verification_status`, `limit`, `offset`)
+  - `GET /api/v1/correlations/alert-flows/{event_id}` (per-alert lookup distinguishing `404` missing Suricata `AlertEvent` from `200` existing alert with zero matching edges)
+- **Safe Verification Defaults:** Defaults to `include_unverified=false`, excluding `unverified_incomplete` edges unless callers explicitly pass `include_unverified=true` or `verification_status=unverified_incomplete`. Legacy edges lacking `verification_status` coalesce to `"verified"` for compatibility (not revalidation).
+- **Read-Only & Persisted-State Boundary:** Executes exclusively via `Neo4jCorrelationRepository` inside `session.execute_read()` transactions. Never invokes `correlate_alert_batch()`, `reconcile_alert_in_tx()`, `run_alert_flow_correlation()`, or `ensure_schema()`, never re-evaluates newly ingested flows on `GET`, and never invents confidence scores or unpersisted Phase 4A candidate reason arrays. See [API.md](API.md) for schemas and examples.

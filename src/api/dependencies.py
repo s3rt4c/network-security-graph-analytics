@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request, HTTPException
 from neo4j import GraphDatabase, Driver
 
 from src.config import get_optional_neo4j_config
+from src.graph.correlation_repository import Neo4jCorrelationRepository
 from src.graph.read_repository import Neo4jReadRepository
 from src.graph.repository import Neo4jRepository
 
@@ -47,6 +48,12 @@ def get_read_repository(request: Request) -> Neo4jReadRepository:
     """Provide a Neo4jReadRepository initialized with the shared driver from app state."""
     driver = getattr(request.app.state, "driver", None)
     return Neo4jReadRepository(driver)
+
+
+def get_correlation_repository(request: Request) -> Neo4jCorrelationRepository:
+    """Provide a Neo4jCorrelationRepository initialized with the shared driver from app state."""
+    driver = getattr(request.app.state, "driver", None)
+    return Neo4jCorrelationRepository(driver)
 
 
 def get_write_repository(request: Request) -> Neo4jRepository:

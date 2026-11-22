@@ -270,6 +270,61 @@ ORDER BY ae.event_id ASC, fo.observation_id ASC
 LIMIT $limit
 """
 
+_CORRELATION_EDGE_FILTER_WHERE = """
+WHERE ae.source_type = 'suricata'
+  AND fo.source_type = 'zeek'
+  AND ae.routing_domain_id IS NOT NULL
+  AND fo.routing_domain_id = ae.routing_domain_id
+  AND coalesce(r.routing_domain_id, ae.routing_domain_id) = ae.routing_domain_id
+  AND ($event_id IS NULL OR ae.event_id = $event_id)
+  AND ($observation_id IS NULL OR fo.observation_id = $observation_id)
+  AND ($routing_domain_id IS NULL OR ae.routing_domain_id = $routing_domain_id)
+  AND (
+      ($verification_status IS NOT NULL AND coalesce(r.verification_status, 'verified') = $verification_status)
+      OR ($verification_status IS NULL AND ($include_unverified OR coalesce(r.verification_status, 'verified') = 'verified'))
+  )
+"""
+
+CYPHER_COUNT_ALERT_FLOW_CORRELATIONS = f"""
+MATCH (ae:AlertEvent)-[r:CORRELATED_WITH]->(fo:FlowObservation)
+{_CORRELATION_EDGE_FILTER_WHERE}
+RETURN count(r) AS total
+"""
+
+CYPHER_LIST_ALERT_FLOW_CORRELATIONS = f"""
+MATCH (ae:AlertEvent)-[r:CORRELATED_WITH]->(fo:FlowObservation)
+{_CORRELATION_EDGE_FILTER_WHERE}
+RETURN ae.event_id AS event_id,
+       fo.observation_id AS observation_id,
+       fo.zeek_uid AS zeek_uid,
+       coalesce(r.routing_domain_id, ae.routing_domain_id) AS routing_domain_id,
+       r.correlation_method AS correlation_method,
+       r.evidence_version AS evidence_version,
+       r.policy_fingerprint AS policy_fingerprint,
+       r.evidence_digest AS evidence_digest,
+       r.tuple_orientation AS tuple_orientation,
+       r.community_id_agreement AS community_id_agreement,
+       r.temporal_relation AS temporal_relation,
+       r.temporal_delta_decimal AS temporal_delta_decimal,
+       r.used_decimal_fallback AS used_decimal_fallback,
+       r.sensor_context AS sensor_context,
+       coalesce(r.verification_status, 'verified') AS verification_status,
+       r.last_incomplete_reason AS last_incomplete_reason,
+       r.last_incomplete_at_utc AS last_incomplete_at_utc,
+       r.decided_at_utc AS decided_at_utc
+ORDER BY ae.event_id ASC, fo.observation_id ASC, coalesce(r.evidence_digest, '') ASC
+SKIP $offset
+LIMIT $limit
+"""
+
+CYPHER_CHECK_SURICATA_ALERT_EVENT_EXISTS = """
+MATCH (ae:AlertEvent {event_id: $event_id})
+WHERE ae.source_type = 'suricata'
+  AND ($routing_domain_id IS NULL OR ae.routing_domain_id = $routing_domain_id)
+RETURN ae.event_id AS event_id
+LIMIT 1
+"""
+
 
 @dataclass(frozen=True)
 class AlertSelectionCursor:
@@ -562,6 +617,84 @@ def build_correlation_edge_properties(
         "last_incomplete_reason": None,
         "last_incomplete_at_utc": None,
     }
+
+
+def _validate_correlation_query_params(
+    *,
+    routing_domain_id: Optional[str],
+    event_id: Optional[str],
+    observation_id: Optional[str],
+    include_unverified: bool,
+    verification_status: Optional[str],
+    limit: int,
+    offset: int,
+) -> Tuple[Optional[str], Optional[str], Optional[str], bool, Optional[str]]:
+    """Validate and normalize read-query filter and pagination parameters."""
+    if not isinstance(include_unverified, bool):
+        raise ValueError(f"include_unverified must be a bool, got {include_unverified!r}")
+
+    norm_status: Optional[str] = None
+    if verification_status is not None:
+        if not isinstance(verification_status, str):
+            raise ValueError(
+                f"verification_status must be a string or None, got {verification_status!r}"
+            )
+        cleaned_status = verification_status.strip()
+        if cleaned_status not in {
+            VERIFICATION_STATUS_VERIFIED,
+            VERIFICATION_STATUS_UNVERIFIED_INCOMPLETE,
+        }:
+            raise ValueError(
+                f"Invalid verification_status {verification_status!r}; expected "
+                f"{VERIFICATION_STATUS_VERIFIED!r} or {VERIFICATION_STATUS_UNVERIFIED_INCOMPLETE!r}"
+            )
+        norm_status = cleaned_status
+
+    if (
+        include_unverified is False
+        and norm_status == VERIFICATION_STATUS_UNVERIFIED_INCOMPLETE
+    ):
+        raise ValueError(
+            "include_unverified=False cannot be combined with "
+            "verification_status='unverified_incomplete'"
+        )
+
+    if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= 1000):
+        raise ValueError(f"limit must be an integer in 1..1000, got {limit!r}")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError(f"offset must be a non-negative integer, got {offset!r}")
+
+    norm_domain: Optional[str] = None
+    if routing_domain_id is not None:
+        if not isinstance(routing_domain_id, str):
+            raise ValueError(
+                f"routing_domain_id must be a string or None, got {routing_domain_id!r}"
+            )
+        cleaned_domain = routing_domain_id.strip().lower()
+        if cleaned_domain:
+            if "#" in cleaned_domain:
+                raise ValueError(f"routing_domain_id cannot contain '#': {cleaned_domain!r}")
+            norm_domain = cleaned_domain
+
+    norm_event: Optional[str] = None
+    if event_id is not None:
+        if not isinstance(event_id, str):
+            raise ValueError(f"event_id must be a string or None, got {event_id!r}")
+        cleaned_event = event_id.strip()
+        if cleaned_event:
+            norm_event = cleaned_event
+
+    norm_obs: Optional[str] = None
+    if observation_id is not None:
+        if not isinstance(observation_id, str):
+            raise ValueError(
+                f"observation_id must be a string or None, got {observation_id!r}"
+            )
+        cleaned_obs = observation_id.strip()
+        if cleaned_obs:
+            norm_obs = cleaned_obs
+
+    return norm_domain, norm_event, norm_obs, include_unverified, norm_status
 
 
 def _record_to_dict(record: Any) -> Dict[str, Any]:
@@ -1101,6 +1234,133 @@ class Neo4jCorrelationRepository:
                 limit=limit,
             )
             return [_record_to_dict(r) for r in res]
+
+        with self.driver.session() as session:
+            return session.execute_read(_work)
+
+    def list_alert_flow_correlations(
+        self,
+        *,
+        routing_domain_id: Optional[str] = None,
+        event_id: Optional[str] = None,
+        observation_id: Optional[str] = None,
+        include_unverified: bool = False,
+        verification_status: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """List persisted V2 Suricata-to-Zeek CORRELATED_WITH relationships with pagination.
+
+        Defaults to `include_unverified=False` so callers only receive `verified` edges
+        unless unverified records are explicitly requested. Legacy edges lacking a
+        `verification_status` property are treated as `'verified'` for backward
+        compatibility. Returns `(items, total)` from a single `execute_read` transaction.
+        """
+        if self.driver is None:
+            raise ConnectionError("Database driver unavailable")
+
+        norm_domain, norm_event, norm_obs, norm_include_unverified, norm_status = (
+            _validate_correlation_query_params(
+                routing_domain_id=routing_domain_id,
+                event_id=event_id,
+                observation_id=observation_id,
+                include_unverified=include_unverified,
+                verification_status=verification_status,
+                limit=limit,
+                offset=offset,
+            )
+        )
+
+        filter_params: Dict[str, Any] = {
+            "event_id": norm_event,
+            "observation_id": norm_obs,
+            "routing_domain_id": norm_domain,
+            "include_unverified": norm_include_unverified,
+            "verification_status": norm_status,
+        }
+
+        def _work(tx) -> Tuple[List[Dict[str, Any]], int]:
+            count_rec = tx.run(CYPHER_COUNT_ALERT_FLOW_CORRELATIONS, **filter_params).single()
+            total = int(count_rec["total"]) if count_rec else 0
+            page_res = tx.run(
+                CYPHER_LIST_ALERT_FLOW_CORRELATIONS,
+                **filter_params,
+                offset=offset,
+                limit=limit,
+            )
+            items = [_record_to_dict(r) for r in page_res]
+            return items, total
+
+        with self.driver.session() as session:
+            return session.execute_read(_work)
+
+    def get_alert_event_correlations(
+        self,
+        event_id: str,
+        *,
+        routing_domain_id: Optional[str] = None,
+        include_unverified: bool = False,
+        verification_status: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Optional[Tuple[List[Dict[str, Any]], int]]:
+        """Retrieve persisted V2 correlations for a specific Suricata AlertEvent.
+
+        Returns:
+            - `None` when no matching Suricata `AlertEvent` exists (within `routing_domain_id`,
+              if specified).
+            - `(items, total)` when the `AlertEvent` exists, including `([], 0)` when it has
+              zero matching `CORRELATED_WITH` edges.
+
+        Raises:
+            ConnectionError: When the database driver is unavailable.
+            ValueError: When `event_id` or query parameters fail validation.
+        """
+        if self.driver is None:
+            raise ConnectionError("Database driver unavailable")
+        if not isinstance(event_id, str) or not event_id.strip():
+            raise ValueError(f"event_id must be a non-empty string, got {event_id!r}")
+
+        norm_domain, norm_event, _, norm_include_unverified, norm_status = (
+            _validate_correlation_query_params(
+                routing_domain_id=routing_domain_id,
+                event_id=event_id,
+                observation_id=None,
+                include_unverified=include_unverified,
+                verification_status=verification_status,
+                limit=limit,
+                offset=offset,
+            )
+        )
+        assert norm_event is not None
+
+        filter_params: Dict[str, Any] = {
+            "event_id": norm_event,
+            "observation_id": None,
+            "routing_domain_id": norm_domain,
+            "include_unverified": norm_include_unverified,
+            "verification_status": norm_status,
+        }
+
+        def _work(tx) -> Optional[Tuple[List[Dict[str, Any]], int]]:
+            exists_rec = tx.run(
+                CYPHER_CHECK_SURICATA_ALERT_EVENT_EXISTS,
+                event_id=norm_event,
+                routing_domain_id=norm_domain,
+            ).single()
+            if exists_rec is None:
+                return None
+
+            count_rec = tx.run(CYPHER_COUNT_ALERT_FLOW_CORRELATIONS, **filter_params).single()
+            total = int(count_rec["total"]) if count_rec else 0
+            page_res = tx.run(
+                CYPHER_LIST_ALERT_FLOW_CORRELATIONS,
+                **filter_params,
+                offset=offset,
+                limit=limit,
+            )
+            items = [_record_to_dict(r) for r in page_res]
+            return items, total
 
         with self.driver.session() as session:
             return session.execute_read(_work)
