@@ -155,7 +155,7 @@ Preserved unverified correlation (`GET /api/v1/correlations/alert-flows?include_
       "used_decimal_fallback": false,
       "sensor_context": "ALLOWED_ANY_IN_DOMAIN:suricata-4c->zeek-4c",
       "verification_status": "unverified_incomplete",
-      "last_incomplete_reason": "CANDIDATE_CAP_EXCEEDED",
+      "last_incomplete_reason": "CANDIDATE_SET_TRUNCATED",
       "last_incomplete_at_utc": "2026-11-22T15:30:00Z",
       "decided_at_utc": "2026-11-22T12:00:00Z"
     }

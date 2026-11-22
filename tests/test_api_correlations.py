@@ -186,7 +186,7 @@ def test_b_d_include_unverified_and_verification_status_filtering():
         event_id=_EVENT_ID_2,
         observation_id=_OBS_ID_2,
         verification_status="unverified_incomplete",
-        last_incomplete_reason="CANDIDATE_CAP_EXCEEDED",
+        last_incomplete_reason="CANDIDATE_SET_TRUNCATED",
         last_incomplete_at_utc="2026-11-22T15:30:00Z",
     )
     mock_repo.list_alert_flow_correlations.return_value = ([verified_row, unverified_row], 2)
@@ -199,7 +199,7 @@ def test_b_d_include_unverified_and_verification_status_filtering():
         "verified",
         "unverified_incomplete",
     ]
-    assert payload["items"][1]["last_incomplete_reason"] == "CANDIDATE_CAP_EXCEEDED"
+    assert payload["items"][1]["last_incomplete_reason"] == "CANDIDATE_SET_TRUNCATED"
     assert payload["items"][1]["last_incomplete_at_utc"] == "2026-11-22T15:30:00Z"
     mock_repo.list_alert_flow_correlations.assert_called_once_with(
         routing_domain_id=None,
@@ -410,12 +410,18 @@ def test_n_o_openapi_route_ordering_and_decimal_no_float_coercion():
         assert list(paths[corr_path].keys()) == ["get"]
 
     # Static /alert-flows must appear before dynamic /alert-flows/{event_id}
-    corr_routes = [
-        r.path for r in app.routes if getattr(r, "path", "").startswith("/api/v1/correlations")
-    ]
-    assert corr_routes.index("/api/v1/correlations/alert-flows") < corr_routes.index(
+    from src.api.routes.correlations import router as correlations_router
+
+    path_keys = list(paths.keys())
+    assert path_keys.index("/api/v1/correlations/alert-flows") < path_keys.index(
         "/api/v1/correlations/alert-flows/{event_id}"
     )
+    router_paths = [getattr(r, "path", "") for r in correlations_router.routes]
+    static_idx = next(i for i, p in enumerate(router_paths) if p.endswith("/alert-flows"))
+    dynamic_idx = next(
+        i for i, p in enumerate(router_paths) if p.endswith("/alert-flows/{event_id}")
+    )
+    assert static_idx < dynamic_idx
 
     # AlertFlowCorrelationResponse forbids float coercion on temporal_delta_decimal
     with pytest.raises(ValidationError):

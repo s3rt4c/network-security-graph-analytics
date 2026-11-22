@@ -606,7 +606,7 @@ def test_01_read_only_invariant_across_all_get_endpoints(seeded_api_env):
     unv_rows = [row for row in r_list_inc.json()["items"] if row["event_id"] == a_unv.event_id]
     assert len(unv_rows) == 1
     assert unv_rows[0]["verification_status"] == VERIFICATION_STATUS_UNVERIFIED_INCOMPLETE
-    assert unv_rows[0]["last_incomplete_reason"] == "CANDIDATE_CAP_EXCEEDED"
+    assert unv_rows[0]["last_incomplete_reason"] == "CANDIDATE_SET_TRUNCATED"
     assert isinstance(unv_rows[0]["last_incomplete_at_utc"], str)
 
     r_detail_unv = client.get(
