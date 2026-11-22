@@ -4,8 +4,12 @@ Graph persistence and query module for Neo4j.
 
 from src.graph.schema import (
     ensure_schema,
+    verify_schema_read_only,
     migrate_ip_identity_to_scoped,
     MigrationRequiredError,
+    SchemaNotReadyError,
+    REQUIRED_CORRELATION_CONSTRAINTS,
+    REQUIRED_CORRELATION_INDEXES,
     SCHEMA_STATEMENTS,
     LEGACY_DROP_STATEMENTS,
 )
@@ -30,11 +34,28 @@ from src.graph.repository import (
     CYPHER_WRITE_SURICATA_ALERT_BATCH,
 )
 from src.graph.read_repository import Neo4jReadRepository, AmbiguousEndpointError
+from src.graph.correlation_repository import (
+    CORRELATION_REL_TYPE,
+    VERIFICATION_STATUS_UNVERIFIED_INCOMPLETE,
+    VERIFICATION_STATUS_VERIFIED,
+    AlertCorrelationOutcome,
+    AlertSelectionCursor,
+    AlertSelectionPage,
+    CandidateRetrievalResult,
+    CorrelationBatchResult,
+    Neo4jCorrelationRepository,
+    build_correlation_edge_properties,
+    compute_correlation_evidence_digest,
+)
 
 __all__ = [
     "ensure_schema",
+    "verify_schema_read_only",
     "migrate_ip_identity_to_scoped",
     "MigrationRequiredError",
+    "SchemaNotReadyError",
+    "REQUIRED_CORRELATION_CONSTRAINTS",
+    "REQUIRED_CORRELATION_INDEXES",
     "SCHEMA_STATEMENTS",
     "LEGACY_DROP_STATEMENTS",
     "Neo4jRepository",
@@ -44,6 +65,17 @@ __all__ = [
     "AlertEventPersistenceSummary",
     "Neo4jReadRepository",
     "AmbiguousEndpointError",
+    "CORRELATION_REL_TYPE",
+    "VERIFICATION_STATUS_VERIFIED",
+    "VERIFICATION_STATUS_UNVERIFIED_INCOMPLETE",
+    "AlertCorrelationOutcome",
+    "AlertSelectionCursor",
+    "AlertSelectionPage",
+    "CandidateRetrievalResult",
+    "CorrelationBatchResult",
+    "Neo4jCorrelationRepository",
+    "build_correlation_edge_properties",
+    "compute_correlation_evidence_digest",
     "canonicalize_ip",
     "compute_alert_fact_key",
     "compute_alert_event_payload_digest",

@@ -146,9 +146,10 @@ Discrete Zeek Connection Observations (Phase 3A.2):
 
 Discrete Suricata Alert Events & Rules (Phase 3B.2):
 (:AlertEvent {event_id: str (UQ), ...})
-    ├──[:TRIGGERED_RULE]───▶ (:AlertDefinition {definition_id: str (UQ), engine, ruleset_namespace, gid, sid})
-    ├──[:HAS_SOURCE]───────▶ (src:IPAddress {scoped_id: str (UQ)})
-    └──[:HAS_DESTINATION]──▶ (dst:IPAddress {scoped_id: str (UQ)})
+    ├──[:TRIGGERED_RULE]────▶ (:AlertDefinition {definition_id: str (UQ), engine, ruleset_namespace, gid, sid})
+    ├──[:HAS_SOURCE]────────▶ (src:IPAddress {scoped_id: str (UQ)})
+    ├──[:HAS_DESTINATION]───▶ (dst:IPAddress {scoped_id: str (UQ)})
+    └──[:CORRELATED_WITH]───▶ (:FlowObservation {observation_id: str (UQ), ...})   [Phase 4B: unique STRONG observational match only]
 ```
 
 ### Node Entities
@@ -172,6 +173,7 @@ Discrete Suricata Alert Events & Rules (Phase 3B.2):
 - **`(:AlertEvent)-[:TRIGGERED_RULE]->(:AlertDefinition)`**: Links a discrete alert firing event to its static rule definition.
 - **`(:AlertEvent)-[:HAS_SOURCE]->(:IPAddress)`**: Links a discrete alert event to its domain-scoped source IP.
 - **`(:AlertEvent)-[:HAS_DESTINATION]->(:IPAddress)`**: Links a discrete alert event to its domain-scoped destination IP.
+- **`(:AlertEvent)-[:CORRELATED_WITH]->(:FlowObservation)`**: Phase 4B verified observational correlation created solely for complete, unambiguous `STRONG` Phase 4A decisions (`correlation_method`, `evidence_version`, `policy_fingerprint`, `routing_domain_id`, `tuple_orientation`, `community_id_agreement`, `temporal_relation`, `temporal_delta_decimal`, `used_decimal_fallback`, `sensor_context`, `evidence_digest`, `decided_at_utc`). Never represents causation, compromise, or attack attribution.
 
 ---
 
