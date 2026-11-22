@@ -51,6 +51,11 @@ from src.correlation import (
 logger = logging.getLogger(__name__)
 
 CORRELATION_REL_TYPE = "CORRELATED_WITH"
+VERIFICATION_STATUS_VERIFIED = "verified"
+VERIFICATION_STATUS_UNVERIFIED_INCOMPLETE = "unverified_incomplete"
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 CYPHER_LIST_CORRELATABLE_ALERT_IDS = """
 MATCH (ae:AlertEvent)
@@ -58,11 +63,28 @@ WHERE ae.source_type = 'suricata'
   AND ($routing_domain_id IS NULL OR ae.routing_domain_id = $routing_domain_id)
   AND ($sensor_id IS NULL OR toLower(trim(ae.sensor_id)) = $sensor_id)
   AND (NOT $only_uncorrelated OR NOT (ae)-[:CORRELATED_WITH]->(:FlowObservation))
-RETURN ae.event_id AS event_id
+  AND (
+      $after_event_id IS NULL
+      OR (
+          NOT $after_ts_is_null
+          AND (
+              ae.timestamp_epoch_ns IS NULL
+              OR ae.timestamp_epoch_ns > $after_ts
+              OR (ae.timestamp_epoch_ns = $after_ts AND ae.event_id > $after_event_id)
+          )
+      )
+      OR (
+          $after_ts_is_null
+          AND ae.timestamp_epoch_ns IS NULL
+          AND ae.event_id > $after_event_id
+      )
+  )
+RETURN ae.event_id AS event_id,
+       ae.timestamp_epoch_ns AS timestamp_epoch_ns
 ORDER BY CASE WHEN ae.timestamp_epoch_ns IS NULL THEN 1 ELSE 0 END ASC,
          ae.timestamp_epoch_ns ASC,
          ae.event_id ASC
-LIMIT $max_alerts
+LIMIT $fetch_limit
 """
 
 _ALERT_EVENT_RETURN_COLUMNS = """
@@ -186,8 +208,17 @@ MATCH (ae:AlertEvent {event_id: $event_id})-[r:CORRELATED_WITH]->(fo:FlowObserva
 RETURN elementId(r) AS rel_id,
        fo.observation_id AS observation_id,
        r.evidence_digest AS evidence_digest,
-       r.policy_fingerprint AS policy_fingerprint
+       r.policy_fingerprint AS policy_fingerprint,
+       r.verification_status AS verification_status
 ORDER BY fo.observation_id ASC, elementId(r) ASC
+"""
+
+CYPHER_MARK_CORRELATIONS_UNVERIFIED = """
+MATCH (ae:AlertEvent {event_id: $event_id})-[r:CORRELATED_WITH]->(:FlowObservation)
+SET r.verification_status = 'unverified_incomplete',
+    r.last_incomplete_reason = $reason,
+    r.last_incomplete_at_utc = $marked_at_utc
+RETURN count(r) AS marked_count
 """
 
 CYPHER_DELETE_CORRELATIONS_BY_ELEMENT_IDS = """
@@ -216,6 +247,7 @@ CYPHER_GET_ALERT_CORRELATIONS = """
 MATCH (ae:AlertEvent)-[r:CORRELATED_WITH]->(fo:FlowObservation)
 WHERE ($event_id IS NULL OR ae.event_id = $event_id)
   AND ($routing_domain_id IS NULL OR r.routing_domain_id = $routing_domain_id)
+  AND ($include_unverified OR coalesce(r.verification_status, 'verified') = 'verified')
 RETURN ae.event_id AS event_id,
        fo.observation_id AS observation_id,
        fo.zeek_uid AS zeek_uid,
@@ -230,10 +262,79 @@ RETURN ae.event_id AS event_id,
        r.used_decimal_fallback AS used_decimal_fallback,
        r.sensor_context AS sensor_context,
        r.evidence_digest AS evidence_digest,
-       r.decided_at_utc AS decided_at_utc
+       r.decided_at_utc AS decided_at_utc,
+       coalesce(r.verification_status, 'verified') AS verification_status,
+       r.last_incomplete_reason AS last_incomplete_reason,
+       r.last_incomplete_at_utc AS last_incomplete_at_utc
 ORDER BY ae.event_id ASC, fo.observation_id ASC
 LIMIT $limit
 """
+
+
+@dataclass(frozen=True)
+class AlertSelectionCursor:
+    """Deterministic keyset continuation cursor for bounded AlertEvent pagination.
+
+    Matches the exact ordering contract:
+    `(timestamp_epoch_ns IS NULL ASC, timestamp_epoch_ns ASC, event_id ASC)`.
+    """
+
+    timestamp_epoch_ns: Optional[int]
+    event_id: str
+
+    def __post_init__(self) -> None:
+        if self.timestamp_epoch_ns is not None:
+            if isinstance(self.timestamp_epoch_ns, bool) or not isinstance(
+                self.timestamp_epoch_ns, int
+            ):
+                raise ValueError(
+                    f"cursor.timestamp_epoch_ns must be int or None, got {self.timestamp_epoch_ns!r}"
+                )
+            if not (_INT64_MIN <= self.timestamp_epoch_ns <= _INT64_MAX):
+                raise ValueError(
+                    f"cursor.timestamp_epoch_ns out of signed int64 bounds: {self.timestamp_epoch_ns}"
+                )
+        if not isinstance(self.event_id, str) or not self.event_id.strip():
+            raise ValueError(f"cursor.event_id must be a non-empty string, got {self.event_id!r}")
+        object.__setattr__(self, "event_id", self.event_id.strip())
+
+    def to_token(self) -> str:
+        """Serialize cursor as a compact deterministic JSON string."""
+        return json.dumps(
+            {
+                "timestamp_epoch_ns": self.timestamp_epoch_ns,
+                "event_id": self.event_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_token(cls, token: str) -> "AlertSelectionCursor":
+        """Parse and validate a serialized cursor token string."""
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError("cursor token must be a non-empty JSON string")
+        try:
+            data = json.loads(token)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid cursor token JSON: {exc}") from exc
+        if not isinstance(data, dict) or set(data.keys()) != {"timestamp_epoch_ns", "event_id"}:
+            raise ValueError(
+                "Invalid cursor token structure; expected keys 'timestamp_epoch_ns' and 'event_id'"
+            )
+        return cls(
+            timestamp_epoch_ns=data["timestamp_epoch_ns"],
+            event_id=data["event_id"],
+        )
+
+
+@dataclass(frozen=True)
+class AlertSelectionPage:
+    """Bounded keyset page of correlatable AlertEvent IDs with exact continuation state."""
+
+    event_ids: Tuple[str, ...]
+    has_more: bool
+    next_cursor: Optional[AlertSelectionCursor]
 
 
 @dataclass(frozen=True)
@@ -457,6 +558,9 @@ def build_correlation_edge_properties(
         "sensor_context": sensor_ctx,
         "evidence_digest": digest,
         "decided_at_utc": timestamp_utc,
+        "verification_status": VERIFICATION_STATUS_VERIFIED,
+        "last_incomplete_reason": None,
+        "last_incomplete_at_utc": None,
     }
 
 
@@ -472,21 +576,36 @@ class Neo4jCorrelationRepository:
     def __init__(self, driver):
         self.driver = driver
 
-    def list_correlatable_alert_event_ids(
+    def list_correlatable_alert_page(
         self,
         *,
         routing_domain_id: Optional[str] = None,
         sensor_id: Optional[str] = None,
         only_uncorrelated: bool = False,
         max_alerts: int = 1000,
-    ) -> List[str]:
-        """List bounded Suricata AlertEvent IDs eligible for correlation evaluation."""
+        after_cursor: Optional[AlertSelectionCursor] = None,
+    ) -> AlertSelectionPage:
+        """List a deterministic keyset-paginated page of Suricata AlertEvent IDs.
+
+        Uses `LIMIT (max_alerts + 1)` over the strict total order
+        `(timestamp_epoch_ns IS NULL ASC, timestamp_epoch_ns ASC, event_id ASC)` to
+        report exact `has_more` and `next_cursor` continuation without skipping or
+        duplicating records on a stable dataset.
+
+        Note: `only_uncorrelated=True` selects only alerts currently lacking an
+        outgoing `:CORRELATED_WITH` edge and is therefore unsuitable for stale-edge
+        revalidation.
+        """
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
-        if isinstance(only_uncorrelated, bool) is False or not isinstance(only_uncorrelated, bool):
+        if not isinstance(only_uncorrelated, bool):
             raise ValueError(f"only_uncorrelated must be a bool, got {only_uncorrelated!r}")
         if isinstance(max_alerts, bool) or not isinstance(max_alerts, int) or max_alerts < 1:
             raise ValueError(f"max_alerts must be a positive integer, got {max_alerts!r}")
+        if after_cursor is not None and not isinstance(after_cursor, AlertSelectionCursor):
+            raise ValueError(
+                f"after_cursor must be an AlertSelectionCursor or None, got {after_cursor!r}"
+            )
 
         norm_domain = (
             routing_domain_id.strip().lower()
@@ -501,18 +620,60 @@ class Neo4jCorrelationRepository:
             else None
         )
 
-        def _work(tx) -> List[str]:
+        after_event_id = after_cursor.event_id if after_cursor is not None else None
+        after_ts = after_cursor.timestamp_epoch_ns if after_cursor is not None else None
+        after_ts_is_null = after_cursor is not None and after_cursor.timestamp_epoch_ns is None
+
+        def _work(tx) -> AlertSelectionPage:
             res = tx.run(
                 CYPHER_LIST_CORRELATABLE_ALERT_IDS,
                 routing_domain_id=norm_domain,
                 sensor_id=norm_sensor,
                 only_uncorrelated=only_uncorrelated,
-                max_alerts=max_alerts,
+                after_event_id=after_event_id,
+                after_ts=after_ts,
+                after_ts_is_null=after_ts_is_null,
+                fetch_limit=max_alerts + 1,
             )
-            return [str(rec["event_id"]) for rec in res]
+            rows = [_record_to_dict(rec) for rec in res]
+            has_more = len(rows) > max_alerts
+            page_rows = rows[:max_alerts]
+            event_ids = tuple(str(r["event_id"]) for r in page_rows)
+            next_cursor: Optional[AlertSelectionCursor] = None
+            if has_more and page_rows:
+                last_row = page_rows[-1]
+                raw_ts = last_row.get("timestamp_epoch_ns")
+                next_cursor = AlertSelectionCursor(
+                    timestamp_epoch_ns=int(raw_ts) if raw_ts is not None else None,
+                    event_id=str(last_row["event_id"]),
+                )
+            return AlertSelectionPage(
+                event_ids=event_ids,
+                has_more=has_more,
+                next_cursor=next_cursor,
+            )
 
         with self.driver.session() as session:
             return session.execute_read(_work)
+
+    def list_correlatable_alert_event_ids(
+        self,
+        *,
+        routing_domain_id: Optional[str] = None,
+        sensor_id: Optional[str] = None,
+        only_uncorrelated: bool = False,
+        max_alerts: int = 1000,
+        after_cursor: Optional[AlertSelectionCursor] = None,
+    ) -> List[str]:
+        """List bounded Suricata AlertEvent IDs eligible for correlation evaluation."""
+        page = self.list_correlatable_alert_page(
+            routing_domain_id=routing_domain_id,
+            sensor_id=sensor_id,
+            only_uncorrelated=only_uncorrelated,
+            max_alerts=max_alerts,
+            after_cursor=after_cursor,
+        )
+        return list(page.event_ids)
 
     def retrieve_candidates_in_tx(
         self,
@@ -622,6 +783,29 @@ class Neo4jCorrelationRepository:
             )
 
         if incomplete:
+            if existing:
+                incomplete_reason = (
+                    decision.decision_reasons[0]
+                    if decision.decision_reasons
+                    else (
+                        "CANDIDATE_RETRIEVAL_ERROR"
+                        if retrieval_error is not None
+                        else "INCOMPLETE_CANDIDATE_EVALUATION"
+                    )
+                )
+                marked_ts = (
+                    decided_at_utc.strip()
+                    if isinstance(decided_at_utc, str) and decided_at_utc.strip()
+                    else datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                )
+                # Non-destructively flag existing edge(s) as unverified_incomplete without
+                # deleting the edge or modifying original evidence properties/evidence_digest.
+                tx.run(
+                    CYPHER_MARK_CORRELATIONS_UNVERIFIED,
+                    event_id=alert.event_id,
+                    reason=incomplete_reason,
+                    marked_at_utc=marked_ts,
+                ).consume()
             return AlertCorrelationOutcome(
                 event_id=alert.event_id,
                 decision=decision,
@@ -647,6 +831,7 @@ class Neo4jCorrelationRepository:
                 len(existing) == 1
                 and existing[0]["observation_id"] == target_obs_id
                 and existing[0].get("evidence_digest") == digest
+                and existing[0].get("verification_status") in (None, VERIFICATION_STATUS_VERIFIED)
             ):
                 return AlertCorrelationOutcome(
                     event_id=alert.event_id,
@@ -883,11 +1068,20 @@ class Neo4jCorrelationRepository:
         event_id: Optional[str] = None,
         *,
         routing_domain_id: Optional[str] = None,
+        include_unverified: bool = True,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
-        """Retrieve persisted (:AlertEvent)-[:CORRELATED_WITH]->(:FlowObservation) records."""
+        """Retrieve persisted (:AlertEvent)-[:CORRELATED_WITH]->(:FlowObservation) records.
+
+        Exposes `verification_status` (`'verified'` vs `'unverified_incomplete'`),
+        `last_incomplete_reason`, and `last_incomplete_at_utc` so callers can distinguish
+        freshly verified correlations from edges preserved across an incomplete reevaluation.
+        Pass `include_unverified=False` to restrict results to `'verified'` correlations only.
+        """
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
+        if not isinstance(include_unverified, bool):
+            raise ValueError(f"include_unverified must be a bool, got {include_unverified!r}")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError(f"limit must be a positive integer, got {limit!r}")
 
@@ -903,6 +1097,7 @@ class Neo4jCorrelationRepository:
                 CYPHER_GET_ALERT_CORRELATIONS,
                 event_id=norm_event,
                 routing_domain_id=norm_domain,
+                include_unverified=include_unverified,
                 limit=limit,
             )
             return [_record_to_dict(r) for r in res]

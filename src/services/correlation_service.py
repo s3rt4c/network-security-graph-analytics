@@ -6,9 +6,17 @@ candidate retrieval, Phase 4A pure-Python correlation evaluation, and atomic
 per-batch edge reconciliation via Neo4jCorrelationRepository.
 
 Transaction & Safety Guarantees:
-- Enforces `ensure_schema(driver)` prior to evaluation (`MigrationRequiredError`
-  propagates without automatic legacy V1 mutation).
-- Supports explicit `dry_run=True` mode using read-only transactions (zero writes).
+- Write mode (`dry_run=False`) enforces `ensure_schema(driver)` prior to evaluation
+  (`MigrationRequiredError` propagates without automatic legacy V1 mutation).
+- Dry-run mode (`dry_run=True`) runs strictly read-only schema verification
+  (`verify_schema_read_only(driver)`) and read-only evaluation transactions —
+  executing ZERO schema DDL (CREATE/DROP CONSTRAINT or INDEX) and ZERO graph writes.
+- Keyset pagination (`after_cursor`, `has_more`, `next_cursor`) prevents bounded-page
+  starvation across workspaces exceeding `max_alerts` without claiming complete coverage
+  when only a page ran.
+- `only_uncorrelated=True` skips alerts that already carry outgoing `:CORRELATED_WITH`
+  edges and is therefore unsuitable for stale-edge revalidation; use default
+  `only_uncorrelated=False` with keyset continuation for full reconciliation passes.
 - Commits each batch independently in one retry-safe managed write transaction.
   Does NOT claim run-wide atomicity across multiple batches: if batch N+1 fails,
   batches 1..N remain committed while batch N+1 rolls back atomically; re-running
@@ -22,15 +30,23 @@ from dataclasses import dataclass
 import json
 import logging
 import sys
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence, Union
 
 from neo4j import GraphDatabase
 
 from src.config import get_neo4j_config
 from src.correlation import CorrelationPolicy, SensorPairingPolicy, SensorPolicyMode
-from src.graph.correlation_repository import Neo4jCorrelationRepository
+from src.graph.correlation_repository import (
+    AlertSelectionCursor,
+    Neo4jCorrelationRepository,
+)
 from src.graph.repository import chunk_list
-from src.graph.schema import MigrationRequiredError, ensure_schema
+from src.graph.schema import (
+    MigrationRequiredError,
+    SchemaNotReadyError,
+    ensure_schema,
+    verify_schema_read_only,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +59,14 @@ class CorrelationRunSummary:
     - When `dry_run=False`, all mutation counters (`correlations_created`,
       `correlations_unchanged`, `correlations_updated`, `stale_correlations_removed`,
       and `batches_committed`) reflect only actually committed write batches.
-    - When `dry_run=True`, zero graph mutations are performed and all mutation counters
-      plus `batches_committed` remain strictly 0.
+    - When `dry_run=True`, zero graph mutations and zero schema DDL statements are
+      executed, and all mutation counters plus `batches_committed` remain strictly 0.
     - `incomplete_evaluations` counts alerts whose candidate set was TRUNCATED or
       experienced a RETRIEVAL_ERROR (never promoted to STRONG and never destructively
-      reconciled).
+      deleted; existing edges are flagged `unverified_incomplete` in write mode).
+    - `has_more` and `next_cursor` report exact keyset pagination state: when
+      `has_more=True`, additional matching AlertEvents remain beyond this page and
+      callers should resume with `after_cursor=summary.next_cursor`.
     """
 
     dry_run: bool
@@ -66,6 +85,8 @@ class CorrelationRunSummary:
     retrieval_errors: int
     incomplete_evaluations: int
     batches_committed: int
+    has_more: bool = False
+    next_cursor: Optional[AlertSelectionCursor] = None
 
 
 def run_alert_flow_correlation(
@@ -77,10 +98,23 @@ def run_alert_flow_correlation(
     only_uncorrelated: bool = False,
     max_alerts: int = 1000,
     batch_size: int = 100,
+    after_cursor: Optional[Union[AlertSelectionCursor, str]] = None,
     dry_run: bool = False,
     driver=None,
 ) -> CorrelationRunSummary:
     """Select bounded Suricata AlertEvents and run Phase 4A + 4B correlation reconciliation.
+
+    Pagination & Coverage Contract:
+    - When `event_ids` is omitted, selects up to `max_alerts` Suricata AlertEvents in
+      deterministic order `(timestamp_epoch_ns IS NULL ASC, timestamp_epoch_ns ASC, event_id ASC)`
+      starting strictly after `after_cursor` (if provided).
+    - Returns `has_more=True` and a deterministic `next_cursor` whenever additional
+      matching alerts exist beyond the evaluated page; never silently claims full
+      workspace coverage on a limited page.
+    - Passing `event_ids` with more than `max_alerts` distinct IDs raises `ValueError`
+      (explicit selections are never silently truncated).
+    - `only_uncorrelated=True` is intended only for incremental correlation of newly
+      ingested unlinked alerts and is unsuitable for stale-edge revalidation.
 
     Multi-batch progress semantics:
     Each batch of up to `batch_size` AlertEvents commits in its own managed Neo4j
@@ -100,6 +134,17 @@ def run_alert_flow_correlation(
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
 
+    parsed_cursor: Optional[AlertSelectionCursor] = None
+    if after_cursor is not None:
+        if isinstance(after_cursor, AlertSelectionCursor):
+            parsed_cursor = after_cursor
+        elif isinstance(after_cursor, str):
+            parsed_cursor = AlertSelectionCursor.from_token(after_cursor)
+        else:
+            raise ValueError(
+                f"after_cursor must be an AlertSelectionCursor, token str, or None, got {after_cursor!r}"
+            )
+
     norm_domain: Optional[str] = None
     if routing_domain_id is not None:
         if not isinstance(routing_domain_id, str) or not routing_domain_id.strip():
@@ -118,6 +163,8 @@ def run_alert_flow_correlation(
 
     explicit_ids: Optional[List[str]] = None
     if event_ids is not None:
+        if parsed_cursor is not None:
+            raise ValueError("after_cursor cannot be combined with explicit event_ids")
         dedup_ids: List[str] = []
         seen = set()
         for raw_id in event_ids:
@@ -127,7 +174,13 @@ def run_alert_flow_correlation(
             if clean_id not in seen:
                 seen.add(clean_id)
                 dedup_ids.append(clean_id)
-        explicit_ids = dedup_ids[:max_alerts]
+        if len(dedup_ids) > max_alerts:
+            raise ValueError(
+                f"Explicit event_ids count ({len(dedup_ids)}) exceeds max_alerts ({max_alerts}). "
+                "Increase max_alerts or split event_ids into smaller batches; explicit selections "
+                "are never silently truncated."
+            )
+        explicit_ids = dedup_ids
 
     owns_driver = driver is None
     active_driver = driver
@@ -145,6 +198,8 @@ def run_alert_flow_correlation(
     retrieval_errors = 0
     incomplete_evaluations = 0
     batches_committed = 0
+    has_more = False
+    next_cursor: Optional[AlertSelectionCursor] = None
 
     try:
         if owns_driver:
@@ -155,19 +210,26 @@ def run_alert_flow_correlation(
             )
 
         active_driver.verify_connectivity()
-        ensure_schema(active_driver)
+        if dry_run:
+            # Strict read-only preflight: never executes CREATE/DROP CONSTRAINT or INDEX DDL.
+            verify_schema_read_only(active_driver)
+        else:
+            ensure_schema(active_driver)
 
         repo = Neo4jCorrelationRepository(active_driver)
-        selected_ids = (
-            explicit_ids
-            if explicit_ids is not None
-            else repo.list_correlatable_alert_event_ids(
+        if explicit_ids is not None:
+            selected_ids = explicit_ids
+        else:
+            page = repo.list_correlatable_alert_page(
                 routing_domain_id=norm_domain,
                 sensor_id=norm_sensor,
                 only_uncorrelated=only_uncorrelated,
                 max_alerts=max_alerts,
+                after_cursor=parsed_cursor,
             )
-        )
+            selected_ids = list(page.event_ids)
+            has_more = page.has_more
+            next_cursor = page.next_cursor
 
         for batch_ids in chunk_list(selected_ids, batch_size):
             try:
@@ -219,6 +281,8 @@ def run_alert_flow_correlation(
         retrieval_errors=retrieval_errors,
         incomplete_evaluations=incomplete_evaluations,
         batches_committed=batches_committed,
+        has_more=has_more,
+        next_cursor=next_cursor,
     )
 
 
@@ -238,7 +302,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--only-uncorrelated",
         action="store_true",
-        help="Evaluate only AlertEvents currently lacking outgoing CORRELATED_WITH edges.",
+        help=(
+            "Evaluate only AlertEvents currently lacking outgoing CORRELATED_WITH edges "
+            "(unsuitable for stale-edge revalidation)."
+        ),
+    )
+    parser.add_argument(
+        "--after-cursor",
+        default=None,
+        help="Serialized JSON keyset continuation cursor token from a prior page's next_cursor.",
     )
     parser.add_argument(
         "--max-alerts",
@@ -311,12 +383,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             only_uncorrelated=args.only_uncorrelated,
             max_alerts=args.max_alerts,
             batch_size=args.batch_size,
+            after_cursor=args.after_cursor,
             dry_run=args.dry_run,
         )
     except (
         ValueError,
         LookupError,
         MigrationRequiredError,
+        SchemaNotReadyError,
         EnvironmentError,
     ) as exc:
         logger.error("Correlation runner failed: %s", exc)
@@ -344,6 +418,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "retrieval_errors": summary.retrieval_errors,
         "incomplete_evaluations": summary.incomplete_evaluations,
         "batches_committed": summary.batches_committed,
+        "has_more": summary.has_more,
+        "next_cursor": summary.next_cursor.to_token() if summary.next_cursor is not None else None,
     }
     print(json.dumps(output, indent=2))
     return 0

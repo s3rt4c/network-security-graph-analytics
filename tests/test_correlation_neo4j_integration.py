@@ -28,10 +28,13 @@ from src.correlation import (
 from src.graph.correlation_repository import (
     CYPHER_RETRIEVE_CANDIDATES_BY_CID,
     CYPHER_RETRIEVE_CANDIDATES_BY_ENDPOINTS,
+    VERIFICATION_STATUS_UNVERIFIED_INCOMPLETE,
+    VERIFICATION_STATUS_VERIFIED,
+    AlertSelectionCursor,
     Neo4jCorrelationRepository,
 )
 from src.graph.repository import Neo4jRepository
-from src.graph.schema import ensure_schema
+from src.graph.schema import MigrationRequiredError, SchemaNotReadyError, ensure_schema
 from src.ingestion.community_id import compute_community_id
 from src.ingestion.models import AlertRecord, TrafficRecord
 from src.ingestion.v2_models import (
@@ -43,7 +46,6 @@ from src.ingestion.v2_models import (
     compute_v2_flow_key,
     scoped_ip_id,
 )
-from src.graph.schema import MigrationRequiredError
 from src.services.correlation_service import run_alert_flow_correlation
 
 pytestmark = pytest.mark.integration
@@ -643,16 +645,40 @@ def test_k_candidate_cap_overflow_fails_closed(live_driver):
         res1 = run_alert_flow_correlation(event_ids=[a.event_id], policy=pol_cap2, driver=live_driver)
         assert res1.strong == 1
         assert res1.correlations_created == 1
-        assert len(_edge_rows(live_driver, a.event_id)) == 1
+        edges1 = _edge_rows(live_driver, a.event_id)
+        assert len(edges1) == 1
+        orig_digest = edges1[0]["props"]["evidence_digest"]
+        assert edges1[0]["props"]["verification_status"] == VERIFICATION_STATUS_VERIFIED
 
-        # Step 2: Ingest f2 & f3 so candidate set (3) > cap (2) -> TRUNCATED, preserves existing edge as unverified
+        # Step 2: Ingest f2 & f3 so candidate set (3) > cap (2) -> TRUNCATED preserves edge & digest,
+        # marks verification_status='unverified_incomplete' cleanly for downstream readers.
         _seed(live_driver, [], [f2, f3])
         res2 = run_alert_flow_correlation(event_ids=[a.event_id], policy=pol_cap2, driver=live_driver)
         assert res2.insufficient == 1
         assert res2.candidate_cap_exceeded == 1
         assert res2.incomplete_evaluations == 1
         assert res2.stale_correlations_removed == 0
-        assert len(_edge_rows(live_driver, a.event_id)) == 1
+
+        corr_repo = Neo4jCorrelationRepository(live_driver)
+        corrs_all = corr_repo.get_alert_correlations(a.event_id, include_unverified=True)
+        assert len(corrs_all) == 1
+        assert corrs_all[0]["evidence_digest"] == orig_digest
+        assert corrs_all[0]["verification_status"] == VERIFICATION_STATUS_UNVERIFIED_INCOMPLETE
+        assert corrs_all[0]["last_incomplete_reason"] == "CANDIDATE_SET_TRUNCATED"
+        assert corr_repo.get_alert_correlations(a.event_id, include_unverified=False) == []
+
+        # Step 3: Re-run with cap=10 -> COMPLETE evaluation clears unverified flag back to 'verified'
+        res3 = run_alert_flow_correlation(
+            event_ids=[a.event_id],
+            policy=CorrelationPolicy(candidate_cap=10),
+            driver=live_driver,
+        )
+        assert res3.strong == 1
+        assert res3.correlations_updated == 1
+        corrs_verified = corr_repo.get_alert_correlations(a.event_id, include_unverified=False)
+        assert len(corrs_verified) == 1
+        assert corrs_verified[0]["verification_status"] == VERIFICATION_STATUS_VERIFIED
+        assert corrs_verified[0]["last_incomplete_reason"] is None
     finally:
         _cleanup_test_entities(
             live_driver,
@@ -1032,5 +1058,226 @@ def test_t_concurrent_correlation_workers_and_migration_guard(live_driver):
             obs_ids=[f1.observation_id, f2.observation_id],
             def_ids=[a1.alert_definition_id, a2.alert_definition_id],
             scoped_ids=[a1.src_scoped_id, a1.dst_scoped_id, a2.src_scoped_id, a2.dst_scoped_id],
+            domain_ids=[dom],
+        )
+
+
+def test_u_dry_run_missing_schema_fails_without_ddl_and_write_mode_recovers(live_driver):
+    """TEST U: Dry-run against missing schema fails with SchemaNotReadyError without running DDL; write mode initializes schema."""
+    dom = "it-4b-u"
+    a = _make_alert(tag="u", domain=dom)
+    f = _make_flow(tag="u", domain=dom)
+    _seed(live_driver, [a], [f])
+
+    target_index = "flow_observation_community_id_index"
+
+    def _index_exists() -> bool:
+        with live_driver.session() as session:
+            names = {
+                str(rec["name"])
+                for rec in session.run("SHOW INDEXES YIELD name RETURN name")
+                if rec.get("name") is not None
+            }
+        return target_index in names
+
+    try:
+        with live_driver.session() as session:
+            session.run(f"DROP INDEX {target_index} IF EXISTS").consume()
+        assert _index_exists() is False
+
+        # Dry-run must fail clearly with SchemaNotReadyError and MUST NOT recreate the index or write edges
+        with pytest.raises(SchemaNotReadyError) as exc_info:
+            run_alert_flow_correlation(routing_domain_id=dom, dry_run=True, driver=live_driver)
+        assert target_index in exc_info.value.missing_indexes
+        assert _index_exists() is False
+        assert _edge_rows(live_driver, a.event_id) == []
+
+        # Normal write mode runs ensure_schema(), restores the index, and persists the correlation
+        write_sum = run_alert_flow_correlation(routing_domain_id=dom, dry_run=False, driver=live_driver)
+        assert _index_exists() is True
+        assert write_sum.strong == 1
+        assert write_sum.correlations_created == 1
+        assert len(_edge_rows(live_driver, a.event_id)) == 1
+
+        # Subsequent dry-run on initialized schema succeeds with zero writes
+        dry_ok = run_alert_flow_correlation(routing_domain_id=dom, dry_run=True, driver=live_driver)
+        assert dry_ok.dry_run is True
+        assert dry_ok.strong == 1
+        assert dry_ok.correlations_created == 0
+        assert dry_ok.batches_committed == 0
+    finally:
+        ensure_schema(live_driver)
+        _cleanup_test_entities(
+            live_driver,
+            event_ids=[a.event_id],
+            obs_ids=[f.observation_id],
+            def_ids=[a.alert_definition_id],
+            scoped_ids=[a.src_scoped_id, a.dst_scoped_id],
+            domain_ids=[dom],
+        )
+
+
+def test_v_keyset_pagination_beyond_max_alerts_identical_and_null_timestamps(live_driver):
+    """TEST V: Keyset continuation paginates > max_alerts across identical and NULL timestamps with zero skips or duplicates."""
+    dom = "it-4b-v"
+    ts_same = Decimal("1795205000")
+    ts_later = Decimal("1795205010")
+
+    alerts = [
+        _make_alert(tag="v1", domain=dom, src_ip="192.0.2.101", dst_ip="198.51.100.101", timestamp_source="2026-11-20T20:03:20+0000", timestamp_epoch_decimal=ts_same),
+        _make_alert(tag="v2", domain=dom, src_ip="192.0.2.102", dst_ip="198.51.100.102", timestamp_source="2026-11-20T20:03:20+0000", timestamp_epoch_decimal=ts_same),
+        _make_alert(tag="v3", domain=dom, src_ip="192.0.2.103", dst_ip="198.51.100.103", timestamp_source="2026-11-20T20:03:20+0000", timestamp_epoch_decimal=ts_same),
+        _make_alert(tag="v4", domain=dom, src_ip="192.0.2.104", dst_ip="198.51.100.104", timestamp_source="2026-11-20T20:03:30+0000", timestamp_epoch_decimal=ts_later),
+        _make_alert(tag="v5", domain=dom, src_ip="192.0.2.105", dst_ip="198.51.100.105", timestamp_source="2026-11-20T20:03:30+0000", timestamp_epoch_decimal=ts_later),
+        _make_alert(tag="v6-naive", domain=dom, src_ip="192.0.2.106", dst_ip="198.51.100.106", timestamp_source="2026-11-20T20:03:40", timestamp_epoch_decimal=None),
+        _make_alert(tag="v7-naive", domain=dom, src_ip="192.0.2.107", dst_ip="198.51.100.107", timestamp_source="2026-11-20T20:03:41", timestamp_epoch_decimal=None),
+    ]
+    flows = [
+        _make_flow(tag=f"v{i}", domain=dom, src_ip=a.src_ip, dst_ip=a.dst_ip, start_epoch=Decimal("1795204990"), end_epoch=Decimal("1795205020"), duration=Decimal("30"))
+        for i, a in enumerate(alerts, start=1)
+    ]
+    _seed(live_driver, alerts, flows)
+
+    try:
+        repo = Neo4jCorrelationRepository(live_driver)
+        expected_order = sorted(
+            [a.event_id for a in alerts[:3]]
+        ) + sorted(
+            [a.event_id for a in alerts[3:5]]
+        ) + sorted(
+            [a.event_id for a in alerts[5:]]
+        )
+
+        # 1. Inspect exact keyset page order across 4 pages (max_alerts=2)
+        paged_ids: List[str] = []
+        cursor: Optional[AlertSelectionCursor] = None
+        page_count = 0
+        while True:
+            page = repo.list_correlatable_alert_page(
+                routing_domain_id=dom, max_alerts=2, after_cursor=cursor
+            )
+            paged_ids.extend(page.event_ids)
+            page_count += 1
+            if not page.has_more:
+                assert page.next_cursor is None
+                break
+            assert page.next_cursor is not None
+            cursor = AlertSelectionCursor.from_token(page.next_cursor.to_token())
+
+        assert page_count == 4
+        assert paged_ids == expected_order
+
+        # 2. Run correlation runner across all pages (max_alerts=2) and verify full coverage
+        total_eval = 0
+        total_strong = 0
+        total_insuff = 0
+        total_created = 0
+        run_cursor: Optional[AlertSelectionCursor] = None
+        while True:
+            s = run_alert_flow_correlation(
+                routing_domain_id=dom,
+                max_alerts=2,
+                batch_size=2,
+                after_cursor=run_cursor,
+                driver=live_driver,
+            )
+            total_eval += s.alerts_evaluated
+            total_strong += s.strong
+            total_insuff += s.insufficient
+            total_created += s.correlations_created
+            if not s.has_more:
+                assert s.next_cursor is None
+                break
+            assert s.next_cursor is not None
+            run_cursor = s.next_cursor
+
+        assert total_eval == 7
+        assert total_strong == 5
+        assert total_insuff == 2
+        assert total_created == 5
+        for a in alerts[:5]:
+            assert len(_edge_rows(live_driver, a.event_id)) == 1
+        for a in alerts[5:]:
+            assert _edge_rows(live_driver, a.event_id) == []
+    finally:
+        _cleanup_test_entities(
+            live_driver,
+            event_ids=[a.event_id for a in alerts],
+            obs_ids=[f.observation_id for f in flows],
+            def_ids=sorted({a.alert_definition_id for a in alerts}),
+            scoped_ids=sorted({a.src_scoped_id for a in alerts} | {a.dst_scoped_id for a in alerts}),
+            domain_ids=[dom],
+        )
+
+
+def test_w_only_uncorrelated_progress_and_explicit_event_ids_limit(live_driver):
+    """TEST W: only_uncorrelated advances past permanently uncorrelated alerts via cursor, and oversized explicit event_ids raise."""
+    dom = "it-4b-w"
+    a1 = _make_alert(tag="w1", domain=dom, src_ip="192.0.2.111", dst_ip="198.51.100.111", timestamp_source="2026-11-20T20:10:01+0000", timestamp_epoch_decimal=Decimal("1795205401"))
+    a2 = _make_alert(tag="w2", domain=dom, src_ip="192.0.2.112", dst_ip="198.51.100.112", timestamp_source="2026-11-20T20:10:02+0000", timestamp_epoch_decimal=Decimal("1795205402"))
+    a3 = _make_alert(tag="w3", domain=dom, src_ip="192.0.2.113", dst_ip="198.51.100.113", timestamp_source="2026-11-20T20:10:03+0000", timestamp_epoch_decimal=Decimal("1795205403"))
+    a4 = _make_alert(tag="w4", domain=dom, src_ip="192.0.2.114", dst_ip="198.51.100.114", timestamp_source="2026-11-20T20:10:04+0000", timestamp_epoch_decimal=Decimal("1795205404"))
+
+    f1 = _make_flow(tag="w1", domain=dom, src_ip=a1.src_ip, dst_ip=a1.dst_ip, start_epoch=Decimal("1795205390"), end_epoch=Decimal("1795205420"), duration=Decimal("30"))
+    # a2 has two overlapping matching flows -> permanently AMBIGUOUS (stays uncorrelated!)
+    f2a = _make_flow(tag="w2a", domain=dom, src_ip=a2.src_ip, dst_ip=a2.dst_ip, start_epoch=Decimal("1795205390"), end_epoch=Decimal("1795205420"), duration=Decimal("30"))
+    f2b = _make_flow(tag="w2b", domain=dom, src_ip=a2.src_ip, dst_ip=a2.dst_ip, start_epoch=Decimal("1795205395"), end_epoch=Decimal("1795205425"), duration=Decimal("30"))
+    # a3 has zero matching flows -> REJECTED (stays uncorrelated!)
+    # a4 has one valid match -> STRONG
+    f4 = _make_flow(tag="w4", domain=dom, src_ip=a4.src_ip, dst_ip=a4.dst_ip, start_epoch=Decimal("1795205390"), end_epoch=Decimal("1795205420"), duration=Decimal("30"))
+
+    alerts = [a1, a2, a3, a4]
+    flows = [f1, f2a, f2b, f4]
+    _seed(live_driver, alerts, flows)
+
+    try:
+        # Explicit event_ids exceeding max_alerts MUST fail clearly rather than silently dropping IDs
+        with pytest.raises(ValueError, match="exceeds max_alerts"):
+            run_alert_flow_correlation(
+                event_ids=[a.event_id for a in alerts],
+                max_alerts=2,
+                driver=live_driver,
+            )
+
+        # Page 1 (only_uncorrelated=True, max_alerts=2): evaluates a1 (STRONG) and a2 (AMBIGUOUS)
+        p1 = run_alert_flow_correlation(
+            routing_domain_id=dom,
+            only_uncorrelated=True,
+            max_alerts=2,
+            driver=live_driver,
+        )
+        assert p1.alerts_evaluated == 2
+        assert p1.strong == 1
+        assert p1.ambiguous == 1
+        assert p1.correlations_created == 1
+        assert p1.has_more is True
+        assert p1.next_cursor is not None
+
+        # Page 2 advances strictly past a2 (despite a2 remaining uncorrelated!) to evaluate a3 and a4
+        p2 = run_alert_flow_correlation(
+            routing_domain_id=dom,
+            only_uncorrelated=True,
+            max_alerts=2,
+            after_cursor=p1.next_cursor,
+            driver=live_driver,
+        )
+        assert p2.alerts_evaluated == 2
+        assert p2.rejected == 1
+        assert p2.strong == 1
+        assert p2.correlations_created == 1
+        assert p2.has_more is False
+        assert p2.next_cursor is None
+
+        assert len(_edge_rows(live_driver, a1.event_id)) == 1
+        assert _edge_rows(live_driver, a2.event_id) == []
+        assert _edge_rows(live_driver, a3.event_id) == []
+        assert len(_edge_rows(live_driver, a4.event_id)) == 1
+    finally:
+        _cleanup_test_entities(
+            live_driver,
+            event_ids=[a.event_id for a in alerts],
+            obs_ids=[f.observation_id for f in flows],
+            def_ids=sorted({a.alert_definition_id for a in alerts}),
+            scoped_ids=sorted({a.src_scoped_id for a in alerts} | {a.dst_scoped_id for a in alerts}),
             domain_ids=[dom],
         )

@@ -7,7 +7,7 @@ and routing domains.
 """
 
 import logging
-from typing import List, Dict, Any, Optional
+from typing import Iterable, List, Dict, Any, Optional, Tuple
 from src.ingestion.v2_models import scoped_ip_id
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,50 @@ class MigrationRequiredError(RuntimeError):
             or f"Database contains {unmigrated_count} legacy V1 IPAddress node(s) lacking scoped_id. "
             "Run migrate_ip_identity_to_scoped(driver) before applying V2 schema or writing records."
         )
+
+
+class SchemaNotReadyError(RuntimeError):
+    """Raised by read-only preflight checks when required V2 schema objects are missing or failed."""
+
+    def __init__(
+        self,
+        *,
+        missing_constraints: Iterable[str] = (),
+        missing_indexes: Iterable[str] = (),
+        failed_indexes: Iterable[str] = (),
+        message: Optional[str] = None,
+    ):
+        self.missing_constraints = tuple(sorted(set(missing_constraints)))
+        self.missing_indexes = tuple(sorted(set(missing_indexes)))
+        self.failed_indexes = tuple(sorted(set(failed_indexes)))
+        parts: List[str] = []
+        if self.missing_constraints:
+            parts.append(f"missing constraints: {', '.join(self.missing_constraints)}")
+        if self.missing_indexes:
+            parts.append(f"missing indexes: {', '.join(self.missing_indexes)}")
+        if self.failed_indexes:
+            parts.append(f"failed indexes: {', '.join(self.failed_indexes)}")
+        detail = "; ".join(parts) if parts else "required V2 schema objects unavailable"
+        super().__init__(
+            message
+            or f"Neo4j schema is not ready for read-only execution ({detail}). "
+            "Initialize schema with ensure_schema(driver) before running dry-run."
+        )
+
+
+REQUIRED_CORRELATION_CONSTRAINTS: Tuple[str, ...] = (
+    "routing_domain_unique",
+    "ip_scoped_unique",
+    "flow_observation_unique",
+    "alert_event_unique",
+)
+
+REQUIRED_CORRELATION_INDEXES: Tuple[str, ...] = (
+    "flow_observation_community_id_index",
+    "flow_observation_routing_domain_index",
+    "alert_event_routing_domain_index",
+    "alert_event_timestamp_epoch_ns_index",
+)
 
 
 # Legacy constraints to drop during schema migration / initialization
@@ -191,6 +235,74 @@ def ensure_schema(driver) -> None:
                 result.consume()
 
     logger.info("Neo4j graph schema constraints and indexes verified.")
+
+
+def verify_schema_read_only(
+    driver,
+    *,
+    required_constraints: Iterable[str] = REQUIRED_CORRELATION_CONSTRAINTS,
+    required_indexes: Iterable[str] = REQUIRED_CORRELATION_INDEXES,
+) -> None:
+    """Verify V2 schema readiness using strictly read-only Neo4j queries (zero DDL, zero writes).
+
+    Intended for dry-run preflight checks where executing CREATE/DROP CONSTRAINT or
+    CREATE INDEX statements would violate read-only guarantees.
+
+    Raises:
+        MigrationRequiredError: If unmigrated legacy V1 IPAddress nodes exist.
+        SchemaNotReadyError: If any required constraint or index is missing or in FAILED state.
+    """
+    req_constraints = tuple(required_constraints)
+    req_indexes = tuple(required_indexes)
+
+    def _check_unmigrated(tx) -> int:
+        check_res = tx.run(
+            "MATCH (ip:IPAddress) "
+            "WHERE ip.scoped_id IS NULL OR trim(toString(ip.scoped_id)) = '' "
+            "RETURN count(ip) AS unmigrated_count"
+        )
+        return _extract_int_field(check_res, "unmigrated_count")
+
+    def _read_constraints(tx) -> set:
+        return {
+            str(rec["name"])
+            for rec in tx.run("SHOW CONSTRAINTS YIELD name RETURN name")
+            if rec.get("name") is not None
+        }
+
+    def _read_indexes(tx) -> Dict[str, str]:
+        found: Dict[str, str] = {}
+        for rec in tx.run("SHOW INDEXES YIELD name, state RETURN name, state"):
+            name = rec.get("name")
+            if name is not None:
+                state = str(rec.get("state") or "ONLINE").upper()
+                found[str(name)] = state
+        return found
+
+    with driver.session() as session:
+        # Execute data read and schema introspection in separate read-only transactions
+        # because Neo4j 5.x forbids mixing data reads and schema reads in one transaction.
+        unmigrated_count = session.execute_read(_check_unmigrated)
+        if unmigrated_count > 0:
+            raise MigrationRequiredError(unmigrated_count)
+
+        existing_constraints = session.execute_read(_read_constraints)
+        existing_indexes = session.execute_read(_read_indexes)
+
+    missing_constraints = [c for c in req_constraints if c not in existing_constraints]
+    missing_indexes = [idx for idx in req_indexes if idx not in existing_indexes]
+    failed_indexes = [
+        idx
+        for idx in req_indexes
+        if idx in existing_indexes and existing_indexes[idx] == "FAILED"
+    ]
+
+    if missing_constraints or missing_indexes or failed_indexes:
+        raise SchemaNotReadyError(
+            missing_constraints=missing_constraints,
+            missing_indexes=missing_indexes,
+            failed_indexes=failed_indexes,
+        )
 
 
 def migrate_ip_identity_to_scoped(driver, default_domain: str = "default") -> Dict[str, Any]:
