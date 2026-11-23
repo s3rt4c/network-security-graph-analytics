@@ -44,7 +44,8 @@ Wait until the container healthcheck reports `healthy` (`17474` HTTP, `17687` Bo
 
 > **Safety Notice:**
 > - Credentials in [compose.yaml](../compose.yaml) (`neo4j` / `phase6-test-password`) are **strictly test-only defaults for disposable local containers** and must never be used in production.
-> - **Never** run unrestricted cleanup commands such as `MATCH (n) DETACH DELETE n` against an unverified or shared Neo4j database. Configure dedicated test variables pointing only to `bolt://localhost:17687`.
+> - **Never** point `NEO4J_TEST_URI` at a remote, shared, or production database, and **never** run unrestricted cleanup commands such as `MATCH (n) DETACH DELETE n` against an unverified or shared Neo4j database.
+> - Both `scripts/v2_browser_smoke.py` and `tests/test_v2_end_to_end_integration.py` enforce fail-closed loopback-only URI checks (`localhost`, `127.0.0.1`, `::1`). In addition, `scripts/v2_browser_smoke.py` refuses to execute against any non-empty database (`MATCH (n) RETURN count(n)` must equal `0`) and refuses to proceed if local ports `127.0.0.1:8000` or `127.0.0.1:5173` are already occupied.
 
 Configure session-local environment variables (do not commit credentials to `.env` if shared):
 
@@ -100,7 +101,7 @@ All fixtures reside under [`tests/fixtures/demo_v2/`](../tests/fixtures/demo_v2/
 
 ## 5. Ingestion & Correlation CLI Commands
 
-Run each V2 service CLI from the repository root (note: V2 ingestion automatically runs `ensure_schema(driver)` and refuses unmigrated legacy databases with `MigrationRequiredError`):
+Run each V2 service CLI from the repository root (note: V2 ingestion automatically runs `ensure_schema(driver)` and refuses unmigrated legacy databases with `MigrationRequiredError`; on Windows PowerShell, replace `\` line continuations with PowerShell backticks `` ` `` or run each command on a single line):
 
 ```bash
 # 1. Ingest Zeek conn.log JSONL into demo-v2-corp and demo-v2-branch
@@ -160,6 +161,8 @@ python -m src.services.correlation_service --routing-domain-id demo-v2-branch
 
 To exercise **Scenario E** (`unverified_incomplete` preservation) and **Scenario F** (stale edge deletion):
 
+> **UI Walkthrough Ordering Note:** If you plan to manually inspect the `Previously Verified — Current Check Incomplete` badge and warning banner in the React UI (Section 9, Step 7), pause after **Scenario E** (`--candidate-cap 1`) to inspect the UI, then return here to execute **Scenario F** (complete reevaluation), which removes the stale edge.
+
 ```bash
 # Ingest the competing rival flow in demo-v2-corp (1 new FlowObservation)
 python -m src.services.zeek_ingestion \
@@ -168,12 +171,16 @@ python -m src.services.zeek_ingestion \
   --routing-domain-id demo-v2-corp \
   --source-provenance phase4e-corp-rival-zeek
 
-# Obtain the Alert EF event_id (sid=9100005), then run with --candidate-cap 1 to simulate truncated lookup:
+# Obtain <ALERT_EF_EVENT_ID> (the AlertEvent for sid=9100005 / zeek_uid=CDemoCorpLifecycle01)
+# via read-only Cypher (`MATCH (ae:AlertEvent {routing_domain_id: 'demo-v2-corp', sid: 9100005}) RETURN ae.event_id`)
+# or via `GET /api/v1/correlations/alert-flows?routing_domain_id=demo-v2-corp`.
+
+# Scenario E — run with --candidate-cap 1 to trigger genuine truncated candidate retrieval:
 python -m src.services.correlation_service --candidate-cap 1 --event-id "<ALERT_EF_EVENT_ID>"
 # Result: incomplete_evaluations=1, candidate_cap_exceeded=1, stale_correlations_removed=0
 # Existing edge is preserved with verification_status="unverified_incomplete" and last_incomplete_reason="CANDIDATE_CAP_TRUNCATED".
 
-# Re-run with complete candidate retrieval (default candidate_cap=200):
+# Scenario F — re-run with complete candidate retrieval (default candidate_cap=200):
 python -m src.services.correlation_service --event-id "<ALERT_EF_EVENT_ID>"
 # Result: ambiguous=1, stale_correlations_removed=1 (stale edge removed).
 ```
@@ -236,8 +243,9 @@ Manual walkthrough at `http://localhost:5173`:
 7. Click **Reset**, check **Include unverified correlations**, and click **Apply Filters** to inspect any `Previously Verified — Current Check Incomplete` edges and explanatory warning banner.
 8. Switch back to **Legacy Correlations** to verify legacy V1 remains functional and unaffected.
 
-Automated real-stack headless Chromium verification (when Playwright Chromium + disposable `neo4j-test` are available):
+Automated real-stack headless Chromium verification (requires Playwright Chromium, an **empty** disposable `neo4j-test` container, and unoccupied local ports `127.0.0.1:8000` and `127.0.0.1:5173`):
 
+**Bash / macOS / Linux:**
 ```bash
 RUN_NEO4J_INTEGRATION=1 \
 NEO4J_TEST_URI=bolt://localhost:17687 \
@@ -246,13 +254,32 @@ NEO4J_TEST_PASSWORD=phase6-test-password \
 python scripts/v2_browser_smoke.py
 ```
 
-And automated pytest integration suite against disposable Neo4j:
+**PowerShell (Windows):**
+```powershell
+$env:RUN_NEO4J_INTEGRATION = "1"
+$env:NEO4J_TEST_URI = "bolt://localhost:17687"
+$env:NEO4J_TEST_USERNAME = "neo4j"
+$env:NEO4J_TEST_PASSWORD = "phase6-test-password"
+python scripts/v2_browser_smoke.py
+```
 
+And automated pytest integration suite against disposable local Neo4j (uses isolated per-run `demo-v2-*-<run_id>` domains and owned-only cleanup):
+
+**Bash / macOS / Linux:**
 ```bash
 RUN_NEO4J_INTEGRATION=1 \
 NEO4J_TEST_URI=bolt://localhost:17687 \
 NEO4J_TEST_USERNAME=neo4j \
 NEO4J_TEST_PASSWORD=phase6-test-password \
+python -m pytest tests/test_v2_end_to_end_integration.py -m integration -v
+```
+
+**PowerShell (Windows):**
+```powershell
+$env:RUN_NEO4J_INTEGRATION = "1"
+$env:NEO4J_TEST_URI = "bolt://localhost:17687"
+$env:NEO4J_TEST_USERNAME = "neo4j"
+$env:NEO4J_TEST_PASSWORD = "phase6-test-password"
 python -m pytest tests/test_v2_end_to_end_integration.py -m integration -v
 ```
 
@@ -267,28 +294,32 @@ Re-running any of the Zeek ingestion, Suricata ingestion, or `correlation_servic
 
 ---
 
-## 11. Scoped Cleanup Instructions
+## 11. Scoped Cleanup Instructions (Disposable Demo Database Only)
 
-Remove **only** synthetic `demo-v2-*` entities from Neo4j (safe alongside other data):
+> **Warning:** Run these cleanup statements **only against your disposable local demo Neo4j container** (`bolt://localhost:17687`). Never run manual deletion queries against a shared or production database.
+
+Remove **only** synthetic `demo-v2-corp` and `demo-v2-branch` entities while preserving any `IPAddress` or `RoutingDomain` still participating in unrelated V1/V2 relationships:
 
 ```cypher
 MATCH (ae:AlertEvent) WHERE ae.routing_domain_id IN ['demo-v2-corp', 'demo-v2-branch'] DETACH DELETE ae;
 MATCH (fo:FlowObservation) WHERE fo.routing_domain_id IN ['demo-v2-corp', 'demo-v2-branch'] DETACH DELETE fo;
 MATCH (ip:IPAddress)
-WHERE (ip.routing_domain_id IN ['demo-v2-corp', 'demo-v2-branch']
-       OR ip.scoped_id STARTS WITH 'demo-v2-corp#'
-       OR ip.scoped_id STARTS WITH 'demo-v2-branch#')
-  AND NOT ((ip)--(:AlertFact))
-  AND NOT ((:FlowObservation)-->(ip))
-  AND NOT ((:AlertEvent)-->(ip))
+WHERE ip.routing_domain_id IN ['demo-v2-corp', 'demo-v2-branch']
+   OR ip.scoped_id STARTS WITH 'demo-v2-corp#'
+   OR ip.scoped_id STARTS WITH 'demo-v2-branch#'
+OPTIONAL MATCH (ip)-[r]-() WHERE type(r) <> 'IN_DOMAIN'
+WITH ip, count(r) AS other_rels
+WHERE other_rels = 0
 DETACH DELETE ip;
 MATCH (ad:AlertDefinition {ruleset_namespace: 'demo-v2-rules'})
 WHERE NOT (()-[:TRIGGERED_RULE]->(ad))
 DETACH DELETE ad;
 MATCH (rd:RoutingDomain)
 WHERE rd.domain_id IN ['demo-v2-corp', 'demo-v2-branch']
-  AND NOT ((:IPAddress)-[:IN_DOMAIN]->(rd))
-DETACH DELETE rd;
+OPTIONAL MATCH (rd)-[r]-()
+WITH rd, count(r) AS rels
+WHERE rels = 0
+DELETE rd;
 ```
 
 Then stop and remove the disposable test container:
@@ -310,11 +341,13 @@ docker compose down
 
 ## 13. Known Limitations
 
+- **Read-Only V2 UI & CLI-Driven V2 Ingestion:** The V2 browser interface and `/api/v1/correlations/alert-flows*` endpoints are strictly read-only. Zeek and Suricata V2 ingestion and Phase 4B correlation runs remain CLI/service operations; the legacy browser **Import Data** workflow does not ingest V2 logs.
 - **Persisted vs Real-Time Verification:** `verification_status` reflects the last stored Phase 4B evaluation, not live revalidation during read requests.
 - **Phase 4C API Field Scope:** V2 correlation responses expose correlation IDs, verification state, and factual evidence fields only — not source/destination IPs, transport ports, full Suricata alert signatures, full Zeek flow bytes/packets, or unpersisted Phase 4A candidate reason arrays.
-- **Read Committed Isolation:** Concurrent ingestion and multi-page count/item API reads can observe committed changes between queries.
-- **Authentication / RBAC:** External multi-user auth/authorization is outside Phases 3A–4E.
-- **Small Synthetic Dataset:** Validates semantic correctness and workflow wiring, not high-volume throughput.
+- **Read Committed Isolation:** Neo4j Read Committed isolation does not provide cross-query snapshot isolation; concurrent ingestion and multi-page count/item API reads can observe committed changes between queries.
+- **Authentication / RBAC:** Multi-user authentication and role-based access control are not implemented in Phases 3A–4E.
+- **Small Synthetic Dataset:** Validates semantic correctness and workflow wiring, not production performance or high-volume telemetry throughput.
+- **Vite Development Server in Browser Smoke:** `scripts/v2_browser_smoke.py` and the CI `v2-browser-smoke` job exercise the Vite development server proxy against local `uvicorn`, not a hardened production reverse-proxy deployment serving static built assets.
 
 ---
 

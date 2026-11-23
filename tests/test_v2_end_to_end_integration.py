@@ -1,15 +1,21 @@
 """
 Live Neo4j 5.26 End-to-End Integration Validation for the Complete V2 Workflow (Phase 4E).
 
-Exercises the entire real pipeline against a disposable Neo4j instance:
+Exercises the entire real pipeline against a disposable local Neo4j instance:
   Synthetic Zeek conn.log JSONL + Suricata EVE JSONL
     -> real streaming parsers & V2 ingestion services/CLIs
     -> bounded keyset-paginated Phase 4A/4B correlation service
     -> Neo4j graph persistence & stale-edge reconciliation
     -> real FastAPI lifespan + read-only Phase 4C API endpoints
 
-Strictly opt-in via RUN_NEO4J_INTEGRATION=1 and NEO4J_TEST_* environment variables.
-All writes and cleanups are scoped strictly to dedicated `demo-v2-*` RoutingDomains.
+Safety Guarantees (Fail-Closed):
+  - Strictly opt-in via RUN_NEO4J_INTEGRATION=1 and NEO4J_TEST_* environment variables.
+  - Rejects any non-loopback NEO4J_TEST_URI host (allows only localhost, 127.0.0.1, ::1).
+  - Isolates each test run inside unique per-run `demo-v2-*-<run_id>` RoutingDomains
+    and ruleset namespaces, verifies zero pre-existing entities before writing, and
+    never executes unconditional pre-test `DETACH DELETE` against shared domains.
+  - Cleans up ONLY exact run-owned entity IDs in `try...finally`, preserving any
+    unrelated entities or V1/V2 relationships.
 """
 
 from __future__ import annotations
@@ -18,7 +24,9 @@ from decimal import Decimal
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Set
+from urllib.parse import urlparse
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,6 +35,10 @@ from neo4j.exceptions import AuthError, ServiceUnavailable
 
 from src.api.app import create_app
 from src.correlation import CorrelationPolicy
+from src.graph.correlation_repository import (
+    AlertSelectionCursor,
+    Neo4jCorrelationRepository,
+)
 from src.graph.schema import ensure_schema
 from src.ingestion.suricata_eve_parser import parse_suricata_eve_alert_file
 from src.ingestion.zeek_conn_parser import parse_zeek_conn_file
@@ -46,18 +58,66 @@ from src.services.zeek_ingestion import (
 pytestmark = pytest.mark.integration
 
 _DEMO_DIR = Path(__file__).resolve().parent / "fixtures" / "demo_v2"
-_CORP_DOMAIN = "demo-v2-corp"
-_BRANCH_DOMAIN = "demo-v2-branch"
-_TOL_DOMAIN = "demo-v2-tol"
-_ALL_DEMO_DOMAINS = [_CORP_DOMAIN, _BRANCH_DOMAIN, _TOL_DOMAIN]
-_DEMO_RULESET_NS = "demo-v2-rules"
 _ZEEK_SENSOR = "zeek-demo-01"
 _SURICATA_SENSOR = "suricata-demo-01"
+_ALLOWED_NEO4J_SCHEMES = frozenset({"bolt", "neo4j", "bolt+s", "bolt+ssc", "neo4j+s", "neo4j+ssc"})
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def validate_disposable_neo4j_uri(uri: str) -> str:
+    """Validate that a Neo4j URI targets only a local loopback disposable endpoint.
+
+    Never assumes a URI is disposable merely because its hostname contains 'test' or 'demo'.
+    """
+    if not isinstance(uri, str) or not uri.strip():
+        raise ValueError("NEO4J_TEST_URI must be a non-empty Bolt/Neo4j URI.")
+    cleaned = uri.strip()
+    parsed = urlparse(cleaned)
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_NEO4J_SCHEMES:
+        raise ValueError(
+            f"Unsupported NEO4J_TEST_URI scheme {parsed.scheme!r}. "
+            f"Allowed schemes: {sorted(_ALLOWED_NEO4J_SCHEMES)}."
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(
+            "NEO4J_TEST_URI must not contain embedded credentials; "
+            "pass credentials via NEO4J_TEST_USERNAME and NEO4J_TEST_PASSWORD."
+        )
+    host = (parsed.hostname or "").lower()
+    if host not in _LOOPBACK_HOSTS:
+        raise ValueError(
+            f"Refusing to run integration tests against non-loopback Neo4j host "
+            f"{parsed.hostname!r} (URI: {cleaned!r}). Only local loopback hosts "
+            f"{sorted(_LOOPBACK_HOSTS)} are permitted."
+        )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid port in NEO4J_TEST_URI {cleaned!r}: {exc}") from exc
+    if port is not None and not (1 <= port <= 65535):
+        raise ValueError(f"Out-of-range port in NEO4J_TEST_URI {cleaned!r}: {port}")
+
+    return cleaned
+
+
+def _make_run_scope() -> Dict[str, str]:
+    """Generate unique per-test RoutingDomain and ruleset namespace identifiers."""
+    tag = uuid.uuid4().hex[:8]
+    return {
+        "tag": tag,
+        "corp_domain": f"demo-v2-corp-{tag}",
+        "branch_domain": f"demo-v2-branch-{tag}",
+        "tol_domain": f"demo-v2-tol-{tag}",
+        "ruleset_ns": f"demo-v2-rules-{tag}",
+        "tol_ns": f"demo-v2-tol-ns-{tag}",
+    }
 
 
 @pytest.fixture(scope="module")
 def neo4j_test_config() -> Dict[str, str]:
-    """Require explicit opt-in and disposable NEO4J_TEST_* configuration."""
+    """Require explicit opt-in and validated local loopback NEO4J_TEST_* configuration."""
     if os.environ.get("RUN_NEO4J_INTEGRATION") != "1":
         pytest.skip("Live Neo4j integration tests disabled (set RUN_NEO4J_INTEGRATION=1 to enable)")
 
@@ -68,7 +128,11 @@ def neo4j_test_config() -> Dict[str, str]:
         pytest.skip(
             "RUN_NEO4J_INTEGRATION=1 is set but NEO4J_TEST_* environment variables are incomplete"
         )
-    return {"uri": uri, "username": username, "password": password}
+    try:
+        validated_uri = validate_disposable_neo4j_uri(uri)
+    except ValueError as exc:
+        pytest.fail(f"Unsafe NEO4J_TEST_URI rejected: {exc}")
+    return {"uri": validated_uri, "username": username, "password": password}
 
 
 @pytest.fixture(scope="module")
@@ -91,58 +155,180 @@ def live_driver(neo4j_test_config: Dict[str, str]):
     driver.close()
 
 
-def _cleanup_demo_domains(driver, domains: List[str], ruleset_namespaces: List[str]) -> None:
-    """Safely remove ONLY synthetic Phase 4E demo entities scoped by domain & ruleset."""
+def _assert_domains_and_rulesets_clean(
+    driver,
+    domains: Iterable[str],
+    ruleset_namespaces: Iterable[str],
+) -> None:
+    """Fail closed if any pre-existing entity occupies the run-scoped domains/namespaces."""
+    dom_list = list(domains)
+    ns_list = list(ruleset_namespaces)
     with driver.session() as session:
-        session.run(
-            "MATCH (ae:AlertEvent) WHERE ae.routing_domain_id IN $doms DETACH DELETE ae",
-            doms=domains,
-        ).consume()
-        session.run(
-            "MATCH (fo:FlowObservation) WHERE fo.routing_domain_id IN $doms DETACH DELETE fo",
-            doms=domains,
-        ).consume()
-        session.run(
-            "MATCH (ip:IPAddress) "
-            "WHERE (ip.routing_domain_id IN $doms "
-            "       OR ANY(d IN $doms WHERE ip.scoped_id STARTS WITH (d + '#'))) "
-            "  AND NOT ((ip)--(:AlertFact)) "
-            "  AND NOT ((:FlowObservation)-->(ip)) "
-            "  AND NOT ((:AlertEvent)-->(ip)) "
-            "DETACH DELETE ip",
-            doms=domains,
-        ).consume()
-        session.run(
-            "MATCH (ad:AlertDefinition) "
-            "WHERE ad.ruleset_namespace IN $nss "
-            "  AND NOT (()-[:TRIGGERED_RULE]->(ad)) "
-            "DETACH DELETE ad",
-            nss=ruleset_namespaces,
-        ).consume()
-        session.run(
-            "MATCH (rd:RoutingDomain) WHERE rd.domain_id IN $doms "
-            "AND NOT ((:IPAddress)-[:IN_DOMAIN]->(rd)) "
-            "DETACH DELETE rd",
-            doms=domains,
-        ).consume()
-
-
-def _snapshot_demo_graph(driver, domains: List[str]) -> Dict[str, Any]:
-    """Capture node/relationship state in demo domains to prove GET endpoints never mutate Neo4j."""
-    with driver.session() as session:
-        counts = session.run(
-            "OPTIONAL MATCH (fo:FlowObservation) WHERE fo.routing_domain_id IN $doms "
-            "WITH count(fo) AS flow_cnt "
+        rec = session.run(
             "OPTIONAL MATCH (ae:AlertEvent) WHERE ae.routing_domain_id IN $doms "
-            "WITH flow_cnt, count(ae) AS alert_cnt "
-            "OPTIONAL MATCH (ae2:AlertEvent)-[r:CORRELATED_WITH]->(fo2:FlowObservation) "
-            "WHERE ae2.routing_domain_id IN $doms "
-            "RETURN flow_cnt, alert_cnt, count(r) AS rel_cnt",
-            doms=domains,
+            "WITH count(ae) AS ae_cnt "
+            "OPTIONAL MATCH (fo:FlowObservation) WHERE fo.routing_domain_id IN $doms "
+            "WITH ae_cnt, count(fo) AS fo_cnt "
+            "OPTIONAL MATCH (ip:IPAddress) WHERE ip.routing_domain_id IN $doms "
+            "  OR ANY(d IN $doms WHERE ip.scoped_id STARTS WITH (d + '#')) "
+            "WITH ae_cnt, fo_cnt, count(ip) AS ip_cnt "
+            "OPTIONAL MATCH (rd:RoutingDomain) WHERE rd.domain_id IN $doms "
+            "WITH ae_cnt, fo_cnt, ip_cnt, count(rd) AS rd_cnt "
+            "OPTIONAL MATCH (ad:AlertDefinition) WHERE ad.ruleset_namespace IN $nss "
+            "RETURN ae_cnt, fo_cnt, ip_cnt, rd_cnt, count(ad) AS ad_cnt",
+            doms=dom_list,
+            nss=ns_list,
         ).single()
+        existing = {
+            "AlertEvent": int(rec["ae_cnt"]),
+            "FlowObservation": int(rec["fo_cnt"]),
+            "IPAddress": int(rec["ip_cnt"]),
+            "RoutingDomain": int(rec["rd_cnt"]),
+            "AlertDefinition": int(rec["ad_cnt"]),
+        }
+        non_zero = {k: v for k, v in existing.items() if v > 0}
+        if non_zero:
+            raise RuntimeError(
+                f"Refusing to overwrite pre-existing entities in target domains={dom_list} "
+                f"or rulesets={ns_list}: {non_zero}"
+            )
 
+
+def _collect_owned_ids(
+    *,
+    flows: Iterable[Any] = (),
+    alerts: Iterable[Any] = (),
+    domains: Iterable[str] = (),
+) -> Dict[str, List[str]]:
+    """Derive exact deterministic entity IDs from parsed records for owned-only cleanup."""
+    scoped_ids: Set[str] = set()
+    obs_ids: Set[str] = set()
+    event_ids: Set[str] = set()
+    def_ids: Set[str] = set()
+
+    for flow in flows:
+        obs_ids.add(flow.observation_id)
+        scoped_ids.add(flow.src_scoped_id)
+        scoped_ids.add(flow.dst_scoped_id)
+    for alert in alerts:
+        event_ids.add(alert.event_id)
+        def_ids.add(alert.alert_definition_id)
+        scoped_ids.add(alert.src_scoped_id)
+        scoped_ids.add(alert.dst_scoped_id)
+
+    return {
+        "event_ids": sorted(event_ids),
+        "obs_ids": sorted(obs_ids),
+        "def_ids": sorted(def_ids),
+        "scoped_ids": sorted(scoped_ids),
+        "domain_ids": sorted(set(domains)),
+    }
+
+
+def _cleanup_owned_entities(
+    driver,
+    *,
+    event_ids: Iterable[str] = (),
+    obs_ids: Iterable[str] = (),
+    def_ids: Iterable[str] = (),
+    scoped_ids: Iterable[str] = (),
+    domain_ids: Iterable[str] = (),
+) -> None:
+    """Safely remove ONLY exact synthetic entities owned by this test run."""
+    e_list = list(event_ids)
+    o_list = list(obs_ids)
+    d_list = list(def_ids)
+    s_list = list(scoped_ids)
+    dom_list = list(domain_ids)
+
+    with driver.session() as session:
+        if e_list:
+            session.run(
+                "MATCH (ae:AlertEvent) WHERE ae.event_id IN $eids DETACH DELETE ae",
+                eids=e_list,
+            ).consume()
+        if o_list:
+            session.run(
+                "MATCH (fo:FlowObservation) WHERE fo.observation_id IN $oids DETACH DELETE fo",
+                oids=o_list,
+            ).consume()
+        if d_list:
+            session.run(
+                "MATCH (ad:AlertDefinition) WHERE ad.definition_id IN $dids "
+                "AND NOT (()-[:TRIGGERED_RULE]->(ad)) DETACH DELETE ad",
+                dids=d_list,
+            ).consume()
+        if s_list:
+            session.run(
+                "MATCH (ip:IPAddress) WHERE ip.scoped_id IN $sids "
+                "OPTIONAL MATCH (ip)-[r]-() WHERE type(r) <> 'IN_DOMAIN' "
+                "WITH ip, count(r) AS other_rels "
+                "WHERE other_rels = 0 "
+                "DETACH DELETE ip",
+                sids=s_list,
+            ).consume()
+        if dom_list:
+            session.run(
+                "MATCH (rd:RoutingDomain) WHERE rd.domain_id IN $doms "
+                "OPTIONAL MATCH (rd)-[r]-() "
+                "WITH rd, count(r) AS rels "
+                "WHERE rels = 0 "
+                "DELETE rd",
+                doms=dom_list,
+            ).consume()
+
+
+def _snapshot_demo_graph(
+    driver,
+    domains: List[str],
+    ruleset_namespaces: List[str],
+) -> Dict[str, Any]:
+    """Capture owned entity digests, counts, CORRELATED_WITH properties, and schema metadata."""
+    with driver.session() as session:
+        flow_digests = [
+            (str(rec["oid"]), rec["digest"])
+            for rec in session.run(
+                "MATCH (fo:FlowObservation) WHERE fo.routing_domain_id IN $doms "
+                "RETURN fo.observation_id AS oid, fo.payload_digest AS digest "
+                "ORDER BY fo.observation_id ASC",
+                doms=domains,
+            )
+        ]
+        alert_digests = [
+            (str(rec["eid"]), rec["digest"])
+            for rec in session.run(
+                "MATCH (ae:AlertEvent) WHERE ae.routing_domain_id IN $doms "
+                "RETURN ae.event_id AS eid, ae.payload_digest AS digest "
+                "ORDER BY ae.event_id ASC",
+                doms=domains,
+            )
+        ]
+        def_ids = [
+            str(rec["did"])
+            for rec in session.run(
+                "MATCH (ad:AlertDefinition) WHERE ad.ruleset_namespace IN $nss "
+                "RETURN ad.definition_id AS did ORDER BY ad.definition_id ASC",
+                nss=ruleset_namespaces,
+            )
+        ]
+        ip_scoped_ids = [
+            str(rec["sid"])
+            for rec in session.run(
+                "MATCH (ip:IPAddress) WHERE ip.routing_domain_id IN $doms "
+                "RETURN ip.scoped_id AS sid ORDER BY ip.scoped_id ASC",
+                doms=domains,
+            )
+        ]
+        domain_ids = [
+            str(rec["dom"])
+            for rec in session.run(
+                "MATCH (rd:RoutingDomain) WHERE rd.domain_id IN $doms "
+                "RETURN rd.domain_id AS dom ORDER BY rd.domain_id ASC",
+                doms=domains,
+            )
+        ]
         rels = [
-            (rec["event_id"], rec["observation_id"], dict(rec["props"]))
+            (str(rec["event_id"]), str(rec["observation_id"]), dict(rec["props"]))
             for rec in session.run(
                 "MATCH (ae:AlertEvent)-[r:CORRELATED_WITH]->(fo:FlowObservation) "
                 "WHERE ae.routing_domain_id IN $doms "
@@ -152,10 +338,23 @@ def _snapshot_demo_graph(driver, domains: List[str]) -> Dict[str, Any]:
                 doms=domains,
             )
         ]
+        constraints = sorted(
+            str(rec["name"]) for rec in session.run("SHOW CONSTRAINTS YIELD name")
+        )
+        indexes = sorted(
+            str(rec["name"]) for rec in session.run("SHOW INDEXES YIELD name")
+        )
 
         return {
-            "counts": (counts["flow_cnt"], counts["alert_cnt"], counts["rel_cnt"]),
+            "counts": (len(flow_digests), len(alert_digests), len(rels)),
+            "flow_digests": flow_digests,
+            "alert_digests": alert_digests,
+            "def_ids": def_ids,
+            "ip_scoped_ids": ip_scoped_ids,
+            "domain_ids": domain_ids,
             "rels": rels,
+            "constraints": constraints,
+            "indexes": indexes,
         }
 
 
@@ -170,16 +369,63 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
     neo4j_test_config: Dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Scenarios A-D + pagination anti-starvation + idempotency + real FastAPI lifespan verification."""
-    _cleanup_demo_domains(live_driver, _ALL_DEMO_DOMAINS, [_DEMO_RULESET_NS, "demo-v2-tol-ns"])
+    """Scenarios A-D + strict keyset pagination + idempotency + real FastAPI lifespan verification."""
+    scope = _make_run_scope()
+    corp_domain = scope["corp_domain"]
+    branch_domain = scope["branch_domain"]
+    ruleset_ns = scope["ruleset_ns"]
+
+    _assert_domains_and_rulesets_clean(live_driver, [corp_domain, branch_domain], [ruleset_ns])
     _configure_env_for_cli_and_app(monkeypatch, neo4j_test_config)
 
+    # Pre-compute exact deterministic entity IDs via real parsers before mutating Neo4j
+    corp_flows, _ = parse_zeek_conn_file(
+        _DEMO_DIR / "corp_conn.log.jsonl",
+        sensor_id=_ZEEK_SENSOR,
+        routing_domain_id=corp_domain,
+        source_provenance="phase4e-corp-zeek",
+    )
+    corp_alerts, _ = parse_suricata_eve_alert_file(
+        _DEMO_DIR / "corp_eve.jsonl",
+        sensor_id=_SURICATA_SENSOR,
+        ruleset_namespace=ruleset_ns,
+        log_source_id="corp-eve-demo-01",
+        routing_domain_id=corp_domain,
+        source_provenance="phase4e-corp-eve",
+    )
+    branch_flows, _ = parse_zeek_conn_file(
+        _DEMO_DIR / "branch_conn.log.jsonl",
+        sensor_id="zeek-branch-01",
+        routing_domain_id=branch_domain,
+        source_provenance="phase4e-branch-zeek",
+    )
+    branch_alerts, _ = parse_suricata_eve_alert_file(
+        _DEMO_DIR / "branch_eve.jsonl",
+        sensor_id="suricata-branch-01",
+        ruleset_namespace=ruleset_ns,
+        log_source_id="branch-eve-demo-01",
+        routing_domain_id=branch_domain,
+        source_provenance="phase4e-branch-eve",
+    )
+    owned = _collect_owned_ids(
+        flows=corp_flows + branch_flows,
+        alerts=corp_alerts + branch_alerts,
+        domains=[corp_domain, branch_domain],
+    )
+
+    alert_a = next(a for a in corp_alerts if a.sid == 9100001)
+    alert_b = next(a for a in corp_alerts if a.sid == 9100002)
+    alert_c1 = next(a for a in corp_alerts if a.sid == 9100003)
+    alert_d = next(a for a in corp_alerts if a.sid == 9100004)
+    alert_ef = next(a for a in corp_alerts if a.sid == 9100005)
+    flow_a = next(f for f in corp_flows if f.zeek_uid == "CDemoCorpStrong01")
+
     try:
-        # 1. Real parser-to-Neo4j ingestion for demo-v2-corp
+        # 1. Real parser-to-Neo4j ingestion for corp_domain
         corp_zeek_res = ingest_zeek_conn_file(
             _DEMO_DIR / "corp_conn.log.jsonl",
             sensor_id=_ZEEK_SENSOR,
-            routing_domain_id=_CORP_DOMAIN,
+            routing_domain_id=corp_domain,
             source_provenance="phase4e-corp-zeek",
             batch_size=3,
             driver=live_driver,
@@ -193,9 +439,9 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
         corp_suri_res = ingest_suricata_eve_file(
             _DEMO_DIR / "corp_eve.jsonl",
             sensor_id=_SURICATA_SENSOR,
-            ruleset_namespace=_DEMO_RULESET_NS,
+            ruleset_namespace=ruleset_ns,
             log_source_id="corp-eve-demo-01",
-            routing_domain_id=_CORP_DOMAIN,
+            routing_domain_id=corp_domain,
             source_provenance="phase4e-corp-eve",
             batch_size=2,
             driver=live_driver,
@@ -207,7 +453,7 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
         assert corp_suri_res.persistence_summary.created_count == 5
         assert corp_suri_res.persistence_summary.definitions_created_count == 5
 
-        # 2. Real CLI entrypoints for demo-v2-branch using disposable env vars
+        # 2. Real CLI entrypoints for branch_domain using disposable env vars
         assert (
             zeek_cli_main(
                 [
@@ -216,7 +462,7 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
                     "--sensor-id",
                     "zeek-branch-01",
                     "--routing-domain-id",
-                    _BRANCH_DOMAIN,
+                    branch_domain,
                     "--source-provenance",
                     "phase4e-branch-zeek",
                 ]
@@ -231,11 +477,11 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
                     "--sensor-id",
                     "suricata-branch-01",
                     "--ruleset-namespace",
-                    _DEMO_RULESET_NS,
+                    ruleset_ns,
                     "--log-source-id",
                     "branch-eve-demo-01",
                     "--routing-domain-id",
-                    _BRANCH_DOMAIN,
+                    branch_domain,
                     "--source-provenance",
                     "phase4e-branch-eve",
                 ]
@@ -251,14 +497,37 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
                 driver=live_driver,
             )
 
-        # 4. Bounded keyset-paginated Phase 4B correlation for demo-v2-corp (max_alerts=2 proves cursor sweep)
+        # 4a. Directly verify keyset page ordering places NULL-ns Alert A (inserted FIRST) on Page 3
+        corr_repo = Neo4jCorrelationRepository(live_driver)
+        p1 = corr_repo.list_correlatable_alert_page(
+            routing_domain_id=corp_domain, max_alerts=2, after_cursor=None
+        )
+        assert p1.event_ids == (alert_b.event_id, alert_c1.event_id)
+        assert p1.has_more is True
+        assert p1.next_cursor == AlertSelectionCursor(1795428125_000000000, alert_c1.event_id)
+
+        p2 = corr_repo.list_correlatable_alert_page(
+            routing_domain_id=corp_domain, max_alerts=2, after_cursor=p1.next_cursor
+        )
+        assert p2.event_ids == (alert_d.event_id, alert_ef.event_id)
+        assert p2.has_more is True
+        assert p2.next_cursor == AlertSelectionCursor(1795428505_000000000, alert_ef.event_id)
+
+        p3 = corr_repo.list_correlatable_alert_page(
+            routing_domain_id=corp_domain, max_alerts=2, after_cursor=p2.next_cursor
+        )
+        assert p3.event_ids == (alert_a.event_id,)
+        assert p3.has_more is False
+        assert p3.next_cursor is None
+
+        # 4b. Bounded keyset-paginated Phase 4B correlation for corp_domain (max_alerts=2)
         policy = CorrelationPolicy()
         corp_pages = []
         cursor = None
         while True:
             page = run_alert_flow_correlation(
                 policy=policy,
-                routing_domain_id=_CORP_DOMAIN,
+                routing_domain_id=corp_domain,
                 max_alerts=2,
                 batch_size=2,
                 after_cursor=cursor,
@@ -272,62 +541,53 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
             cursor = page.next_cursor
             assert len(corp_pages) <= 5  # anti-infinite-loop safeguard
 
-        assert len(corp_pages) == 3  # 5 alerts paged as 2 + 2 + 1 (NULL-ns Alert A on final page)
-        assert sum(p.alerts_evaluated for p in corp_pages) == 5
-        assert sum(p.strong for p in corp_pages) == 3
-        assert sum(p.ambiguous for p in corp_pages) == 1
-        assert sum(p.rejected for p in corp_pages) == 1
-        assert sum(p.correlations_created for p in corp_pages) == 3
+        assert len(corp_pages) == 3
+        assert [p.alerts_evaluated for p in corp_pages] == [2, 2, 1]
+        # Page 1: Alert B (AMBIGUOUS) + Alert C1 (STRONG)
+        assert (
+            corp_pages[0].strong,
+            corp_pages[0].ambiguous,
+            corp_pages[0].rejected,
+            corp_pages[0].correlations_created,
+        ) == (1, 1, 0, 1)
+        assert corp_pages[0].next_cursor == AlertSelectionCursor(
+            1795428125_000000000, alert_c1.event_id
+        )
+        # Page 2: Alert D (REJECTED) + Alert EF (STRONG)
+        assert (
+            corp_pages[1].strong,
+            corp_pages[1].ambiguous,
+            corp_pages[1].rejected,
+            corp_pages[1].correlations_created,
+        ) == (1, 0, 1, 1)
+        assert corp_pages[1].next_cursor == AlertSelectionCursor(
+            1795428505_000000000, alert_ef.event_id
+        )
+        # Page 3: NULL-ns Alert A (STRONG) evaluated last despite being line 1 of corp_eve.jsonl
+        assert (
+            corp_pages[2].strong,
+            corp_pages[2].ambiguous,
+            corp_pages[2].rejected,
+            corp_pages[2].correlations_created,
+        ) == (1, 0, 0, 1)
+        assert corp_pages[2].has_more is False
+        assert corp_pages[2].next_cursor is None
 
         # Run branch domain via CLI entrypoint cleanly
         assert (
             correlation_cli_main(
-                ["--routing-domain-id", _BRANCH_DOMAIN, "--max-alerts", "10", "--batch-size", "10"]
+                ["--routing-domain-id", branch_domain, "--max-alerts", "10", "--batch-size", "10"]
             )
             == 0
         )
 
-        # 5. Parse ground-truth IDs using real parsers for Cypher verification
-        corp_flows, _ = parse_zeek_conn_file(
-            _DEMO_DIR / "corp_conn.log.jsonl",
-            sensor_id=_ZEEK_SENSOR,
-            routing_domain_id=_CORP_DOMAIN,
-            source_provenance="phase4e-corp-zeek",
-        )
-        corp_alerts, _ = parse_suricata_eve_alert_file(
-            _DEMO_DIR / "corp_eve.jsonl",
-            sensor_id=_SURICATA_SENSOR,
-            ruleset_namespace=_DEMO_RULESET_NS,
-            log_source_id="corp-eve-demo-01",
-            routing_domain_id=_CORP_DOMAIN,
-            source_provenance="phase4e-corp-eve",
-        )
-        branch_flows, _ = parse_zeek_conn_file(
-            _DEMO_DIR / "branch_conn.log.jsonl",
-            sensor_id="zeek-branch-01",
-            routing_domain_id=_BRANCH_DOMAIN,
-            source_provenance="phase4e-branch-zeek",
-        )
-        branch_alerts, _ = parse_suricata_eve_alert_file(
-            _DEMO_DIR / "branch_eve.jsonl",
-            sensor_id="suricata-branch-01",
-            ruleset_namespace=_DEMO_RULESET_NS,
-            log_source_id="branch-eve-demo-01",
-            routing_domain_id=_BRANCH_DOMAIN,
-            source_provenance="phase4e-branch-eve",
-        )
-
-        alert_a = next(a for a in corp_alerts if a.sid == 9100001)
-        alert_d = next(a for a in corp_alerts if a.sid == 9100004)
-        flow_a = next(f for f in corp_flows if f.zeek_uid == "CDemoCorpStrong01")
-
-        # 6. Verify persisted Cypher graph state
+        # 5. Verify persisted Cypher graph state
         with live_driver.session() as session:
             cross_domain_cnt = session.run(
                 "MATCH (ae:AlertEvent)-[r:CORRELATED_WITH]->(fo:FlowObservation) "
                 "WHERE ae.routing_domain_id IN $doms AND ae.routing_domain_id <> fo.routing_domain_id "
                 "RETURN count(r) AS cnt",
-                doms=[_CORP_DOMAIN, _BRANCH_DOMAIN],
+                doms=[corp_domain, branch_domain],
             ).single()["cnt"]
             assert cross_domain_cnt == 0
 
@@ -339,7 +599,7 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
                 "MATCH (ae2:AlertEvent)-[:TRIGGERED_RULE]->(ad:AlertDefinition) "
                 "WHERE ae2.routing_domain_id IN $doms "
                 "RETURN flows, alerts, count(ad) AS def_links",
-                doms=[_CORP_DOMAIN, _BRANCH_DOMAIN],
+                doms=[corp_domain, branch_domain],
             ).single()
             assert demo_counts["flows"] == 8
             assert demo_counts["alerts"] == 7
@@ -365,14 +625,16 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
             assert props["evidence_version"] == policy.evidence_version
             assert len(props["evidence_digest"]) == 64
 
-        snapshot_before_repeat = _snapshot_demo_graph(live_driver, [_CORP_DOMAIN, _BRANCH_DOMAIN])
+        snapshot_before_repeat = _snapshot_demo_graph(
+            live_driver, [corp_domain, branch_domain], [ruleset_ns]
+        )
         assert snapshot_before_repeat["counts"] == (8, 7, 4)
 
-        # 7. Idempotency: repeat ingestion & repeat correlation produce zero duplicate nodes/edges
+        # 6. Idempotency: repeat ingestion & repeat correlation produce zero duplicate nodes/edges
         repeat_zeek = ingest_zeek_conn_file(
             _DEMO_DIR / "corp_conn.log.jsonl",
             sensor_id=_ZEEK_SENSOR,
-            routing_domain_id=_CORP_DOMAIN,
+            routing_domain_id=corp_domain,
             source_provenance="phase4e-corp-zeek",
             driver=live_driver,
         )
@@ -382,9 +644,9 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
         repeat_suri = ingest_suricata_eve_file(
             _DEMO_DIR / "corp_eve.jsonl",
             sensor_id=_SURICATA_SENSOR,
-            ruleset_namespace=_DEMO_RULESET_NS,
+            ruleset_namespace=ruleset_ns,
             log_source_id="corp-eve-demo-01",
-            routing_domain_id=_CORP_DOMAIN,
+            routing_domain_id=corp_domain,
             source_provenance="phase4e-corp-eve",
             driver=live_driver,
         )
@@ -393,7 +655,7 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
 
         repeat_corr = run_alert_flow_correlation(
             policy=policy,
-            routing_domain_id=_CORP_DOMAIN,
+            routing_domain_id=corp_domain,
             driver=live_driver,
         )
         assert repeat_corr.correlations_created == 0
@@ -401,10 +663,12 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
         assert repeat_corr.correlations_updated == 0
         assert repeat_corr.stale_correlations_removed == 0
 
-        snapshot_after_repeat = _snapshot_demo_graph(live_driver, [_CORP_DOMAIN, _BRANCH_DOMAIN])
+        snapshot_after_repeat = _snapshot_demo_graph(
+            live_driver, [corp_domain, branch_domain], [ruleset_ns]
+        )
         assert snapshot_after_repeat == snapshot_before_repeat
 
-        # 8. Real FastAPI app + lifespan against live disposable Neo4j
+        # 7. Real FastAPI app + lifespan against live disposable Neo4j
         with TestClient(create_app()) as client:
             health_res = client.get("/health")
             assert health_res.status_code == 200
@@ -416,13 +680,13 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
 
             corp_api = client.get(
                 "/api/v1/correlations/alert-flows",
-                params={"routing_domain_id": _CORP_DOMAIN},
+                params={"routing_domain_id": corp_domain},
             )
             assert corp_api.status_code == 200
             corp_body = corp_api.json()
             assert corp_body["total"] == 3
             assert all(item["verification_status"] == "verified" for item in corp_body["items"])
-            assert all(item["routing_domain_id"] == _CORP_DOMAIN for item in corp_body["items"])
+            assert all(item["routing_domain_id"] == corp_domain for item in corp_body["items"])
 
             # Verify exact string Decimal delta on Scenario A item
             strong_api_item = next(
@@ -433,23 +697,31 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
             assert strong_api_item["temporal_delta_decimal"] == "0"
             assert strong_api_item["used_decimal_fallback"] is True
 
-            # Branch isolation & pagination check
+            # Branch isolation & observation_id filter check
             branch_api = client.get(
                 "/api/v1/correlations/alert-flows",
-                params={"routing_domain_id": _BRANCH_DOMAIN},
+                params={"routing_domain_id": branch_domain},
             )
             assert branch_api.status_code == 200
             assert branch_api.json()["total"] == 1
             assert branch_api.json()["items"][0]["observation_id"] == branch_flows[0].observation_id
 
+            obs_filtered = client.get(
+                "/api/v1/correlations/alert-flows",
+                params={"observation_id": flow_a.observation_id},
+            )
+            assert obs_filtered.status_code == 200
+            assert obs_filtered.json()["total"] == 1
+            assert obs_filtered.json()["items"][0]["event_id"] == alert_a.event_id
+
             # Pagination across corp items (limit=2, offset=2)
             page1 = client.get(
                 "/api/v1/correlations/alert-flows",
-                params={"routing_domain_id": _CORP_DOMAIN, "limit": 2, "offset": 0},
+                params={"routing_domain_id": corp_domain, "limit": 2, "offset": 0},
             ).json()
             page2 = client.get(
                 "/api/v1/correlations/alert-flows",
-                params={"routing_domain_id": _CORP_DOMAIN, "limit": 2, "offset": 2},
+                params={"routing_domain_id": corp_domain, "limit": 2, "offset": 2},
             ).json()
             assert page1["total"] == 3 and len(page1["items"]) == 2
             assert page2["total"] == 3 and len(page2["items"]) == 1
@@ -457,7 +729,7 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
             # Existing non-correlated AlertEvent -> HTTP 200 empty; missing AlertEvent -> HTTP 404
             empty_alert_res = client.get(
                 f"/api/v1/correlations/alert-flows/{alert_d.event_id}",
-                params={"routing_domain_id": _CORP_DOMAIN},
+                params={"routing_domain_id": corp_domain},
             )
             assert empty_alert_res.status_code == 200
             assert empty_alert_res.json()["items"] == []
@@ -470,15 +742,18 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
             branch_uncorr = next(a for a in branch_alerts if a.sid == 9100006)
             branch_empty_res = client.get(
                 f"/api/v1/correlations/alert-flows/{branch_uncorr.event_id}",
-                params={"routing_domain_id": _BRANCH_DOMAIN},
+                params={"routing_domain_id": branch_domain},
             )
             assert branch_empty_res.status_code == 200
             assert branch_empty_res.json()["total"] == 0
 
-        # Confirm zero graph writes occurred during GET requests
-        assert _snapshot_demo_graph(live_driver, [_CORP_DOMAIN, _BRANCH_DOMAIN]) == snapshot_before_repeat
+        # Confirm zero observable graph or schema mutations occurred during GET requests
+        assert (
+            _snapshot_demo_graph(live_driver, [corp_domain, branch_domain], [ruleset_ns])
+            == snapshot_before_repeat
+        )
     finally:
-        _cleanup_demo_domains(live_driver, _ALL_DEMO_DOMAINS, [_DEMO_RULESET_NS, "demo-v2-tol-ns"])
+        _cleanup_owned_entities(live_driver, **owned)
 
 
 def test_e2e_02_verification_lifecycle_and_stale_reconciliation(
@@ -487,39 +762,60 @@ def test_e2e_02_verification_lifecycle_and_stale_reconciliation(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Scenarios E & F: incomplete reevaluation preserves edge as unverified_incomplete; complete removal deletes stale edge."""
-    _cleanup_demo_domains(live_driver, _ALL_DEMO_DOMAINS, [_DEMO_RULESET_NS])
+    scope = _make_run_scope()
+    corp_domain = scope["corp_domain"]
+    ruleset_ns = scope["ruleset_ns"]
+
+    _assert_domains_and_rulesets_clean(live_driver, [corp_domain], [ruleset_ns])
     _configure_env_for_cli_and_app(monkeypatch, neo4j_test_config)
+
+    corp_flows, _ = parse_zeek_conn_file(
+        _DEMO_DIR / "corp_conn.log.jsonl",
+        sensor_id=_ZEEK_SENSOR,
+        routing_domain_id=corp_domain,
+        source_provenance="phase4e-corp-zeek",
+    )
+    rival_flows, _ = parse_zeek_conn_file(
+        _DEMO_DIR / "corp_stale_rival_conn.log.jsonl",
+        sensor_id=_ZEEK_SENSOR,
+        routing_domain_id=corp_domain,
+        source_provenance="phase4e-corp-rival-zeek",
+    )
+    corp_alerts, _ = parse_suricata_eve_alert_file(
+        _DEMO_DIR / "corp_eve.jsonl",
+        sensor_id=_SURICATA_SENSOR,
+        ruleset_namespace=ruleset_ns,
+        log_source_id="corp-eve-demo-01",
+        routing_domain_id=corp_domain,
+        source_provenance="phase4e-corp-eve",
+    )
+    owned = _collect_owned_ids(
+        flows=corp_flows + rival_flows,
+        alerts=corp_alerts,
+        domains=[corp_domain],
+    )
+    alert_ef = next(a for a in corp_alerts if a.sid == 9100005)
 
     try:
         ingest_zeek_conn_file(
             _DEMO_DIR / "corp_conn.log.jsonl",
             sensor_id=_ZEEK_SENSOR,
-            routing_domain_id=_CORP_DOMAIN,
+            routing_domain_id=corp_domain,
             source_provenance="phase4e-corp-zeek",
             driver=live_driver,
         )
         ingest_suricata_eve_file(
             _DEMO_DIR / "corp_eve.jsonl",
             sensor_id=_SURICATA_SENSOR,
-            ruleset_namespace=_DEMO_RULESET_NS,
+            ruleset_namespace=ruleset_ns,
             log_source_id="corp-eve-demo-01",
-            routing_domain_id=_CORP_DOMAIN,
+            routing_domain_id=corp_domain,
             source_provenance="phase4e-corp-eve",
             driver=live_driver,
         )
 
-        corp_alerts, _ = parse_suricata_eve_alert_file(
-            _DEMO_DIR / "corp_eve.jsonl",
-            sensor_id=_SURICATA_SENSOR,
-            ruleset_namespace=_DEMO_RULESET_NS,
-            log_source_id="corp-eve-demo-01",
-            routing_domain_id=_CORP_DOMAIN,
-            source_provenance="phase4e-corp-eve",
-        )
-        alert_ef = next(a for a in corp_alerts if a.sid == 9100005)
-
         initial = run_alert_flow_correlation(
-            routing_domain_id=_CORP_DOMAIN,
+            routing_domain_id=corp_domain,
             driver=live_driver,
         )
         assert initial.correlations_created == 3
@@ -528,7 +824,7 @@ def test_e2e_02_verification_lifecycle_and_stale_reconciliation(
         rival_ingest = ingest_zeek_conn_file(
             _DEMO_DIR / "corp_stale_rival_conn.log.jsonl",
             sensor_id=_ZEEK_SENSOR,
-            routing_domain_id=_CORP_DOMAIN,
+            routing_domain_id=corp_domain,
             source_provenance="phase4e-corp-rival-zeek",
             driver=live_driver,
         )
@@ -548,28 +844,28 @@ def test_e2e_02_verification_lifecycle_and_stale_reconciliation(
             # Default API excludes unverified_incomplete (hides Alert EF, shows 2 verified edges)
             default_list = client.get(
                 "/api/v1/correlations/alert-flows",
-                params={"routing_domain_id": _CORP_DOMAIN},
+                params={"routing_domain_id": corp_domain},
             ).json()
             assert default_list["total"] == 2
             assert all(item["event_id"] != alert_ef.event_id for item in default_list["items"])
 
             detail_default = client.get(
                 f"/api/v1/correlations/alert-flows/{alert_ef.event_id}",
-                params={"routing_domain_id": _CORP_DOMAIN},
+                params={"routing_domain_id": corp_domain},
             )
             assert detail_default.status_code == 200
             assert detail_default.json()["total"] == 0
 
-            # Explicit include_unverified=true or verification_status=unverified_incomplete reveals it
+            # Explicit include_unverified=true reveals it with factual reason & timestamp
             unverified_res = client.get(
                 f"/api/v1/correlations/alert-flows/{alert_ef.event_id}",
-                params={"routing_domain_id": _CORP_DOMAIN, "include_unverified": "true"},
+                params={"routing_domain_id": corp_domain, "include_unverified": "true"},
             )
             assert unverified_res.status_code == 200
             unverified_items = unverified_res.json()["items"]
             assert len(unverified_items) == 1
             assert unverified_items[0]["verification_status"] == "unverified_incomplete"
-            assert unverified_items[0]["last_incomplete_reason"] is not None
+            assert unverified_items[0]["last_incomplete_reason"] == "CANDIDATE_CAP_TRUNCATED"
             assert unverified_items[0]["last_incomplete_at_utc"] is not None
 
         # Scenario F: complete reevaluation (candidate_cap=200) classifies AMBIGUOUS & removes stale edge
@@ -586,13 +882,13 @@ def test_e2e_02_verification_lifecycle_and_stale_reconciliation(
         with TestClient(create_app()) as client:
             after_removal = client.get(
                 f"/api/v1/correlations/alert-flows/{alert_ef.event_id}",
-                params={"routing_domain_id": _CORP_DOMAIN, "include_unverified": "true"},
+                params={"routing_domain_id": corp_domain, "include_unverified": "true"},
             )
             assert after_removal.status_code == 200
             assert after_removal.json()["items"] == []
             assert after_removal.json()["total"] == 0
     finally:
-        _cleanup_demo_domains(live_driver, _ALL_DEMO_DOMAINS, [_DEMO_RULESET_NS])
+        _cleanup_owned_entities(live_driver, **owned)
 
 
 def test_e2e_03_subnanosecond_decimal_delta_and_db_unavailable_503(
@@ -602,7 +898,11 @@ def test_e2e_03_subnanosecond_decimal_delta_and_db_unavailable_503(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Verify non-zero sub-nanosecond Decimal delta preserves verbatim string end-to-end and 503 works cleanly."""
-    _cleanup_demo_domains(live_driver, _ALL_DEMO_DOMAINS, ["demo-v2-tol-ns"])
+    scope = _make_run_scope()
+    tol_domain = scope["tol_domain"]
+    tol_ns = scope["tol_ns"]
+
+    _assert_domains_and_rulesets_clean(live_driver, [tol_domain], [tol_ns])
     _configure_env_for_cli_and_app(monkeypatch, neo4j_test_config)
 
     zeek_file = tmp_path / "tol_conn.log.jsonl"
@@ -641,19 +941,31 @@ def test_e2e_03_subnanosecond_decimal_delta_and_db_unavailable_503(
         encoding="utf-8",
     )
 
+    tol_flows, _ = parse_zeek_conn_file(
+        zeek_file, sensor_id="zeek-tol-01", routing_domain_id=tol_domain
+    )
+    tol_alerts, _ = parse_suricata_eve_alert_file(
+        eve_file,
+        sensor_id="suricata-tol-01",
+        ruleset_namespace=tol_ns,
+        log_source_id="tol-eve-01",
+        routing_domain_id=tol_domain,
+    )
+    owned = _collect_owned_ids(flows=tol_flows, alerts=tol_alerts, domains=[tol_domain])
+
     try:
         ingest_zeek_conn_file(
             zeek_file,
             sensor_id="zeek-tol-01",
-            routing_domain_id=_TOL_DOMAIN,
+            routing_domain_id=tol_domain,
             driver=live_driver,
         )
         ingest_suricata_eve_file(
             eve_file,
             sensor_id="suricata-tol-01",
-            ruleset_namespace="demo-v2-tol-ns",
+            ruleset_namespace=tol_ns,
             log_source_id="tol-eve-01",
-            routing_domain_id=_TOL_DOMAIN,
+            routing_domain_id=tol_domain,
             driver=live_driver,
         )
 
@@ -663,7 +975,7 @@ def test_e2e_03_subnanosecond_decimal_delta_and_db_unavailable_503(
         )
         summary = run_alert_flow_correlation(
             policy=tol_policy,
-            routing_domain_id=_TOL_DOMAIN,
+            routing_domain_id=tol_domain,
             driver=live_driver,
         )
         assert summary.strong == 1
@@ -672,7 +984,7 @@ def test_e2e_03_subnanosecond_decimal_delta_and_db_unavailable_503(
         with TestClient(create_app()) as client:
             res = client.get(
                 "/api/v1/correlations/alert-flows",
-                params={"routing_domain_id": _TOL_DOMAIN},
+                params={"routing_domain_id": tol_domain},
             )
             assert res.status_code == 200
             items = res.json()["items"]
@@ -689,4 +1001,97 @@ def test_e2e_03_subnanosecond_decimal_delta_and_db_unavailable_503(
             unavail_res = unavail_client.get("/api/v1/correlations/alert-flows")
             assert unavail_res.status_code == 503
     finally:
-        _cleanup_demo_domains(live_driver, [_TOL_DOMAIN], ["demo-v2-tol-ns"])
+        _cleanup_owned_entities(live_driver, **owned)
+
+
+def test_e2e_04_owned_cleanup_and_preflight_collision_safety(live_driver):
+    """Verify pre-flight refuses pre-existing domain data and owned cleanup preserves unrelated V1/V2 edges."""
+    scope = _make_run_scope()
+    domain = scope["branch_domain"]
+    ruleset_ns = scope["ruleset_ns"]
+
+    _assert_domains_and_rulesets_clean(live_driver, [domain], [ruleset_ns])
+
+    branch_flows, _ = parse_zeek_conn_file(
+        _DEMO_DIR / "branch_conn.log.jsonl",
+        sensor_id="zeek-branch-01",
+        routing_domain_id=domain,
+        source_provenance="phase4e-cleanup-zeek",
+    )
+    branch_alerts, _ = parse_suricata_eve_alert_file(
+        _DEMO_DIR / "branch_eve.jsonl",
+        sensor_id="suricata-branch-01",
+        ruleset_namespace=ruleset_ns,
+        log_source_id="branch-eve-cleanup-01",
+        routing_domain_id=domain,
+        source_provenance="phase4e-cleanup-eve",
+    )
+    owned = _collect_owned_ids(flows=branch_flows, alerts=branch_alerts, domains=[domain])
+    shared_src_scoped = branch_flows[0].src_scoped_id
+    shared_dst_scoped = branch_flows[0].dst_scoped_id
+    foreign_flow_key = f"foreign-v1-flow-{scope['tag']}"
+
+    try:
+        ingest_zeek_conn_file(
+            _DEMO_DIR / "branch_conn.log.jsonl",
+            sensor_id="zeek-branch-01",
+            routing_domain_id=domain,
+            source_provenance="phase4e-cleanup-zeek",
+            driver=live_driver,
+        )
+        ingest_suricata_eve_file(
+            _DEMO_DIR / "branch_eve.jsonl",
+            sensor_id="suricata-branch-01",
+            ruleset_namespace=ruleset_ns,
+            log_source_id="branch-eve-cleanup-01",
+            routing_domain_id=domain,
+            source_provenance="phase4e-cleanup-eve",
+            driver=live_driver,
+        )
+
+        # Pre-flight collision check must fail closed when domain already contains entities
+        with pytest.raises(RuntimeError, match="Refusing to overwrite pre-existing entities"):
+            _assert_domains_and_rulesets_clean(live_driver, [domain], [ruleset_ns])
+
+        # Attach an unrelated V1 COMMUNICATED_TO edge to the shared IPAddress pair
+        with live_driver.session() as session:
+            session.run(
+                "MATCH (a:IPAddress {scoped_id: $src}), (b:IPAddress {scoped_id: $dst}) "
+                "MERGE (a)-[:COMMUNICATED_TO {flow_key: $fk, protocol: 'TCP'}]->(b)",
+                src=shared_src_scoped,
+                dst=shared_dst_scoped,
+                fk=foreign_flow_key,
+            ).consume()
+
+        # Run owned cleanup: must remove V2 FlowObservation/AlertEvent/AlertDefinition
+        # while PRESERVING the IPAddresses, COMMUNICATED_TO edge, and RoutingDomain.
+        _cleanup_owned_entities(live_driver, **owned)
+
+        with live_driver.session() as session:
+            preserved = session.run(
+                "MATCH (a:IPAddress {scoped_id: $src})-[c:COMMUNICATED_TO {flow_key: $fk}]->"
+                "(b:IPAddress {scoped_id: $dst}) "
+                "OPTIONAL MATCH (rd:RoutingDomain {domain_id: $dom}) "
+                "OPTIONAL MATCH (fo:FlowObservation) WHERE fo.observation_id IN $oids "
+                "OPTIONAL MATCH (ae:AlertEvent) WHERE ae.event_id IN $eids "
+                "RETURN count(c) AS comm_cnt, count(rd) AS rd_cnt, "
+                "       count(fo) AS fo_cnt, count(ae) AS ae_cnt",
+                src=shared_src_scoped,
+                dst=shared_dst_scoped,
+                fk=foreign_flow_key,
+                dom=domain,
+                oids=owned["obs_ids"],
+                eids=owned["event_ids"],
+            ).single()
+            assert preserved["comm_cnt"] == 1
+            assert preserved["rd_cnt"] == 1
+            assert preserved["fo_cnt"] == 0
+            assert preserved["ae_cnt"] == 0
+    finally:
+        # Remove the synthetic V1 edge, then re-run owned cleanup to leave zero residual nodes
+        with live_driver.session() as session:
+            session.run(
+                "MATCH (:IPAddress)-[c:COMMUNICATED_TO {flow_key: $fk}]->(:IPAddress) DELETE c",
+                fk=foreign_flow_key,
+            ).consume()
+        _cleanup_owned_entities(live_driver, **owned)
