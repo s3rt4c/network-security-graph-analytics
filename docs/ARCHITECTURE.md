@@ -93,10 +93,14 @@ frontend/src/
   │   ├── OverviewPage.tsx         (Global metrics, mode banners, distribution grids, endpoint rankings)
   │   ├── NetworkExplorerPage.tsx  (Cytoscape graph canvas, parallel edge rendering, edge & IP inspectors)
   │   ├── AlertExplorerPage.tsx    (Normalized alert facts table & detail modal)
-  │   ├── CorrelationsPage.tsx     (Traffic & alert co-occurrence table with flow keys and ports)
+  │   ├── CorrelationsPage.tsx     (Accessible tabs separating Legacy V1 co-occurrence & V2 alert–flow explorer)
   │   ├── PathFinderPage.tsx       (Directional L3 communication hop chain visualizer)
   │   └── ImportDataPage.tsx       (Browser data import, dual-file validation & workspace replacement)
   └── components/
+      ├── correlations/
+      │   ├── AlertFlowCorrelationsView.tsx (V2 verified-first read-only table, filters, pagination & retry)
+      │   ├── CorrelationEvidenceModal.tsx  (Factual persisted evidence inspector & copy controls)
+      │   └── VerificationStatusBadge.tsx   (Non-color-only verified vs unverified_incomplete badge)
       ├── graph/
       │   ├── CytoscapeCanvas.tsx  (Interactive canvas lifecycle, parallel edge layout & selection)
       │   └── cytoscapeStyle.ts    (Dark cybersecurity theme stylesheet)
@@ -177,6 +181,7 @@ frontend/src/
 - Single-page application built with **React 19**, **TypeScript 6.x**, and **Vite 8**.
 - **Graph Engine:** Cytoscape.js with custom dark cybersecurity styling, bezier curve multi-edge routing for parallel flows, and node/edge interaction handlers.
 - **Slide Drawers:** Contextual inspectors (`CommunicationEdgePanel`, `IPDetailPanel`, `Layer2DetailPanel`) for deep entity analysis without navigating away from the canvas.
+- **V2 Alert–Flow Correlations Explorer (`CorrelationsPage`, `AlertFlowCorrelationsView`):** Accessible sub-tabbed view preserving the default **Legacy Correlations** (V1 endpoint co-occurrence) tab separately from read-only persisted **Alert–Flow Correlations** (`GET /api/v1/correlations/alert-flows` and `/alert-flows/{event_id}`), with safe `include_unverified=false` default, fail-closed `RoutingDomain`/SHA-256 validation (`utils/correlationHelpers.ts`), server pagination, and `CorrelationEvidenceModal` preserving exact `Decimal` strings and neutral `Not recorded` fields without triggering live correlation runs.
 
 ---
 
@@ -204,7 +209,7 @@ neo4j_project/
 │   │   ├── api/                   # Typed API client modules
 │   │   ├── components/            # Graph canvas, inspectors, UI widgets
 │   │   ├── pages/                 # Overview, Network, Alerts, Correlations, Path, Import
-│   │   ├── utils/                 # Formatting & pure utility functions
+│   │   ├── utils/                 # Formatting, correlation validation/helpers & pure utilities
 │   │   └── styles/                # CSS variables & dark cybersecurity theme
 │   ├── package.json
 │   └── vite.config.ts

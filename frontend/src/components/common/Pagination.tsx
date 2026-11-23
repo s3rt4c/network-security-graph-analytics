@@ -17,8 +17,9 @@ export const Pagination: React.FC<PaginationProps> = ({
 }) => {
   const currentPage = Math.floor(offset / limit) + 1;
   const totalPages = Math.max(1, Math.ceil(total / limit));
-  const startItem = total === 0 ? 0 : offset + 1;
-  const endItem = Math.min(offset + limit, total);
+  const isOutOfRange = total > 0 && offset >= total;
+  const startItem = total === 0 || isOutOfRange ? 0 : offset + 1;
+  const endItem = isOutOfRange ? 0 : Math.min(offset + limit, total);
 
   return (
     <div

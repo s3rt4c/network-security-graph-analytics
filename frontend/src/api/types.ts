@@ -152,6 +152,48 @@ export interface TrafficAlertCorrelationResponse {
   alert_protocol: string | null;
 }
 
+export type CorrelationVerificationStatus = 'verified' | 'unverified_incomplete';
+
+export interface AlertFlowCorrelationResponse {
+  event_id: string;
+  observation_id: string;
+  zeek_uid: string | null;
+  routing_domain_id: string;
+  correlation_method: string | null;
+  evidence_version: string | null;
+  policy_fingerprint: string | null;
+  evidence_digest: string | null;
+  tuple_orientation: string | null;
+  community_id_agreement: string | null;
+  temporal_relation: string | null;
+  /** Exact canonical Decimal temporal delta string in seconds (never coerce to number). */
+  temporal_delta_decimal: string | null;
+  used_decimal_fallback: boolean | null;
+  sensor_context: string | null;
+  verification_status: CorrelationVerificationStatus;
+  last_incomplete_reason: string | null;
+  last_incomplete_at_utc: string | null;
+  decided_at_utc: string | null;
+}
+
+export interface AlertFlowCorrelationListParams {
+  routing_domain_id?: string;
+  event_id?: string;
+  observation_id?: string;
+  include_unverified?: boolean;
+  verification_status?: CorrelationVerificationStatus;
+  limit?: number;
+  offset?: number;
+}
+
+export interface AlertFlowCorrelationEventParams {
+  routing_domain_id?: string;
+  include_unverified?: boolean;
+  verification_status?: CorrelationVerificationStatus;
+  limit?: number;
+  offset?: number;
+}
+
 // Graph traversal & topology
 export interface GraphNodeResponse {
   id: string;
