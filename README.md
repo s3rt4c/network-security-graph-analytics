@@ -52,6 +52,8 @@ cd frontend && npm install && npm run dev
 
 Open `http://localhost:5173`, navigate to **Import Data**, select `data/samples/sample_traffic_enriched.tsv` and `data/samples/sample_alerts.json`, click **Validate Files**, check confirmation, and click **Import & Analyze**.
 
+> **V1 vs V2 Demo Note:** The browser **Import Data** workflow above ingests **legacy V1** traffic TSV + Snort alert JSON only. To run the reproducible **V2 Zeek–Suricata End-to-End Demo** (Zeek `conn.log` JSONL, Suricata EVE JSONL, Phase 4B correlation persistence, read-only V2 API, and React **Alert–Flow Correlations** explorer), see [V2 End-to-End Demo & Validation Guide](docs/V2_END_TO_END_DEMO.md).
+
 ---
 
 ## What It Does
@@ -147,6 +149,7 @@ Flow-aware correlation table pairing observed communications with security alert
 | Document | Description |
 |---|---|
 | [Architecture & System Design](docs/ARCHITECTURE.md) | Component architecture, data flows, and codebase directory layout |
+| [V2 End-to-End Demo & Validation](docs/V2_END_TO_END_DEMO.md) | Reproducible disposable Zeek–Suricata V2 workflow, CLI & API verification |
 | [Traffic Ingestion & Graph Model](docs/TRAFFIC_MODEL.md) | Input formats, flow aggregation, Neo4j schema, metric modes, and analysis boundaries |
 | [REST API Reference](docs/API.md) | Complete endpoint specifications, query parameters, sorting, and filtering |
 | [Browser Import & Security](docs/IMPORT_SECURITY.md) | Gated workspace replacement, concurrency locking, and security considerations |

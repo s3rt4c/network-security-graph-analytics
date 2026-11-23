@@ -1,0 +1,1 @@
+{"ts":1795428120.000000,"uid":"CDemoBranchIsoFlow01","id.orig_h":"203.0.113.50","id.orig_p":56000,"id.resp_h":"203.0.113.60","id.resp_p":22,"proto":"tcp","service":"ssh","duration":20.000000,"orig_bytes":1280,"resp_bytes":1920,"conn_state":"SF","orig_pkts":10,"orig_ip_bytes":1680,"resp_pkts":10,"resp_ip_bytes":2320}
