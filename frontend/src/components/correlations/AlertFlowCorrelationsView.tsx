@@ -12,6 +12,7 @@ import {
   buildStableCorrelationRowKeys,
   describeCorrelationApiError,
   formatPersistedValue,
+  normalizeRoutingDomainInput,
   truncateIdentifier,
   validateRoutingDomainInput,
   validateSha256Input,
@@ -54,7 +55,10 @@ export const AlertFlowCorrelationsView: React.FC = () => {
   const [verificationStatusInput, setVerificationStatusInput] = useState<
     '' | CorrelationVerificationStatus
   >('');
-  const [validationError, setValidationError] = useState<string | null>(null);
+  const [validationError, setValidationError] = useState<{
+    field: 'routingDomain' | 'eventId' | 'observationId';
+    message: string;
+  } | null>(null);
 
   // Applied backend query state
   const [appliedQuery, setAppliedQuery] = useState<AppliedCorrelationQuery>(DEFAULT_APPLIED_QUERY);
@@ -152,6 +156,8 @@ export const AlertFlowCorrelationsView: React.FC = () => {
       setVerificationStatusInput(value);
       if (value === 'unverified_incomplete') {
         setIncludeUnverifiedInput(true);
+      } else if (value === 'verified') {
+        setIncludeUnverifiedInput(false);
       }
     } else {
       setVerificationStatusInput('');
@@ -162,6 +168,8 @@ export const AlertFlowCorrelationsView: React.FC = () => {
     setIncludeUnverifiedInput(checked);
     if (!checked && verificationStatusInput === 'unverified_incomplete') {
       setVerificationStatusInput('');
+    } else if (checked && verificationStatusInput === 'verified') {
+      setVerificationStatusInput('');
     }
   };
 
@@ -170,32 +178,37 @@ export const AlertFlowCorrelationsView: React.FC = () => {
 
     const domainError = validateRoutingDomainInput(routingDomainInput);
     if (domainError) {
-      setValidationError(domainError);
+      setValidationError({ field: 'routingDomain', message: domainError });
       return;
     }
 
     const eventError = validateSha256Input(eventIdInput, 'AlertEvent ID');
     if (eventError) {
-      setValidationError(eventError);
+      setValidationError({ field: 'eventId', message: eventError });
       return;
     }
 
     const obsError = validateSha256Input(observationIdInput, 'FlowObservation ID');
     if (obsError) {
-      setValidationError(obsError);
+      setValidationError({ field: 'observationId', message: obsError });
       return;
     }
 
     const nextStatus = verificationStatusInput || undefined;
     const nextIncludeUnverified =
-      nextStatus === 'unverified_incomplete' ? true : includeUnverifiedInput;
+      nextStatus === 'unverified_incomplete'
+        ? true
+        : nextStatus === 'verified'
+          ? false
+          : includeUnverifiedInput;
 
     setValidationError(null);
     setSelectedCorrelation(null);
+    setCopiedCellKey(null);
     setError(null);
     setLoading(true);
     setAppliedQuery((prev) => ({
-      routingDomainId: routingDomainInput.trim() || undefined,
+      routingDomainId: normalizeRoutingDomainInput(routingDomainInput),
       eventId: eventIdInput.trim() || undefined,
       observationId: observationIdInput.trim() || undefined,
       includeUnverified: nextIncludeUnverified,
@@ -213,6 +226,7 @@ export const AlertFlowCorrelationsView: React.FC = () => {
     setVerificationStatusInput('');
     setValidationError(null);
     setSelectedCorrelation(null);
+    setCopiedCellKey(null);
     setError(null);
     setLoading(true);
     setAppliedQuery((prev) => ({
@@ -223,6 +237,7 @@ export const AlertFlowCorrelationsView: React.FC = () => {
 
   const handlePageChange = (newOffset: number) => {
     setSelectedCorrelation(null);
+    setCopiedCellKey(null);
     setError(null);
     setLoading(true);
     setAppliedQuery((prev) => ({
@@ -263,11 +278,18 @@ export const AlertFlowCorrelationsView: React.FC = () => {
       });
   };
 
+  const hasUnknownStatus = items.some(
+    (item) =>
+      item.verification_status !== 'verified' &&
+      item.verification_status !== 'unverified_incomplete'
+  );
+
   const hasUnverifiedVisible =
-    appliedQuery.includeUnverified ||
+    (appliedQuery.includeUnverified && appliedQuery.verificationStatus !== 'verified') ||
     appliedQuery.verificationStatus === 'unverified_incomplete' ||
     items.some((item) => item.verification_status === 'unverified_incomplete');
 
+  const isOutOfRangePage = !loading && !error && items.length === 0 && total > 0 && appliedQuery.offset >= total;
   const isEventDetailActive = Boolean(appliedQuery.eventId && !appliedQuery.observationId);
   const hasAnyFilter = Boolean(
     appliedQuery.routingDomainId ||
@@ -302,7 +324,7 @@ export const AlertFlowCorrelationsView: React.FC = () => {
           <div
             style={{
               display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 210px), 1fr))',
               gap: '0.85rem',
             }}
           >
@@ -319,6 +341,12 @@ export const AlertFlowCorrelationsView: React.FC = () => {
                 placeholder="e.g. default, corp, branch-a"
                 value={routingDomainInput}
                 onChange={(e) => setRoutingDomainInput(e.target.value)}
+                aria-invalid={validationError?.field === 'routingDomain'}
+                aria-describedby={
+                  validationError?.field === 'routingDomain'
+                    ? 'v2-filter-validation-error'
+                    : undefined
+                }
               />
             </div>
 
@@ -336,6 +364,10 @@ export const AlertFlowCorrelationsView: React.FC = () => {
                 placeholder="64-character lowercase hex"
                 value={eventIdInput}
                 onChange={(e) => setEventIdInput(e.target.value)}
+                aria-invalid={validationError?.field === 'eventId'}
+                aria-describedby={
+                  validationError?.field === 'eventId' ? 'v2-filter-validation-error' : undefined
+                }
               />
             </div>
 
@@ -353,6 +385,12 @@ export const AlertFlowCorrelationsView: React.FC = () => {
                 placeholder="64-character lowercase hex"
                 value={observationIdInput}
                 onChange={(e) => setObservationIdInput(e.target.value)}
+                aria-invalid={validationError?.field === 'observationId'}
+                aria-describedby={
+                  validationError?.field === 'observationId'
+                    ? 'v2-filter-validation-error'
+                    : undefined
+                }
               />
             </div>
 
@@ -418,6 +456,7 @@ export const AlertFlowCorrelationsView: React.FC = () => {
 
           {validationError && (
             <div
+              id="v2-filter-validation-error"
               role="alert"
               style={{
                 backgroundColor: 'var(--accent-rose-dim)',
@@ -428,7 +467,7 @@ export const AlertFlowCorrelationsView: React.FC = () => {
                 fontSize: '0.82rem',
               }}
             >
-              {validationError}
+              {validationError.message}
             </div>
           )}
 
@@ -474,6 +513,23 @@ export const AlertFlowCorrelationsView: React.FC = () => {
       </section>
 
       {/* Verification Status Explanation Banner */}
+      {hasUnknownStatus && (
+        <div
+          role="alert"
+          style={{
+            backgroundColor: 'var(--accent-rose-dim)',
+            border: '1px solid var(--accent-rose-border)',
+            color: 'var(--accent-rose-hover)',
+            padding: '0.6rem 0.85rem',
+            borderRadius: 'var(--radius-sm)',
+            fontSize: '0.82rem',
+          }}
+        >
+          <strong>Unrecognized Verification Status Present:</strong> One or more returned records
+          contain an unknown verification status value and must not be treated as verified.
+        </div>
+      )}
+
       {hasUnverifiedVisible ? (
         <div className="warning-banner" role="note">
           <strong>Unverified Correlations Visible:</strong> For relationships marked{' '}
@@ -481,7 +537,7 @@ export const AlertFlowCorrelationsView: React.FC = () => {
           was preserved, but the latest reevaluation could not establish completeness. This does
           not prove the original correlation remains valid.
         </div>
-      ) : (
+      ) : !hasUnknownStatus ? (
         <div className="info-banner" style={{ fontSize: '0.8rem' }}>
           <Info size={15} aria-hidden="true" style={{ flexShrink: 0 }} />
           <span>
@@ -490,7 +546,7 @@ export const AlertFlowCorrelationsView: React.FC = () => {
             correlation evaluation, not real-time verification.
           </span>
         </div>
-      )}
+      ) : null}
 
       {/* Error State */}
       {error && (
@@ -532,8 +588,8 @@ export const AlertFlowCorrelationsView: React.FC = () => {
       )}
 
       {/* Results Table */}
-      <div className="table-container">
-        <table>
+      <div className="table-container" aria-busy={loading}>
+        <table aria-label="Persisted alert-flow correlations">
           <thead>
             <tr>
               <th>Verification Status</th>
@@ -588,7 +644,28 @@ export const AlertFlowCorrelationsView: React.FC = () => {
                       textAlign: 'left',
                     }}
                   >
-                    {isEventDetailActive ? (
+                    {isOutOfRangePage ? (
+                      <>
+                        <strong style={{ color: 'var(--text-primary)' }}>
+                          This page is beyond the currently available results.
+                        </strong>
+                        <p style={{ fontSize: '0.83rem' }}>
+                          Requested offset <code>{appliedQuery.offset}</code> exceeds the current
+                          total of <code>{total}</code> matching persisted alert-flow correlations
+                          (graph counts may change between page requests under Neo4j Read
+                          Committed isolation).
+                        </p>
+                        <div>
+                          <button
+                            type="button"
+                            className="btn-secondary"
+                            onClick={() => handlePageChange(0)}
+                          >
+                            Return to First Page
+                          </button>
+                        </div>
+                      </>
+                    ) : isEventDetailActive ? (
                       <>
                         <strong style={{ color: 'var(--text-primary)' }}>
                           The AlertEvent exists, but no matching persisted relationships are
@@ -740,10 +817,12 @@ export const AlertFlowCorrelationsView: React.FC = () => {
       )}
 
       {/* Evidence Inspector Modal */}
-      <CorrelationEvidenceModal
-        correlation={selectedCorrelation}
-        onClose={() => setSelectedCorrelation(null)}
-      />
+      {selectedCorrelation && (
+        <CorrelationEvidenceModal
+          correlation={selectedCorrelation}
+          onClose={() => setSelectedCorrelation(null)}
+        />
+      )}
     </div>
   );
 };

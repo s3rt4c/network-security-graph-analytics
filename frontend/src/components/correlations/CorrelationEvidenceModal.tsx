@@ -121,8 +121,22 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
     field: string;
   } | null>(null);
   const copyTimerRef = useRef<number | null>(null);
+  const isMountedRef = useRef<boolean>(true);
+  const activeCorrelationRef = useRef<AlertFlowCorrelationResponse | null>(correlation);
 
   useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    activeCorrelationRef.current = correlation;
     return () => {
       if (copyTimerRef.current !== null) {
         window.clearTimeout(copyTimerRef.current);
@@ -130,6 +144,15 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
       }
     };
   }, [correlation]);
+
+  const handleClose = () => {
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = null;
+    }
+    setCopiedState(null);
+    onClose();
+  };
 
   const handleCopy = (
     target: AlertFlowCorrelationResponse,
@@ -142,11 +165,17 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
     navigator.clipboard
       .writeText(text)
       .then(() => {
+        if (!isMountedRef.current || activeCorrelationRef.current !== target) {
+          return;
+        }
         setCopiedState({ target, field: fieldKey });
         if (copyTimerRef.current !== null) {
           window.clearTimeout(copyTimerRef.current);
         }
         copyTimerRef.current = window.setTimeout(() => {
+          if (!isMountedRef.current) {
+            return;
+          }
           setCopiedState(null);
           copyTimerRef.current = null;
         }, 2000);
@@ -163,10 +192,14 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
   const isFieldCopied = (fieldKey: string) =>
     copiedState?.target === correlation && copiedState.field === fieldKey;
 
+  const isKnownStatus =
+    correlation.verification_status === 'verified' ||
+    correlation.verification_status === 'unverified_incomplete';
+
   return (
     <Modal
       isOpen={true}
-      onClose={onClose}
+      onClose={handleClose}
       title="Persisted Correlation Evidence Inspector"
       maxWidth="780px"
     >
@@ -197,6 +230,23 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
           </div>
         )}
 
+        {!isKnownStatus && (
+          <div
+            role="note"
+            style={{
+              backgroundColor: 'var(--accent-rose-dim)',
+              border: '1px solid var(--accent-rose-border)',
+              color: 'var(--accent-rose-hover)',
+              padding: '0.55rem 0.8rem',
+              borderRadius: 'var(--radius-sm)',
+              fontSize: '0.82rem',
+            }}
+          >
+            <strong>Unrecognized Verification Status:</strong> This record carries an unexpected
+            verification status value and must not be treated as verified.
+          </div>
+        )}
+
         <div className="info-banner" style={{ alignItems: 'flex-start' }}>
           <ShieldAlert size={16} aria-hidden="true" style={{ flexShrink: 0, marginTop: '0.1rem' }} />
           <div>
@@ -210,7 +260,7 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
         <div
           style={{
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))',
             gap: '0.7rem',
           }}
         >
@@ -321,7 +371,7 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
         </div>
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: '0.25rem' }}>
-          <button type="button" className="btn-secondary" onClick={onClose}>
+          <button type="button" className="btn-secondary" onClick={handleClose}>
             Close
           </button>
         </div>

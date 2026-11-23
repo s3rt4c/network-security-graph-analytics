@@ -28,6 +28,15 @@ export function validateRoutingDomainInput(raw: string): string | null {
 }
 
 /**
+ * Normalize a validated optional RoutingDomain input to match backend
+ * canonicalization (`domain.strip().lower()`). Call only after validateRoutingDomainInput().
+ */
+export function normalizeRoutingDomainInput(raw: string): string | undefined {
+  const normalized = raw.trim().toLowerCase();
+  return normalized === '' ? undefined : normalized;
+}
+
+/**
  * Validate an optional 64-character lowercase SHA-256 hex identifier filter input.
  */
 export function validateSha256Input(raw: string, fieldLabel: string): string | null {
@@ -72,6 +81,8 @@ export function buildStableCorrelationRowKeys(items: AlertFlowCorrelationRespons
       item.observation_id,
       item.routing_domain_id,
       item.verification_status,
+      item.correlation_method ?? 'no-method',
+      item.temporal_delta_decimal ?? 'no-delta',
       item.evidence_digest ?? 'no-digest',
       item.decided_at_utc ?? 'no-decided-ts',
       item.last_incomplete_at_utc ?? 'no-incomplete-ts',
@@ -115,8 +126,8 @@ export function describeCorrelationApiError(
         title: 'Suricata AlertEvent Not Found (HTTP 404)',
         message:
           context.isEventDetailQuery && context.eventId
-            ? `No persisted Suricata AlertEvent matching "${context.eventId}" exists${domainNote}. (${err.detail})`
-            : err.detail || 'The requested AlertEvent resource was not found.',
+            ? `No persisted Suricata AlertEvent matching "${context.eventId}" exists${domainNote}.`
+            : 'The requested Suricata AlertEvent resource was not found.',
         canRetry: true,
       };
     }
@@ -163,7 +174,7 @@ export function describeCorrelationApiError(
     return {
       status: err.status,
       title: `Correlation Query Failed (HTTP ${err.status})`,
-      message: err.detail || 'The correlation API request could not be completed.',
+      message: `The correlation API request could not be completed (HTTP ${err.status}).`,
       canRetry: true,
     };
   }

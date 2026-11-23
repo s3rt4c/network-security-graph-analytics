@@ -30,30 +30,51 @@ export const CorrelationsPage: React.FC<CorrelationsPageProps> = ({ onNavigate }
 
   const legacyTabRef = useRef<HTMLButtonElement>(null);
   const v2TabRef = useRef<HTMLButtonElement>(null);
+  const legacyRequestIdRef = useRef<number>(0);
+  const isMountedRef = useRef<boolean>(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (activeTab !== 'legacy') {
+      legacyRequestIdRef.current += 1;
       return;
     }
 
     const controller = new AbortController();
+    const requestId = ++legacyRequestIdRef.current;
 
     listTrafficAlertCorrelations(limit, offset, controller.signal)
       .then((res) => {
-        if (!controller.signal.aborted) {
-          setCorrelations(res.items);
-          setTotal(res.total);
-          setError(null);
-          setLoading(false);
+        if (
+          controller.signal.aborted ||
+          !isMountedRef.current ||
+          requestId !== legacyRequestIdRef.current
+        ) {
+          return;
         }
+        setCorrelations(res.items);
+        setTotal(res.total);
+        setError(null);
+        setLoading(false);
       })
       .catch((err: Error) => {
-        if (!controller.signal.aborted) {
-          setError(err.message);
-          setCorrelations([]);
-          setTotal(0);
-          setLoading(false);
+        if (
+          controller.signal.aborted ||
+          !isMountedRef.current ||
+          requestId !== legacyRequestIdRef.current
+        ) {
+          return;
         }
+        setError(err.message);
+        setCorrelations([]);
+        setTotal(0);
+        setLoading(false);
       });
 
     return () => {
@@ -104,7 +125,7 @@ export const CorrelationsPage: React.FC<CorrelationsPageProps> = ({ onNavigate }
         maxWidth: '1440px',
         width: '100%',
         margin: '0 auto',
-        padding: '2rem 2.5rem',
+        padding: 'clamp(1rem, 2.5vw, 2rem) clamp(0.85rem, 3vw, 2.5rem)',
         display: 'flex',
         flexDirection: 'column',
         gap: '1.75rem',
@@ -145,6 +166,8 @@ export const CorrelationsPage: React.FC<CorrelationsPageProps> = ({ onNavigate }
           aria-label="Correlation views"
           style={{
             display: 'inline-flex',
+            flexWrap: 'wrap',
+            maxWidth: '100%',
             gap: '0.25rem',
             padding: '0.25rem',
             backgroundColor: 'var(--bg-surface)',

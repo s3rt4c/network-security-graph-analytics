@@ -634,4 +634,271 @@ describe('CorrelationsPage Component', () => {
       screen.getByText(/does not prove every alert was evaluated/i)
     ).toBeInTheDocument();
   });
+
+  // Review Regression: Contradictory checkbox/select transitions, unknown status fail-closed, domain case normalization
+  it('prevents contradictory verification filters, handles unknown status safely, and normalizes RoutingDomain case', async () => {
+    const unknownStatusItem = makeV2Record({
+      zeek_uid: 'CzeekUnknownStatus',
+      verification_status: 'pending_external_check' as AlertFlowCorrelationResponse['verification_status'],
+    });
+
+    const fetchMock = vi.fn((input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/traffic-alerts')) {
+        return mockJsonResponse({ items: [], total: 0, limit: 50, offset: 0 });
+      }
+      if (url.includes('routing_domain_id=corp-east')) {
+        return mockJsonResponse({
+          items: [unknownStatusItem],
+          total: 1,
+          limit: 50,
+          offset: 0,
+        });
+      }
+      return mockJsonResponse({ items: [makeV2Record()], total: 1, limit: 50, offset: 0 });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(<CorrelationsPage />);
+    fireEvent.click(screen.getByRole('tab', { name: /Alert–Flow Correlations/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('CzeekUid12345')).toBeInTheDocument();
+    });
+
+    const statusSelect = screen.getByLabelText(/Verification Status/i) as HTMLSelectElement;
+    const includeCheckbox = screen.getByLabelText(
+      /Include unverified correlations/i
+    ) as HTMLInputElement;
+
+    // 1. Select unverified_incomplete -> include_unverified auto-checks
+    fireEvent.change(statusSelect, { target: { value: 'unverified_incomplete' } });
+    expect(includeCheckbox.checked).toBe(true);
+
+    // 2. Uncheck include_unverified -> invalid unverified_incomplete status clears
+    fireEvent.click(includeCheckbox);
+    expect(includeCheckbox.checked).toBe(false);
+    expect(statusSelect.value).toBe('');
+
+    // 3. Submit -> verifies safe default params and no unverified warning banner
+    fireEvent.click(screen.getByRole('button', { name: /Apply Filters/i }));
+    await waitFor(() => {
+      const lastUrl = String(fetchMock.mock.calls[fetchMock.mock.calls.length - 1][0]);
+      expect(lastUrl).toContain('include_unverified=false');
+      expect(lastUrl).not.toContain('verification_status=');
+    });
+    expect(screen.getByText(/Safe default active/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Unverified Correlations Visible/i)).not.toBeInTheDocument();
+
+    // 4. Select verified while include_unverified is checked -> auto-unchecks include_unverified
+    fireEvent.click(includeCheckbox);
+    expect(includeCheckbox.checked).toBe(true);
+    fireEvent.change(statusSelect, { target: { value: 'verified' } });
+    expect(includeCheckbox.checked).toBe(false);
+
+    // 5. Submit verified-only with mixed-case RoutingDomain -> lowercased to match backend
+    fireEvent.change(screen.getByRole('textbox', { name: /RoutingDomain/i }), {
+      target: { value: '  CORP-East  ' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Apply Filters/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('CzeekUnknownStatus')).toBeInTheDocument();
+    });
+    const domainUrl = String(fetchMock.mock.calls[fetchMock.mock.calls.length - 1][0]);
+    expect(domainUrl).toContain('routing_domain_id=corp-east');
+    expect(domainUrl).toContain('include_unverified=false');
+    expect(domainUrl).toContain('verification_status=verified');
+
+    // Unknown runtime status must NOT be presented as Verified or Previously Verified
+    expect(within(screen.getByRole('table')).getByText('Unknown Verification Status')).toBeInTheDocument();
+    expect(within(screen.getByRole('table')).queryByText('Verified')).not.toBeInTheDocument();
+    expect(screen.getByText(/Unrecognized Verification Status Present/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Safe default active/i)).not.toBeInTheDocument();
+
+    // Whitespace-only SHA-256 AlertEvent ID fails closed with aria-invalid
+    const callsBeforeWhitespaceId = fetchMock.mock.calls.length;
+    const eventInput = screen.getByRole('textbox', { name: /AlertEvent ID/i });
+    fireEvent.change(eventInput, { target: { value: '   ' } });
+    fireEvent.click(screen.getByRole('button', { name: /Apply Filters/i }));
+    expect(eventInput).toHaveAttribute('aria-invalid', 'true');
+    expect(fetchMock).toHaveBeenCalledTimes(callsBeforeWhitespaceId);
+  });
+
+  // Review Regression: Negative Decimal preservation, clipboard rejection, fresh modal Copy state & focus trap/restoration
+  it('preserves negative sub-nanosecond Decimal, handles clipboard failures, resets Copy across reopens, and manages modal focus', async () => {
+    const record = makeV2Record({
+      temporal_delta_decimal: '-0.000000000123',
+      verification_status: 'unverified_incomplete',
+      last_incomplete_reason: 'CANDIDATE_CAP_TRUNCATED',
+      last_incomplete_at_utc: '2026-11-22T09:00:00Z',
+    });
+
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/traffic-alerts')) {
+        return mockJsonResponse({ items: [], total: 0, limit: 50, offset: 0 });
+      }
+      return mockJsonResponse({ items: [record], total: 1, limit: 50, offset: 0 });
+    }) as unknown as typeof fetch;
+
+    const writeTextMock = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: writeTextMock },
+      configurable: true,
+    });
+
+    render(<CorrelationsPage />);
+    fireEvent.click(screen.getByRole('tab', { name: /Alert–Flow Correlations/i }));
+
+    const inspectBtn = await screen.findByRole('button', { name: /Inspect evidence/i });
+    // Badge must allow wrapping on narrow viewports (not white-space: nowrap)
+    const badgeEl = within(screen.getByRole('table')).getByText(
+      'Previously Verified — Current Check Incomplete'
+    ).parentElement;
+    expect(badgeEl?.style.whiteSpace).toBe('normal');
+
+    // Open modal from focused trigger button
+    inspectBtn.focus();
+    expect(document.activeElement).toBe(inspectBtn);
+    fireEvent.click(inspectBtn);
+
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Persisted Correlation Evidence Inspector',
+    });
+    expect(document.body.style.overflow).toBe('hidden');
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(within(dialog).getByText('-0.000000000123')).toBeInTheDocument();
+
+    // No fabricated V1 IP / attacker / confidence fields in V2 inspector
+    expect(within(dialog).queryByText('Source IP')).not.toBeInTheDocument();
+    expect(within(dialog).queryByText('Destination IP')).not.toBeInTheDocument();
+    expect(within(dialog).queryByText('Attacker IP')).not.toBeInTheDocument();
+    expect(within(dialog).queryByText('Confidence Score')).not.toBeInTheDocument();
+
+    // Keyboard focus trap: Shift+Tab from first focusable wraps to Close; Tab from Close wraps to Close dialog
+    const closeHeaderBtn = within(dialog).getByRole('button', { name: 'Close dialog' });
+    const closeFooterBtn = within(dialog).getByRole('button', { name: 'Close' });
+    closeHeaderBtn.focus();
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(closeFooterBtn);
+    fireEvent.keyDown(document, { key: 'Tab' });
+    expect(document.activeElement).toBe(closeHeaderBtn);
+
+    // Copy AlertEvent ID -> shows Copied -> close immediately -> reopen -> must NOT remain stuck on Copied
+    const copyEventBtn = within(dialog).getByRole('button', { name: /Copy full AlertEvent ID/i });
+    fireEvent.click(copyEventBtn);
+    await waitFor(() => {
+      expect(within(copyEventBtn).getByText('Copied')).toBeInTheDocument();
+    });
+
+    // Escape closes modal, restores overflow and restores focus to trigger button
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+    expect(document.body.style.overflow).toBe('');
+    expect(document.activeElement).toBe(inspectBtn);
+
+    // Reopen same row object -> Copy state is clean & clipboard rejection does not crash
+    writeTextMock.mockRejectedValueOnce(new Error('NotAllowedError'));
+    fireEvent.click(inspectBtn);
+    const dialog2 = await screen.findByRole('dialog', {
+      name: 'Persisted Correlation Evidence Inspector',
+    });
+    const copyEventBtn2 = within(dialog2).getByRole('button', { name: /Copy full AlertEvent ID/i });
+    expect(within(copyEventBtn2).getByText('Copy')).toBeInTheDocument();
+    fireEvent.click(copyEventBtn2);
+    await Promise.resolve();
+    expect(within(copyEventBtn2).getByText('Copy')).toBeInTheDocument();
+  });
+
+  // Review Regression: Out-of-range pagination, late 503 after newer 200, Home/End tab keys & unmount safety
+  it('handles out-of-range pages, suppresses late 503 errors after newer 200, supports Home/End tabs, and unmounts safely', async () => {
+    let rejectSlowError!: (err: unknown) => void;
+
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/traffic-alerts')) {
+        return mockJsonResponse({ items: [], total: 0, limit: 50, offset: 0 });
+      }
+      if (url.includes('routing_domain_id=slow-fail')) {
+        return new Promise((_resolve, reject) => {
+          rejectSlowError = reject;
+        });
+      }
+      if (url.includes('offset=50')) {
+        // Concurrent deletion shrank total below offset=50
+        return mockJsonResponse({ items: [], total: 40, limit: 50, offset: 50 });
+      }
+      if (url.includes('routing_domain_id=fast-ok')) {
+        return mockJsonResponse({
+          items: [makeV2Record({ routing_domain_id: 'fast-ok', zeek_uid: 'CzeekRecoveredOk' })],
+          total: 1,
+          limit: 50,
+          offset: 0,
+        });
+      }
+      return mockJsonResponse({
+        items: [makeV2Record({ zeek_uid: 'CzeekPageOne' })],
+        total: 75,
+        limit: 50,
+        offset: 0,
+      });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const { unmount } = render(<CorrelationsPage />);
+
+    // Home/End keyboard navigation on tabs
+    const legacyTab = screen.getByRole('tab', { name: /Legacy Correlations/i });
+    const v2Tab = screen.getByRole('tab', { name: /Alert–Flow Correlations/i });
+    fireEvent.keyDown(legacyTab, { key: 'End' });
+    expect(document.activeElement).toBe(v2Tab);
+    expect(v2Tab).toHaveAttribute('aria-selected', 'true');
+
+    await waitFor(() => {
+      expect(screen.getByText('CzeekPageOne')).toBeInTheDocument();
+    });
+
+    // Advance to page 2 -> out-of-range state (offset=50, total=40)
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await waitFor(() => {
+      expect(
+        screen.getByText(/This page is beyond the currently available results/i)
+      ).toBeInTheDocument();
+    });
+    // Pagination must NOT claim "51 to 40"
+    expect(screen.queryByText(/Showing 51 to 40/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Return to First Page/i }));
+    await waitFor(() => {
+      expect(screen.getByText('CzeekPageOne')).toBeInTheDocument();
+    });
+
+    // Slow failing request superseded by fast 200 success -> late rejection must NOT flash error
+    fireEvent.change(screen.getByRole('textbox', { name: /RoutingDomain/i }), {
+      target: { value: 'slow-fail' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Apply Filters/i }));
+
+    fireEvent.change(screen.getByRole('textbox', { name: /RoutingDomain/i }), {
+      target: { value: 'fast-ok' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Apply Filters/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('CzeekRecoveredOk')).toBeInTheDocument();
+    });
+
+    rejectSlowError(new Error('Late network failure after supersede'));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(screen.getByText('CzeekRecoveredOk')).toBeInTheDocument();
+    expect(screen.queryByText(/Network Connection Error/i)).not.toBeInTheDocument();
+
+    // Home returns focus to Legacy tab; unmount mid-flight produces zero errors
+    fireEvent.keyDown(v2Tab, { key: 'Home' });
+    expect(document.activeElement).toBe(legacyTab);
+    unmount();
+  });
 });

@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useId, useRef } from 'react';
 import { X } from 'lucide-react';
 
 interface ModalProps {
@@ -9,6 +9,9 @@ interface ModalProps {
   maxWidth?: string;
 }
 
+const FOCUSABLE_SELECTOR =
+  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
 export const Modal: React.FC<ModalProps> = ({
   isOpen,
   onClose,
@@ -16,28 +19,78 @@ export const Modal: React.FC<ModalProps> = ({
   children,
   maxWidth = '600px',
 }) => {
+  const titleId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+
   useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    const previousActiveElement =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+
+    document.body.style.overflow = 'hidden';
+
+    const dialogNode = dialogRef.current;
+    if (dialogNode) {
+      dialogNode.focus();
+    }
+
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        onClose();
+        e.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+
+      if (e.key === 'Tab' && dialogRef.current) {
+        const focusableElements = Array.from(
+          dialogRef.current.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)
+        );
+        if (focusableElements.length === 0) {
+          e.preventDefault();
+          dialogRef.current.focus();
+          return;
+        }
+
+        const firstEl = focusableElements[0];
+        const lastEl = focusableElements[focusableElements.length - 1];
+        const activeEl = document.activeElement as HTMLElement | null;
+
+        if (e.shiftKey) {
+          if (!activeEl || activeEl === firstEl || activeEl === dialogRef.current || !dialogRef.current.contains(activeEl)) {
+            e.preventDefault();
+            lastEl.focus();
+          }
+        } else if (!activeEl || activeEl === lastEl || !dialogRef.current.contains(activeEl)) {
+          e.preventDefault();
+          firstEl.focus();
+        }
       }
     };
-    if (isOpen) {
-      document.addEventListener('keydown', handleKeyDown);
-      document.body.style.overflow = 'hidden';
-    }
+
+    document.addEventListener('keydown', handleKeyDown);
+
     return () => {
       document.removeEventListener('keydown', handleKeyDown);
-      document.body.style.overflow = 'auto';
+      document.body.style.overflow = previousOverflow;
+      if (previousActiveElement && previousActiveElement.isConnected) {
+        previousActiveElement.focus();
+      }
     };
-  }, [isOpen, onClose]);
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
   return (
     <div
-      role="dialog"
-      aria-modal="true"
       style={{
         position: 'fixed',
         inset: 0,
@@ -52,6 +105,11 @@ export const Modal: React.FC<ModalProps> = ({
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
         className="card"
         style={{
           width: '100%',
@@ -72,12 +130,16 @@ export const Modal: React.FC<ModalProps> = ({
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
+            gap: '0.75rem',
             padding: '1rem 1.25rem',
             borderBottom: '1px solid var(--border-subtle)',
           }}
         >
-          <h2 style={{ fontSize: '1.15rem' }}>{title}</h2>
+          <h2 id={titleId} style={{ fontSize: '1.15rem' }}>
+            {title}
+          </h2>
           <button
+            type="button"
             onClick={onClose}
             aria-label="Close dialog"
             style={{
@@ -86,9 +148,10 @@ export const Modal: React.FC<ModalProps> = ({
               alignItems: 'center',
               padding: '0.25rem',
               borderRadius: 'var(--radius-sm)',
+              flexShrink: 0,
             }}
           >
-            <X size={18} />
+            <X size={18} aria-hidden="true" />
           </button>
         </div>
 
