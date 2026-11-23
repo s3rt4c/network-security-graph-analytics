@@ -293,14 +293,13 @@ def run_browser_smoke() -> None:
             f"Unexpected pre-browser snapshot: {pre_browser_snapshot['counts']}"
         )
 
-        # 2. Boot real FastAPI + real Vite dev server
+        # 2. Boot real FastAPI + real Vite dev server (log to DEVNULL/files so pipes never block)
         api_proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "src.api.app:app", "--host", "127.0.0.1", "--port", "8000"],
             cwd=_REPO_ROOT,
             env=sub_env,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
-            text=True,
         )
         _wait_for_http("http://127.0.0.1:8000/ready", timeout_sec=30.0)
 
@@ -323,15 +322,15 @@ def run_browser_smoke() -> None:
             ],
             cwd=_REPO_ROOT,
             env=sub_env,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
-            text=True,
         )
         _wait_for_http("http://127.0.0.1:5173/", timeout_sec=30.0)
 
         # 3. Drive real headless Chromium across full user flow
         observed_requests: List[tuple[str, str]] = []
         observed_api_statuses: List[tuple[str, int]] = []
+        page_errors: List[str] = []
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -347,10 +346,13 @@ def run_browser_smoke() -> None:
 
             page.on("request", _on_request)
             page.on("response", _on_response)
+            page.on("pageerror", lambda err: page_errors.append(str(err)))
 
-            page.goto("http://127.0.0.1:5173/", wait_until="networkidle")
-            page.get_by_text("API Liveness").wait_for(timeout=15000)
-            page.get_by_text("Neo4j Connected").wait_for(timeout=15000)
+            # Vite dev server keeps an open HMR WebSocket, so use domcontentloaded
+            # and wait directly on rendered UI indicators rather than networkidle.
+            page.goto("http://127.0.0.1:5173/", wait_until="domcontentloaded", timeout=30000)
+            page.get_by_text("API Liveness").wait_for(timeout=20000)
+            page.get_by_text("Neo4j Connected").wait_for(timeout=20000)
 
             # Open Correlations view -> Legacy Correlations tab default
             page.get_by_role("button", name="Correlations").click()
@@ -402,7 +404,8 @@ def run_browser_smoke() -> None:
 
             browser.close()
 
-        # 4. Assert read-only network & zero 5xx errors
+        # 4. Assert zero uncaught JS errors, read-only network & zero 5xx errors
+        assert not page_errors, f"Uncaught browser JS errors observed: {page_errors}"
         non_get = [(m, u) for m, u in observed_requests if m != "GET"]
         assert not non_get, f"Unexpected non-GET browser requests observed: {non_get}"
         server_errors = [(u, s) for u, s in observed_api_statuses if s >= 500]
