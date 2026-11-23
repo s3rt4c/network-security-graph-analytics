@@ -865,7 +865,7 @@ def test_e2e_02_verification_lifecycle_and_stale_reconciliation(
             unverified_items = unverified_res.json()["items"]
             assert len(unverified_items) == 1
             assert unverified_items[0]["verification_status"] == "unverified_incomplete"
-            assert unverified_items[0]["last_incomplete_reason"] == "CANDIDATE_CAP_TRUNCATED"
+            assert unverified_items[0]["last_incomplete_reason"] == "CANDIDATE_SET_TRUNCATED"
             assert unverified_items[0]["last_incomplete_at_utc"] is not None
 
         # Scenario F: complete reevaluation (candidate_cap=200) classifies AMBIGUOUS & removes stale edge

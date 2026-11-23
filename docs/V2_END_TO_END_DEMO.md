@@ -178,7 +178,7 @@ python -m src.services.zeek_ingestion \
 # Scenario E — run with --candidate-cap 1 to trigger genuine truncated candidate retrieval:
 python -m src.services.correlation_service --candidate-cap 1 --event-id "<ALERT_EF_EVENT_ID>"
 # Result: incomplete_evaluations=1, candidate_cap_exceeded=1, stale_correlations_removed=0
-# Existing edge is preserved with verification_status="unverified_incomplete" and last_incomplete_reason="CANDIDATE_CAP_TRUNCATED".
+# Existing edge is preserved with verification_status="unverified_incomplete" and last_incomplete_reason="CANDIDATE_SET_TRUNCATED".
 
 # Scenario F — re-run with complete candidate retrieval (default candidate_cap=200):
 python -m src.services.correlation_service --event-id "<ALERT_EF_EVENT_ID>"

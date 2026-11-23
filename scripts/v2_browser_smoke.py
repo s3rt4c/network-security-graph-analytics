@@ -816,7 +816,7 @@ def run_browser_smoke() -> None:
                 dialog.get_by_text(alert_ef.event_id).wait_for(timeout=10000)
                 dialog.get_by_text(flow_ef.observation_id).wait_for(timeout=10000)
                 dialog.get_by_text("Unverified Incomplete Status:").wait_for(timeout=10000)
-                dialog.get_by_text("CANDIDATE_CAP_TRUNCATED").wait_for(timeout=10000)
+                dialog.get_by_text("CANDIDATE_SET_TRUNCATED").wait_for(timeout=10000)
                 page.keyboard.press("Escape")
                 dialog.wait_for(state="detached", timeout=10000)
 
@@ -860,7 +860,7 @@ def run_browser_smoke() -> None:
             and any(
                 item.get("event_id") == alert_ef.event_id
                 and item.get("verification_status") == "unverified_incomplete"
-                and item.get("last_incomplete_reason") == "CANDIDATE_CAP_TRUNCATED"
+                and item.get("last_incomplete_reason") == "CANDIDATE_SET_TRUNCATED"
                 for item in body.get("items", [])
             )
             for u, body in observed_v2_payloads
