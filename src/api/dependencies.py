@@ -122,3 +122,16 @@ def validate_optional_routing_domain_id(routing_domain_id: Optional[str]) -> Opt
             detail="Invalid routing_domain_id: must not be empty when specified",
         )
     return validate_routing_domain(routing_domain_id)
+
+
+def validate_optional_sensor_id(sensor_id: Optional[str]) -> Optional[str]:
+    """Validate an optional V2 sensor_id filter, failing closed on explicit blank values."""
+    if sensor_id is None:
+        return None
+    normalized = sensor_id.strip().lower()
+    if not normalized:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid sensor_id: must not be empty when specified",
+        )
+    return normalized

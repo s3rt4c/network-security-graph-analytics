@@ -39,8 +39,10 @@ from src.graph.correlation_repository import (
     AlertSelectionCursor,
     Neo4jCorrelationRepository,
 )
+from src.graph.repository import decimal_epoch_to_ns
 from src.graph.schema import ensure_schema
 from src.ingestion.suricata_eve_parser import parse_suricata_eve_alert_file
+from src.ingestion.v2_models import format_canonical_decimal
 from src.ingestion.zeek_conn_parser import parse_zeek_conn_file
 from src.services.correlation_service import (
     main as correlation_cli_main,
@@ -1356,5 +1358,267 @@ def test_e2e_05_overlapping_domains_and_corrupt_graph_links_fail_closed(
             missing_prop = client.get(f"/api/v1/flow-observations/{flow_b.observation_id}", params={"routing_domain_id": dom_b})
             assert missing_prop.status_code == 500
             assert missing_prop.json() == {"detail": "Internal server error"}
+    finally:
+        _cleanup_owned_entities(live_driver, **owned)
+
+
+def test_e2e_06_v2_alert_event_triage_list_filters_pagination_and_unlinked_detail(
+    live_driver,
+    neo4j_test_config: Dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Phase 4F.2: Real Neo4j triage listing of linked + unlinked AlertEvents, filters, NULL ordering, pagination & unlinked detail."""
+    scope = _make_run_scope()
+    corp_domain = scope["corp_domain"]
+    branch_domain = scope["branch_domain"]
+    ruleset_ns = scope["ruleset_ns"]
+
+    _assert_domains_and_rulesets_clean(live_driver, [corp_domain, branch_domain], [ruleset_ns])
+    _configure_env_for_cli_and_app(monkeypatch, neo4j_test_config)
+
+    # Extra timezone-naive AlertEvent in corp_domain -> timestamp_epoch_ns=None, timestamp_epoch_decimal=None
+    naive_eve = tmp_path / "corp_naive_eve.jsonl"
+    naive_eve.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-11-23T12:00:00",
+                "flow_id": 8810999,
+                "in_iface": "eth0",
+                "event_type": "alert",
+                "src_ip": "192.0.2.150",
+                "src_port": 60123,
+                "dest_ip": "198.51.100.150",
+                "dest_port": 9443,
+                "proto": "TCP",
+                "alert": {
+                    "action": "allowed",
+                    "gid": 1,
+                    "signature_id": 9100999,
+                    "rev": 1,
+                    "signature": "SYNTHETIC Timezone-Naive Null-NS Event",
+                    "category": "Misc activity",
+                    "severity": 1,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    corp_flows, _ = parse_zeek_conn_file(
+        _DEMO_DIR / "corp_conn.log.jsonl",
+        sensor_id=_ZEEK_SENSOR,
+        routing_domain_id=corp_domain,
+        source_provenance="phase4f2-corp-zeek",
+    )
+    branch_flows, _ = parse_zeek_conn_file(
+        _DEMO_DIR / "branch_conn.log.jsonl",
+        sensor_id="zeek-branch-01",
+        routing_domain_id=branch_domain,
+        source_provenance="phase4f2-branch-zeek",
+    )
+    corp_alerts, _ = parse_suricata_eve_alert_file(
+        _DEMO_DIR / "corp_eve.jsonl",
+        sensor_id=_SURICATA_SENSOR,
+        ruleset_namespace=ruleset_ns,
+        log_source_id="corp-eve-demo-01",
+        routing_domain_id=corp_domain,
+        source_provenance="phase4f2-corp-eve",
+    )
+    naive_alerts, _ = parse_suricata_eve_alert_file(
+        naive_eve,
+        sensor_id=_SURICATA_SENSOR,
+        ruleset_namespace=ruleset_ns,
+        log_source_id="corp-naive-eve-01",
+        routing_domain_id=corp_domain,
+        source_provenance="phase4f2-corp-naive-eve",
+    )
+    branch_alerts, _ = parse_suricata_eve_alert_file(
+        _DEMO_DIR / "branch_eve.jsonl",
+        sensor_id="suricata-branch-01",
+        ruleset_namespace=ruleset_ns,
+        log_source_id="branch-eve-demo-01",
+        routing_domain_id=branch_domain,
+        source_provenance="phase4f2-branch-eve",
+    )
+    all_alerts = corp_alerts + naive_alerts + branch_alerts
+    owned = _collect_owned_ids(
+        flows=corp_flows + branch_flows,
+        alerts=all_alerts,
+        domains=[corp_domain, branch_domain],
+    )
+
+    alert_a = next(a for a in corp_alerts if a.sid == 9100001)  # linked (STRONG)
+    alert_b = next(a for a in corp_alerts if a.sid == 9100002)  # unlinked (AMBIGUOUS)
+    alert_naive = naive_alerts[0]  # unlinked + null ns
+
+    try:
+        ingest_zeek_conn_file(
+            _DEMO_DIR / "corp_conn.log.jsonl",
+            sensor_id=_ZEEK_SENSOR,
+            routing_domain_id=corp_domain,
+            source_provenance="phase4f2-corp-zeek",
+            driver=live_driver,
+        )
+        ingest_zeek_conn_file(
+            _DEMO_DIR / "branch_conn.log.jsonl",
+            sensor_id="zeek-branch-01",
+            routing_domain_id=branch_domain,
+            source_provenance="phase4f2-branch-zeek",
+            driver=live_driver,
+        )
+        ingest_suricata_eve_file(
+            _DEMO_DIR / "corp_eve.jsonl",
+            sensor_id=_SURICATA_SENSOR,
+            ruleset_namespace=ruleset_ns,
+            log_source_id="corp-eve-demo-01",
+            routing_domain_id=corp_domain,
+            source_provenance="phase4f2-corp-eve",
+            driver=live_driver,
+        )
+        ingest_suricata_eve_file(
+            naive_eve,
+            sensor_id=_SURICATA_SENSOR,
+            ruleset_namespace=ruleset_ns,
+            log_source_id="corp-naive-eve-01",
+            routing_domain_id=corp_domain,
+            source_provenance="phase4f2-corp-naive-eve",
+            driver=live_driver,
+        )
+        ingest_suricata_eve_file(
+            _DEMO_DIR / "branch_eve.jsonl",
+            sensor_id="suricata-branch-01",
+            ruleset_namespace=ruleset_ns,
+            log_source_id="branch-eve-demo-01",
+            routing_domain_id=branch_domain,
+            source_provenance="phase4f2-branch-eve",
+            driver=live_driver,
+        )
+
+        # Run genuine Phase 4B correlation on both domains (never fabricate CORRELATED_WITH edges)
+        corr_corp = run_alert_flow_correlation(routing_domain_id=corp_domain, driver=live_driver)
+        assert corr_corp.correlations_created == 3
+        corr_branch = run_alert_flow_correlation(routing_domain_id=branch_domain, driver=live_driver)
+        assert corr_branch.correlations_created == 1
+
+        snapshot_before_reads = _snapshot_demo_graph(
+            live_driver, [corp_domain, branch_domain], [ruleset_ns]
+        )
+
+        with TestClient(create_app()) as client:
+            # 1. Domain list in corp includes all 6 events: 3 linked + 3 unlinked (including NULL ns last)
+            corp_list_res = client.get(
+                "/api/v1/alert-events",
+                params={"routing_domain_id": corp_domain, "limit": 50, "offset": 0},
+            )
+            assert corp_list_res.status_code == 200
+            corp_body = corp_list_res.json()
+            assert corp_body["total"] == 6
+            corp_items = corp_body["items"]
+            assert len(corp_items) == 6
+            # Both alert_a (sub-nanosecond decimal) and alert_naive (timezone-naive) have
+            # timestamp_epoch_ns=None and therefore order last (NULLS LAST) by event_id ASC.
+            assert [i["event_id"] for i in corp_items[-2:]] == sorted(
+                [alert_a.event_id, alert_naive.event_id]
+            )
+            by_id = {item["event_id"]: item for item in corp_items}
+            assert by_id[alert_naive.event_id]["timestamp_epoch_decimal"] is None
+            assert by_id[alert_naive.event_id]["has_persisted_correlation"] is False
+            assert by_id[alert_a.event_id]["has_persisted_correlation"] is True
+            assert by_id[alert_b.event_id]["has_persisted_correlation"] is False
+            assert by_id[alert_a.event_id]["timestamp_epoch_decimal"] == "1795428002.123456789123"
+            assert all("timestamp_epoch_ns" not in item for item in corp_items)
+
+            # 2. Branch domain isolation & sensor_id filter
+            branch_res = client.get(
+                "/api/v1/alert-events",
+                params={"routing_domain_id": branch_domain, "sensor_id": "SURICATA-BRANCH-01"},
+            )
+            assert branch_res.status_code == 200
+            branch_body = branch_res.json()
+            assert branch_body["total"] == 2
+            assert {i["sid"] for i in branch_body["items"]} == {9100003, 9100006}
+            assert {i["sid"]: i["has_persisted_correlation"] for i in branch_body["items"]} == {
+                9100003: True,
+                9100006: False,
+            }
+
+            # 3. Severity and SID filters
+            sev_res = client.get(
+                "/api/v1/alert-events",
+                params={"routing_domain_id": corp_domain, "severity": 2, "sid": 9100002},
+            )
+            assert sev_res.status_code == 200
+            assert sev_res.json()["total"] == 1
+            assert sev_res.json()["items"][0]["event_id"] == alert_b.event_id
+
+            # 4. Timestamp range filter excludes NULL timestamp_epoch_ns & matches inclusive bounds
+            b_ns = decimal_epoch_to_ns(alert_b.timestamp_epoch_decimal, "timestamp_epoch_decimal")
+            assert b_ns is not None
+            time_res = client.get(
+                "/api/v1/alert-events",
+                params={
+                    "routing_domain_id": corp_domain,
+                    "start_epoch_ns": b_ns,
+                    "end_epoch_ns": b_ns,
+                },
+            )
+            assert time_res.status_code == 200
+            assert time_res.json()["total"] == 1
+            assert time_res.json()["items"][0]["event_id"] == alert_b.event_id
+
+            wide_time_res = client.get(
+                "/api/v1/alert-events",
+                params={
+                    "routing_domain_id": corp_domain,
+                    "start_epoch_ns": 0,
+                    "end_epoch_ns": 2_000_000_000_000_000_000,
+                },
+            )
+            assert wide_time_res.status_code == 200
+            wide_ids = {i["event_id"] for i in wide_time_res.json()["items"]}
+            assert wide_time_res.json()["total"] == 4
+            assert alert_a.event_id not in wide_ids
+            assert alert_naive.event_id not in wide_ids
+
+            # 5. Deterministic pagination across pages
+            p1 = client.get(
+                "/api/v1/alert-events",
+                params={"routing_domain_id": corp_domain, "limit": 2, "offset": 0},
+            ).json()
+            p2 = client.get(
+                "/api/v1/alert-events",
+                params={"routing_domain_id": corp_domain, "limit": 2, "offset": 2},
+            ).json()
+            p3 = client.get(
+                "/api/v1/alert-events",
+                params={"routing_domain_id": corp_domain, "limit": 2, "offset": 4},
+            ).json()
+            paged_ids = [i["event_id"] for page in (p1, p2, p3) for i in page["items"]]
+            assert paged_ids == [i["event_id"] for i in corp_items]
+
+            # 6. Open Phase 4F.1 detail API independently for unlinked AlertEvent (sid=9100002)
+            unlinked_detail_res = client.get(
+                f"/api/v1/alert-events/{alert_b.event_id}",
+                params={"routing_domain_id": corp_domain},
+            )
+            assert unlinked_detail_res.status_code == 200
+            unlinked_detail = unlinked_detail_res.json()
+            assert unlinked_detail["event_id"] == alert_b.event_id
+            assert unlinked_detail["sid"] == 9100002
+            assert unlinked_detail["signature"] == "SYNTHETIC Demo Ambiguous Dual Flow Probe"
+            assert unlinked_detail["engine"] == "suricata"
+            assert unlinked_detail["flow_id"] == "8810002"
+            assert unlinked_detail["timestamp_epoch_decimal"] == format_canonical_decimal(
+                alert_b.timestamp_epoch_decimal
+            )
+            assert "timestamp_epoch_ns" not in unlinked_detail
+
+        # Confirm zero graph or schema mutations during GET triage & detail requests
+        assert (
+            _snapshot_demo_graph(live_driver, [corp_domain, branch_domain], [ruleset_ns])
+            == snapshot_before_reads
+        )
     finally:
         _cleanup_owned_entities(live_driver, **owned)

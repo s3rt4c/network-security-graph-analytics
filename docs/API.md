@@ -288,6 +288,33 @@ Zeek `FlowObservation` detail (`GET /api/v1/flow-observations/b0e9ea368ed1cbbab5
 
 ---
 
+### 8. V2 Suricata AlertEvent Triage Listing (`GET /api/v1/alert-events`)
+
+#### V1 / V2 Separation & Independent Investigation Scope
+- **`GET /api/v1/alerts`** remains exclusively for legacy **V1 `AlertFact`** nodes and is unchanged.
+- **`GET /api/v1/alert-events`** lists persisted discrete **V2 Suricata `AlertEvent`** (`source_type = 'suricata'`) occurrences regardless of whether a persisted `(:AlertEvent)-[:CORRELATED_WITH]->(:FlowObservation)` relationship exists.
+- Static route `/api/v1/alert-events` is registered before dynamic `/api/v1/alert-events/{event_id}`.
+- Executes strictly inside `session.execute_read()` on the shared Neo4j driver with zero graph writes, zero correlation recalculation, no raw event payloads, and no Neo4j `elementId` or `timestamp_epoch_ns` JSON exposure.
+
+#### Query Parameters & Validation
+- `routing_domain_id` *(optional string)*: Trimmed lowercase normalization; explicit blank/whitespace strings or `#` return **HTTP 422**. Omitted returns across configured domains inside the trusted/local boundary (`routing_domain_id` is not an authentication mechanism).
+- `severity` *(optional int `0..9223372036854775807`)*: Exact recorded Suricata severity integer (not a universal risk score). Invalid/negative/overflow values return **HTTP 422**.
+- `sid` *(optional int `0..9223372036854775807`)*: Exact Suricata signature ID match. Invalid values return **HTTP 422**.
+- `sensor_id` *(optional string)*: Exact match after trimmed lowercase normalization; explicit blank/whitespace returns **HTTP 422**.
+- `start_epoch_ns`, `end_epoch_ns` *(optional signed int64 `[-9223372036854775808, 9223372036854775807]`)*: Inclusive bounds on `ae.timestamp_epoch_ns`. When neither is supplied, `AlertEvent` records with `timestamp_epoch_ns IS NULL` (e.g., timezone-naive timestamps) **are included**. When either time bound is active, events with `timestamp_epoch_ns IS NULL` **are excluded**. Reversed bounds (`start_epoch_ns > end_epoch_ns`) or out-of-range values return **HTTP 422**.
+- `limit` *(int `1..200`, default `50`)* and `offset` *(int `0..9223372036854775807`, default `0`)*: Bounded server-side pagination with int64 overflow short-circuiting.
+
+#### Ordering, Precision & Persisted-Link Semantics
+- **Deterministic Ordering:** `timestamp_epoch_ns` ascending with `NULL` values ordered last (`NULLS LAST`), breaking ties deterministically by `event_id` ascending.
+- **Response Envelope (`SafePaginatedResponse[AlertEventTriageItemResponse]`):** `items`, `total`, `limit`, `offset`. Counts (`total`, `offset`, `sid`, `severity`) preserve exact JSON numbers up to `9007199254740991` (`2^53 - 1`) and lossless decimal strings above that threshold. `timestamp_epoch_decimal` preserves exact fixed-point strings verbatim (`null` when timezone-naive).
+- **`has_persisted_correlation` *(boolean)*:** Computed cleanly per row via `EXISTS { MATCH (ae)-[:CORRELATED_WITH]->(:FlowObservation) }` without multiplying result rows.
+  - `true` means at least one persisted `CORRELATED_WITH` relationship exists in Neo4j.
+  - `false` means **only** that no persisted relationship is recorded — it does **not** prove `REJECTED`, `AMBIGUOUS`, `INSUFFICIENT`, benign traffic, or lack of evaluation, and does not replace last stored `verification_status`.
+- **HTTP Status Semantics:** `200` (including empty filtered sets `items: [], total: 0` — never `404` for empty lists), `422` (invalid query filters/bounds/pagination), `503` (unavailable Neo4j driver/database), `500` (sanitized internal error or corrupt persisted node properties rejected by strict Pydantic `ConfigDict(strict=True, extra="forbid")` validation).
+- **Concurrency & Auth Limitations:** Count and page queries execute inside one `execute_read` transaction under Neo4j Read Committed isolation, which does not guarantee multi-query snapshot consistency under concurrent ingestion writes. Multi-user authentication/RBAC remain out of scope.
+
+---
+
 ## Ambiguity Resolution & Error Handling (HTTP 409 Conflict)
 
 In multi-tenant or segmented environments, multiple endpoints may share the same IP address across different routing domains (e.g., `corp#10.0.0.5` vs `branch#10.0.0.5`).

@@ -43,6 +43,8 @@ from urllib.request import urlopen
 
 from neo4j import GraphDatabase
 
+from src.ingestion.v2_models import format_canonical_decimal
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -570,6 +572,7 @@ def run_browser_smoke() -> None:
 
         # Establish one genuine unverified_incomplete edge (Alert EF with candidate_cap=1)
         alert_a = next(a for a in owned["corp_alerts"] if a.sid == 9100001)
+        alert_b = next(a for a in owned["corp_alerts"] if a.sid == 9100002)
         flow_a = next(f for f in owned["corp_flows"] if f.zeek_uid == "CDemoCorpStrong01")
         alert_ef = next(a for a in owned["corp_alerts"] if a.sid == 9100005)
         flow_ef = next(f for f in owned["corp_flows"] if f.zeek_uid == "CDemoCorpLifecycle01")
@@ -686,6 +689,7 @@ def run_browser_smoke() -> None:
         observed_api_statuses: List[Tuple[str, int]] = []
         observed_v2_payloads: List[Tuple[str, Dict[str, Any]]] = []
         observed_detail_payloads: List[Tuple[str, Dict[str, Any]]] = []
+        observed_triage_payloads: List[Tuple[str, Dict[str, Any]]] = []
         page_errors: List[str] = []
 
         with sync_playwright() as p:
@@ -891,6 +895,116 @@ def run_browser_smoke() -> None:
                 # Return to Legacy V1 tab -> continues working cleanly
                 legacy_tab.click()
                 page.get_by_text("Legacy V1 Correlation Notice:").wait_for(timeout=10000)
+
+                # Phase 4F.2: Navigate to Alert Explorer -> verify Legacy Alert Facts default & V2 Suricata Events triage
+                page.get_by_role("button", name="Alert Explorer").click()
+                legacy_alerts_tab = page.get_by_role("tab", name="Legacy Alert Facts")
+                legacy_alerts_tab.wait_for(timeout=10000)
+                assert legacy_alerts_tab.get_attribute("aria-selected") == "true"
+                page.get_by_text("AlertFact Semantic Note:").wait_for(timeout=10000)
+                page.get_by_text("No alert facts found matching current filters.").wait_for(timeout=10000)
+
+                all_alert_tabs_valid = page.evaluate(
+                    """() => {
+                        const tabs = Array.from(document.querySelectorAll('[aria-label="Alert explorer views"] [role="tab"]'));
+                        return tabs.length === 2 && tabs.every((t) => {
+                            const cid = t.getAttribute('aria-controls');
+                            const panel = cid ? document.getElementById(cid) : null;
+                            return panel !== null && panel.getAttribute('role') === 'tabpanel';
+                        });
+                    }"""
+                )
+                assert all_alert_tabs_valid, "Expected both Alert Explorer tabs to reference valid DOM tabpanels"
+
+                suricata_events_tab = page.get_by_role("tab", name="Suricata Events")
+                with page.expect_response(
+                    lambda r: urlparse(r.url).path == "/api/v1/alert-events"
+                    and "routing_domain_id" not in parse_qs(urlparse(r.url).query),
+                    timeout=15000,
+                ) as triage_all_resp_info:
+                    suricata_events_tab.click()
+                triage_all_resp = triage_all_resp_info.value
+                assert triage_all_resp.status == 200
+                observed_triage_payloads.append((triage_all_resp.url, triage_all_resp.json()))
+
+                triage_table = page.get_by_role("table", name="Suricata AlertEvents")
+                triage_table.get_by_text("SYNTHETIC Demo Strong Match TLS Observation").wait_for(timeout=15000)
+                triage_table.get_by_text("SYNTHETIC Demo Ambiguous Dual Flow Probe").wait_for(timeout=10000)
+                triage_table.get_by_text("SYNTHETIC Demo Cross-Domain Uncorrelated Event").wait_for(timeout=10000)
+                assert triage_table.locator("tbody tr").count() == 7
+
+                # Filter by RoutingDomain=demo-v2-corp -> hides branch event
+                page.get_by_role("textbox", name="RoutingDomain").fill(_CORP_DOMAIN)
+                with page.expect_response(
+                    lambda r: urlparse(r.url).path == "/api/v1/alert-events"
+                    and parse_qs(urlparse(r.url).query).get("routing_domain_id") == [_CORP_DOMAIN],
+                    timeout=15000,
+                ) as triage_corp_resp_info:
+                    page.get_by_role("button", name="Apply Filters").click()
+                triage_corp_resp = triage_corp_resp_info.value
+                assert triage_corp_resp.status == 200
+                observed_triage_payloads.append((triage_corp_resp.url, triage_corp_resp.json()))
+                triage_table.get_by_text("SYNTHETIC Demo Cross-Domain Uncorrelated Event").wait_for(
+                    state="detached", timeout=10000
+                )
+                assert triage_table.locator("tbody tr").count() == 5
+
+                # Filter further by Severity=2 and SID=9100002 -> isolates unlinked Scenario B AlertEvent
+                page.get_by_role("textbox", name="Severity (integer)").fill("2")
+                page.get_by_role("textbox", name="Signature ID (SID)").fill("9100002")
+                with page.expect_response(
+                    lambda r: urlparse(r.url).path == "/api/v1/alert-events"
+                    and parse_qs(urlparse(r.url).query).get("severity") == ["2"]
+                    and parse_qs(urlparse(r.url).query).get("sid") == ["9100002"],
+                    timeout=15000,
+                ) as triage_filtered_resp_info:
+                    page.get_by_role("button", name="Apply Filters").click()
+                triage_filtered_resp = triage_filtered_resp_info.value
+                assert triage_filtered_resp.status == 200
+                observed_triage_payloads.append((triage_filtered_resp.url, triage_filtered_resp.json()))
+                triage_table.get_by_text("SYNTHETIC Demo Strong Match TLS Observation").wait_for(
+                    state="detached", timeout=10000
+                )
+                triage_table.get_by_text("SYNTHETIC Demo Ambiguous Dual Flow Probe").wait_for(timeout=10000)
+                triage_table.get_by_text("No persisted link recorded").wait_for(timeout=10000)
+                assert triage_table.locator("tbody tr").count() == 1
+
+                # Inspect the unlinked Scenario B AlertEvent independently (no observation_id required)
+                triage_inspect_btn = page.get_by_role(
+                    "button",
+                    name=f"Inspect Suricata AlertEvent {alert_b.event_id}",
+                )
+                with page.expect_response(
+                    lambda r: urlparse(r.url).path == f"/api/v1/alert-events/{alert_b.event_id}"
+                    and parse_qs(urlparse(r.url).query).get("routing_domain_id") == [_CORP_DOMAIN],
+                    timeout=15000,
+                ) as unlinked_detail_resp_info:
+                    triage_inspect_btn.click()
+                unlinked_detail_resp = unlinked_detail_resp_info.value
+                assert unlinked_detail_resp.status == 200
+                observed_detail_payloads.append((unlinked_detail_resp.url, unlinked_detail_resp.json()))
+
+                triage_dialog = page.get_by_role("dialog", name="Suricata AlertEvent Forensic Detail")
+                triage_dialog.get_by_text("No Persisted Correlation Edge Recorded:").wait_for(timeout=10000)
+                triage_dialog.get_by_text("SYNTHETIC Demo Ambiguous Dual Flow Probe", exact=True).wait_for(timeout=10000)
+                triage_dialog.get_by_text("9100002", exact=True).wait_for(timeout=10000)
+                triage_dialog.get_by_text("192.0.2.30", exact=True).wait_for(timeout=10000)
+                triage_dialog.get_by_text("198.51.100.40", exact=True).wait_for(timeout=10000)
+                triage_dialog.get_by_text("8810002", exact=True).wait_for(timeout=10000)
+                triage_dialog.get_by_text(alert_b.timestamp_source, exact=True).wait_for(timeout=10000)
+                triage_dialog.get_by_text(
+                    format_canonical_decimal(alert_b.timestamp_epoch_decimal), exact=True
+                ).wait_for(timeout=10000)
+
+                page.keyboard.press("Escape")
+                triage_dialog.wait_for(state="detached", timeout=10000)
+                assert triage_inspect_btn.evaluate("el => el === document.activeElement"), (
+                    "Expected Escape to restore keyboard focus to triggering triage Inspect button"
+                )
+
+                # Switch back to Legacy Alert Facts tab cleanly
+                legacy_alerts_tab.click()
+                page.get_by_text("AlertFact Semantic Note:").wait_for(timeout=10000)
             finally:
                 browser.close()
 
@@ -956,6 +1070,38 @@ def run_browser_smoke() -> None:
             and "end_epoch_ns" not in body
             for u, body in observed_detail_payloads
         ), f"Missing expected FlowObservation detail API response: {observed_detail_payloads}"
+
+        assert any(
+            urlparse(u).path == "/api/v1/alert-events"
+            and "routing_domain_id" not in parse_qs(urlparse(u).query)
+            and body.get("total") == 7
+            and any(item.get("has_persisted_correlation") is True for item in body.get("items", []))
+            and any(item.get("has_persisted_correlation") is False for item in body.get("items", []))
+            and all("timestamp_epoch_ns" not in item for item in body.get("items", []))
+            for u, body in observed_triage_payloads
+        ), f"Missing expected unfiltered Phase 4F.2 alert triage response: {observed_triage_payloads}"
+
+        assert any(
+            urlparse(u).path == "/api/v1/alert-events"
+            and parse_qs(urlparse(u).query).get("routing_domain_id") == [_CORP_DOMAIN]
+            and parse_qs(urlparse(u).query).get("severity") == ["2"]
+            and parse_qs(urlparse(u).query).get("sid") == ["9100002"]
+            and body.get("total") == 1
+            and body.get("items", [{}])[0].get("event_id") == alert_b.event_id
+            and body.get("items", [{}])[0].get("has_persisted_correlation") is False
+            for u, body in observed_triage_payloads
+        ), f"Missing expected filtered Phase 4F.2 alert triage response: {observed_triage_payloads}"
+
+        assert any(
+            urlparse(u).path == f"/api/v1/alert-events/{alert_b.event_id}"
+            and parse_qs(urlparse(u).query).get("routing_domain_id") == [_CORP_DOMAIN]
+            and body.get("sid") == 9100002
+            and body.get("signature") == "SYNTHETIC Demo Ambiguous Dual Flow Probe"
+            and body.get("timestamp_epoch_decimal")
+            == format_canonical_decimal(alert_b.timestamp_epoch_decimal)
+            and "timestamp_epoch_ns" not in body
+            for u, body in observed_detail_payloads
+        ), f"Missing expected unlinked AlertEvent detail API response: {observed_detail_payloads}"
 
         # 5. Confirm zero observable graph or schema mutations during real browser browsing
         post_browser_snapshot = _snapshot_full_disposable_graph(driver)

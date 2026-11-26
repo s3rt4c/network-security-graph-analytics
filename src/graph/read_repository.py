@@ -2198,3 +2198,166 @@ class Neo4jReadRepository:
 
         with self.driver.session() as session:
             return session.execute_read(_work)
+
+    @staticmethod
+    def _record_to_triage_alert_event(record) -> Dict[str, Any]:
+        """Materialize a compact V2 Suricata AlertEvent triage record (never exposing ns index)."""
+        return {
+            "event_id": record["event_id"],
+            "routing_domain_id": record["routing_domain_id"],
+            "source_type": record["source_type"],
+            "sensor_id": record["sensor_id"],
+            "sid": record["sid"],
+            "signature": record["signature"],
+            "severity": record["severity"],
+            "category": record["category"],
+            "src_ip": record["src_ip"],
+            "dst_ip": record["dst_ip"],
+            "src_port": record["src_port"],
+            "dst_port": record["dst_port"],
+            "protocol": record["protocol"],
+            "timestamp_source": record["timestamp_source"],
+            "timestamp_epoch_decimal": record["timestamp_epoch_decimal"],
+            "has_persisted_correlation": record["has_persisted_correlation"],
+        }
+
+    def list_alert_events_for_triage(
+        self,
+        *,
+        routing_domain_id: Optional[str] = None,
+        sensor_id: Optional[str] = None,
+        sid: Optional[int] = None,
+        severity: Optional[int] = None,
+        start_epoch_ns: Optional[int] = None,
+        end_epoch_ns: Optional[int] = None,
+        source_type: str = "suricata",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Read-only paginated listing of V2 AlertEvents with factual persisted-link presence.
+
+        Enforces `source_type` (default 'suricata'), strict filter validation (explicit
+        blank strings fail closed), bounded `limit` (1..200) and signed int64 `offset`,
+        deterministic `timestamp_epoch_ns` ASC (NULLS LAST), `event_id` ASC ordering,
+        and non-multiplying `EXISTS { MATCH (ae)-[:CORRELATED_WITH]->(:FlowObservation) }`
+        presence detection.
+
+        Note on isolation: count and page queries run inside one `execute_read`
+        transaction. Under Neo4j Read Committed isolation, `total` and `items` agree on
+        an unchanged dataset, but snapshot consistency is not guaranteed if concurrent
+        ingestion writes occur between the count and page statements.
+        """
+        if self.driver is None:
+            raise ConnectionError("Database driver unavailable")
+
+        norm_domain = self._normalize_optional_filter_domain(routing_domain_id)
+        norm_source_type = self._normalize_optional_source_type(source_type)
+        if norm_source_type is None:
+            raise ValueError("source_type must be a non-empty string")
+
+        norm_sensor: Optional[str] = None
+        if sensor_id is not None:
+            if not isinstance(sensor_id, str) or not sensor_id.strip():
+                raise ValueError("sensor_id must not be empty or whitespace when specified")
+            norm_sensor = sensor_id.strip().lower()
+
+        if sid is not None:
+            if isinstance(sid, bool) or not isinstance(sid, int) or not (0 <= sid <= _INT64_MAX):
+                raise ValueError(f"sid must be an integer in 0..{_INT64_MAX} or None, got {sid!r}")
+
+        if severity is not None:
+            if isinstance(severity, bool) or not isinstance(severity, int) or not (0 <= severity <= _INT64_MAX):
+                raise ValueError(f"severity must be an integer in 0..{_INT64_MAX} or None, got {severity!r}")
+
+        if start_epoch_ns is not None:
+            if isinstance(start_epoch_ns, bool) or not isinstance(start_epoch_ns, int):
+                raise ValueError(f"start_epoch_ns must be an integer or None, got {start_epoch_ns!r}")
+            if not (_INT64_MIN <= start_epoch_ns <= _INT64_MAX):
+                raise ValueError(f"start_epoch_ns exceeds 64-bit signed integer range: {start_epoch_ns}")
+
+        if end_epoch_ns is not None:
+            if isinstance(end_epoch_ns, bool) or not isinstance(end_epoch_ns, int):
+                raise ValueError(f"end_epoch_ns must be an integer or None, got {end_epoch_ns!r}")
+            if not (_INT64_MIN <= end_epoch_ns <= _INT64_MAX):
+                raise ValueError(f"end_epoch_ns exceeds 64-bit signed integer range: {end_epoch_ns}")
+
+        if start_epoch_ns is not None and end_epoch_ns is not None and start_epoch_ns > end_epoch_ns:
+            raise ValueError("start_epoch_ns cannot be greater than end_epoch_ns")
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= 200):
+            raise ValueError(f"limit must be an integer in 1..200, got {limit!r}")
+        if isinstance(offset, bool) or not isinstance(offset, int) or not (0 <= offset <= _INT64_MAX):
+            raise ValueError(f"offset must be an integer in 0..{_INT64_MAX}, got {offset!r}")
+
+        clauses: List[str] = ["ae.source_type = $source_type"]
+        filter_params: Dict[str, Any] = {"source_type": norm_source_type}
+
+        if norm_domain is not None:
+            clauses.append("ae.routing_domain_id = $routing_domain_id")
+            filter_params["routing_domain_id"] = norm_domain
+        if norm_sensor is not None:
+            clauses.append("ae.sensor_id = $sensor_id")
+            filter_params["sensor_id"] = norm_sensor
+        if sid is not None:
+            clauses.append("ae.sid = $sid")
+            filter_params["sid"] = sid
+        if severity is not None:
+            clauses.append("ae.severity = $severity")
+            filter_params["severity"] = severity
+        if start_epoch_ns is not None:
+            clauses.append("ae.timestamp_epoch_ns IS NOT NULL AND ae.timestamp_epoch_ns >= $start_epoch_ns")
+            filter_params["start_epoch_ns"] = start_epoch_ns
+        if end_epoch_ns is not None:
+            clauses.append("ae.timestamp_epoch_ns IS NOT NULL AND ae.timestamp_epoch_ns <= $end_epoch_ns")
+            filter_params["end_epoch_ns"] = end_epoch_ns
+
+        where_clause = f"WHERE {' AND '.join(clauses)}"
+
+        count_cypher = f"""
+        MATCH (ae:AlertEvent)
+        {where_clause}
+        RETURN count(ae) AS total
+        """
+
+        page_cypher = f"""
+        MATCH (ae:AlertEvent)
+        {where_clause}
+        RETURN ae.event_id AS event_id,
+               ae.routing_domain_id AS routing_domain_id,
+               ae.source_type AS source_type,
+               ae.sensor_id AS sensor_id,
+               ae.sid AS sid,
+               ae.signature AS signature,
+               ae.severity AS severity,
+               ae.category AS category,
+               ae.src_ip AS src_ip,
+               ae.dst_ip AS dst_ip,
+               ae.src_port AS src_port,
+               ae.dst_port AS dst_port,
+               ae.protocol AS protocol,
+               ae.timestamp_source AS timestamp_source,
+               ae.timestamp_epoch_decimal AS timestamp_epoch_decimal,
+               EXISTS {{ MATCH (ae)-[:CORRELATED_WITH]->(:FlowObservation) }} AS has_persisted_correlation
+        ORDER BY CASE WHEN ae.timestamp_epoch_ns IS NULL THEN 1 ELSE 0 END ASC,
+                 ae.timestamp_epoch_ns ASC,
+                 ae.event_id ASC
+        SKIP $offset
+        LIMIT $limit
+        """
+
+        def _work(tx) -> Tuple[List[Dict[str, Any]], int]:
+            count_rec = tx.run(count_cypher, **filter_params).single()
+            total = int(count_rec["total"]) if count_rec else 0
+            if total == 0 or offset >= total or offset > _INT64_MAX - limit:
+                return [], total
+            page_res = tx.run(
+                page_cypher,
+                **filter_params,
+                offset=offset,
+                limit=limit,
+            )
+            items = [self._record_to_triage_alert_event(r) for r in page_res]
+            return items, total
+
+        with self.driver.session() as session:
+            return session.execute_read(_work)

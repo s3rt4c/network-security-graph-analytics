@@ -194,6 +194,42 @@ export interface AlertEventDetailResponse {
   timestamp_epoch_decimal: string | null;
 }
 
+export interface AlertEventTriageItemResponse {
+  event_id: string;
+  routing_domain_id: string;
+  source_type: 'suricata';
+  sensor_id: string;
+  sid: SafeCount;
+  signature: string | null;
+  severity: SafeCount | null;
+  category: string | null;
+  src_ip: string;
+  dst_ip: string;
+  src_port: number | null;
+  dst_port: number | null;
+  protocol: string | null;
+  timestamp_source: string;
+  /** Exact arbitrary-precision Decimal epoch seconds string (never coerce to number). */
+  timestamp_epoch_decimal: string | null;
+  /**
+   * Factual graph presence of >= 1 persisted CORRELATED_WITH edge.
+   * False means no persisted link is recorded; it does not establish REJECTED, AMBIGUOUS,
+   * INSUFFICIENT, benign traffic, or lack of evaluation.
+   */
+  has_persisted_correlation: boolean;
+}
+
+export interface AlertEventTriageListParams {
+  routing_domain_id?: string;
+  severity?: SafeCount;
+  sid?: SafeCount;
+  sensor_id?: string;
+  start_epoch_ns?: SafeCount;
+  end_epoch_ns?: SafeCount;
+  limit?: number;
+  offset?: SafeCount;
+}
+
 export interface FlowObservationDetailResponse {
   observation_id: string;
   flow_key: string;
@@ -316,6 +352,14 @@ export interface PaginatedResponse<T> {
   total: number;
   limit: number;
   offset: number;
+}
+
+/** Strict pagination envelope preserving lossless strings when counts exceed 2^53-1. */
+export interface SafePaginatedResponse<T> {
+  items: T[];
+  total: SafeCount;
+  limit: number;
+  offset: SafeCount;
 }
 
 // Data import & workspace replacement (Phase 6.5)
