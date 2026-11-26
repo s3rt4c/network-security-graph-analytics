@@ -43,8 +43,6 @@ from urllib.request import urlopen
 
 from neo4j import GraphDatabase
 
-from src.ingestion.v2_models import format_canonical_decimal
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -52,6 +50,7 @@ if str(_REPO_ROOT) not in sys.path:
 from src.correlation import CorrelationPolicy
 from src.graph.schema import ensure_schema
 from src.ingestion.suricata_eve_parser import parse_suricata_eve_alert_file
+from src.ingestion.v2_models import format_canonical_decimal
 from src.ingestion.zeek_conn_parser import parse_zeek_conn_file
 
 _DEMO_DIR = _REPO_ROOT / "tests" / "fixtures" / "demo_v2"
