@@ -97,14 +97,48 @@ export function buildStableCorrelationRowKeys(items: AlertFlowCorrelationRespons
  * Render persisted nullable evidence values neutrally without inventing defaults
  * or coercing arbitrary-precision Decimal strings into JavaScript numbers.
  */
-export function formatPersistedValue(value: string | boolean | null): string {
+export function formatPersistedValue(value: string | number | boolean | null): string {
   if (value === null || value === '') {
     return 'Not recorded';
   }
   if (typeof value === 'boolean') {
     return value ? 'Yes (true)' : 'No (false)';
   }
+  if (typeof value === 'number') {
+    return String(value);
+  }
   return value;
+}
+
+function buildServerAndNetworkErrorSummary(
+  err: ApiError,
+  resourceLabel: string,
+  fallbackVerb: string
+): CorrelationErrorSummary {
+  if (err.status >= 500) {
+    return {
+      status: err.status,
+      title: `Internal Server Error (HTTP ${err.status})`,
+      message: `The backend server encountered an unexpected error while ${fallbackVerb}. No stack traces are exposed; please retry or inspect backend logs.`,
+      canRetry: true,
+    };
+  }
+
+  if (err.status === 0) {
+    return {
+      status: 0,
+      title: 'Network Connection Error',
+      message: `Could not connect to the API server while loading ${resourceLabel}. Verify backend availability and network connectivity, then retry.`,
+      canRetry: true,
+    };
+  }
+
+  return {
+    status: err.status,
+    title: `${resourceLabel} Request Failed (HTTP ${err.status})`,
+    message: `The ${resourceLabel} request could not be completed (HTTP ${err.status}).`,
+    canRetry: true,
+  };
 }
 
 /**
@@ -151,38 +185,78 @@ export function describeCorrelationApiError(
       };
     }
 
-    if (err.status >= 500) {
-      return {
-        status: err.status,
-        title: `Internal Server Error (HTTP ${err.status})`,
-        message:
-          'The backend server encountered an unexpected error while retrieving persisted correlations. No stack traces are exposed; please retry or inspect backend logs.',
-        canRetry: true,
-      };
-    }
-
-    if (err.status === 0) {
-      return {
-        status: 0,
-        title: 'Network Connection Error',
-        message:
-          'Could not connect to the correlation API server. Verify backend availability and network connectivity, then retry.',
-        canRetry: true,
-      };
-    }
-
-    return {
-      status: err.status,
-      title: `Correlation Query Failed (HTTP ${err.status})`,
-      message: `The correlation API request could not be completed (HTTP ${err.status}).`,
-      canRetry: true,
-    };
+    return buildServerAndNetworkErrorSummary(
+      err,
+      'persisted correlations',
+      'retrieving persisted correlations'
+    );
   }
 
   return {
     status: null,
     title: 'Unexpected Error',
     message: 'An unexpected client error occurred while loading persisted correlations.',
+    canRetry: true,
+  };
+}
+
+/**
+ * Translate ApiError and fetch failures when lazily fetching Suricata AlertEvent
+ * or Zeek FlowObservation forensic details.
+ */
+export function describeObservationDetailApiError(
+  err: unknown,
+  context: {
+    entityKind: 'AlertEvent' | 'FlowObservation';
+    entityId: string;
+    routingDomainId?: string;
+  }
+): CorrelationErrorSummary {
+  const displayName =
+    context.entityKind === 'AlertEvent' ? 'Suricata AlertEvent' : 'Zeek FlowObservation';
+
+  if (err instanceof ApiError) {
+    if (err.status === 404) {
+      const domainNote = context.routingDomainId
+        ? ` in RoutingDomain "${context.routingDomainId}"`
+        : '';
+      return {
+        status: 404,
+        title: `${displayName} Not Found (HTTP 404)`,
+        message: `No persisted ${displayName} matching "${context.entityId}" exists${domainNote}.`,
+        canRetry: true,
+      };
+    }
+
+    if (err.status === 422) {
+      return {
+        status: 422,
+        title: `Invalid ${displayName} Query Parameters (HTTP 422)`,
+        message: err.detail || `The backend rejected the ${displayName} identifier or RoutingDomain parameter.`,
+        canRetry: false,
+      };
+    }
+
+    if (err.status === 503) {
+      return {
+        status: 503,
+        title: 'Database Service Temporarily Unavailable (HTTP 503)',
+        message: `The Neo4j graph database is currently unreachable. This indicates a service availability issue and does not mean this ${displayName} is missing.`,
+        canRetry: true,
+      };
+    }
+
+    return buildServerAndNetworkErrorSummary(
+      err,
+      displayName,
+      `retrieving ${displayName} details`
+    );
+  }
+
+  return {
+    status: null,
+    title: 'Unexpected Error',
+    message: `An unexpected client error occurred while loading ${displayName} details.`,
     canRetry: true,
   };
 }

@@ -110,3 +110,15 @@ def validate_routing_domain(domain: Optional[str]) -> Optional[str]:
             detail=f"Invalid routing domain format (cannot contain '#'): '{domain}'",
         )
     return normalized
+
+
+def validate_optional_routing_domain_id(routing_domain_id: Optional[str]) -> Optional[str]:
+    """Validate an optional V2 routing_domain_id filter, failing closed on explicit blank values."""
+    if routing_domain_id is None:
+        return None
+    if not routing_domain_id.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid routing_domain_id: must not be empty when specified",
+        )
+    return validate_routing_domain(routing_domain_id)

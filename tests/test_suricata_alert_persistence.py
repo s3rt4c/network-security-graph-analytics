@@ -556,8 +556,10 @@ def test_j_cypher_relationships_and_phase_boundaries():
 
 def test_k_read_repository_guardrails_and_filters():
     none_repo = Neo4jReadRepository(None)
-    assert none_repo.get_alert_event("abc") is None
-    assert none_repo.list_alert_events() == ([], 0)
+    with pytest.raises(ConnectionError, match="Database driver unavailable"):
+        none_repo.get_alert_event("abc")
+    with pytest.raises(ConnectionError, match="Database driver unavailable"):
+        none_repo.list_alert_events()
 
     mock_session = MagicMock()
     mock_driver = MagicMock()

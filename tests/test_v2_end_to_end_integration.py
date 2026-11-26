@@ -747,6 +747,62 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
             assert branch_empty_res.status_code == 200
             assert branch_empty_res.json()["total"] == 0
 
+            # Phase 4F.1 Scenario A detail endpoints -> exact persisted Suricata AlertEvent & Zeek FlowObservation
+            alert_detail_res = client.get(
+                f"/api/v1/alert-events/{alert_a.event_id}",
+                params={"routing_domain_id": corp_domain},
+            )
+            assert alert_detail_res.status_code == 200
+            alert_detail = alert_detail_res.json()
+            assert alert_detail["event_id"] == alert_a.event_id
+            assert alert_detail["routing_domain_id"] == corp_domain
+            assert alert_detail["source_type"] == "suricata"
+            assert alert_detail["engine"] == "suricata"
+            assert alert_detail["sid"] == 9100001
+            assert alert_detail["signature"] == "SYNTHETIC Demo Strong Match TLS Observation"
+            assert alert_detail["src_ip"] == "192.0.2.10"
+            assert alert_detail["src_port"] == 54321
+            assert alert_detail["dst_ip"] == "198.51.100.20"
+            assert alert_detail["dst_port"] == 443
+            assert alert_detail["flow_id"] == "8810001"
+            assert isinstance(alert_detail["timestamp_epoch_decimal"], str)
+            assert alert_detail["timestamp_epoch_decimal"] == "1795428002.123456789123"
+            assert "timestamp_epoch_ns" not in alert_detail
+
+            flow_detail_res = client.get(
+                f"/api/v1/flow-observations/{flow_a.observation_id}",
+                params={"routing_domain_id": corp_domain},
+            )
+            assert flow_detail_res.status_code == 200
+            flow_detail = flow_detail_res.json()
+            assert flow_detail["observation_id"] == flow_a.observation_id
+            assert flow_detail["zeek_uid"] == "CDemoCorpStrong01"
+            assert flow_detail["routing_domain_id"] == corp_domain
+            assert flow_detail["source_type"] == "zeek"
+            assert flow_detail["start_epoch_decimal"] == "1795428000.123456789"
+            assert flow_detail["duration_decimal"] == "10"
+            assert flow_detail["orig_bytes"] == 640
+            assert flow_detail["resp_bytes"] == 2400
+            assert flow_detail["orig_ip_bytes"] == 928
+            assert flow_detail["resp_ip_bytes"] == 2736
+            assert flow_detail["conn_state"] == "SF"
+            assert flow_detail["service"] == "ssl"
+            assert "start_epoch_ns" not in flow_detail
+            assert "end_epoch_ns" not in flow_detail
+
+            # Cross-domain wrong-scope checks fail closed with HTTP 404
+            wrong_domain_alert = client.get(
+                f"/api/v1/alert-events/{alert_a.event_id}",
+                params={"routing_domain_id": branch_domain},
+            )
+            assert wrong_domain_alert.status_code == 404
+
+            wrong_domain_flow = client.get(
+                f"/api/v1/flow-observations/{flow_a.observation_id}",
+                params={"routing_domain_id": branch_domain},
+            )
+            assert wrong_domain_flow.status_code == 404
+
         # Confirm zero observable graph or schema mutations occurred during GET requests
         assert (
             _snapshot_demo_graph(live_driver, [corp_domain, branch_domain], [ruleset_ns])
@@ -1000,6 +1056,8 @@ def test_e2e_03_subnanosecond_decimal_delta_and_db_unavailable_503(
         with TestClient(create_app()) as unavail_client:
             unavail_res = unavail_client.get("/api/v1/correlations/alert-flows")
             assert unavail_res.status_code == 503
+            assert unavail_client.get(f"/api/v1/alert-events/{tol_alerts[0].event_id}").status_code == 503
+            assert unavail_client.get(f"/api/v1/flow-observations/{tol_flows[0].observation_id}").status_code == 503
     finally:
         _cleanup_owned_entities(live_driver, **owned)
 
@@ -1094,4 +1152,209 @@ def test_e2e_04_owned_cleanup_and_preflight_collision_safety(live_driver):
                 "MATCH (:IPAddress)-[c:COMMUNICATED_TO {flow_key: $fk}]->(:IPAddress) DELETE c",
                 fk=foreign_flow_key,
             ).consume()
+        _cleanup_owned_entities(live_driver, **owned)
+
+
+def test_e2e_05_overlapping_domains_and_corrupt_graph_links_fail_closed(
+    live_driver,
+    neo4j_test_config: Dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Live Neo4j verification of overlapping private IP isolation, missing AlertDefinition, and corrupt link fail-closed 500s."""
+    scope = _make_run_scope()
+    dom_a = scope["corp_domain"]
+    dom_b = scope["branch_domain"]
+    ruleset_ns = scope["ruleset_ns"]
+
+    _assert_domains_and_rulesets_clean(live_driver, [dom_a, dom_b], [ruleset_ns])
+    _configure_env_for_cli_and_app(monkeypatch, neo4j_test_config)
+
+    zeek_file = tmp_path / "overlap_conn.log.jsonl"
+    eve_file = tmp_path / "overlap_eve.jsonl"
+    zeek_file.write_text(
+        json.dumps(
+            {
+                "ts": 1795429000.123456789,
+                "uid": "COverlapPriv01",
+                "id.orig_h": "10.99.0.10",
+                "id.orig_p": 50001,
+                "id.resp_h": "10.99.0.20",
+                "id.resp_p": 443,
+                "proto": "tcp",
+                "duration": 5.0,
+                "orig_bytes": 128,
+                "resp_bytes": 256,
+                "conn_state": "SF",
+                "service": "ssl",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    eve_file.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-11-23T10:16:42.123456789+0000",
+                "flow_id": 9910001,
+                "event_type": "alert",
+                "src_ip": "10.99.0.10",
+                "src_port": 50001,
+                "dest_ip": "10.99.0.20",
+                "dest_port": 443,
+                "proto": "TCP",
+                "alert": {
+                    "action": "allowed",
+                    "gid": 1,
+                    "signature_id": 9109901,
+                    "rev": 1,
+                    "signature": "SYNTHETIC Overlap Domain Integrity Check",
+                    "category": "Misc Activity",
+                    "severity": 3,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    flows_a, _ = parse_zeek_conn_file(zeek_file, sensor_id="zeek-a", routing_domain_id=dom_a)
+    flows_b, _ = parse_zeek_conn_file(zeek_file, sensor_id="zeek-b", routing_domain_id=dom_b)
+    alerts_a, _ = parse_suricata_eve_alert_file(
+        eve_file,
+        sensor_id="suri-a",
+        ruleset_namespace=ruleset_ns,
+        log_source_id="eve-a",
+        routing_domain_id=dom_a,
+    )
+    alerts_b, _ = parse_suricata_eve_alert_file(
+        eve_file,
+        sensor_id="suri-b",
+        ruleset_namespace=ruleset_ns,
+        log_source_id="eve-b",
+        routing_domain_id=dom_b,
+    )
+    owned = _collect_owned_ids(
+        flows=flows_a + flows_b,
+        alerts=alerts_a + alerts_b,
+        domains=[dom_a, dom_b],
+    )
+    rogue_scoped_id = f"{dom_a}#10.99.0.99"
+    owned["scoped_ids"] = sorted(set(owned["scoped_ids"] + [rogue_scoped_id]))
+
+    alert_a = alerts_a[0]
+    alert_b = alerts_b[0]
+    flow_a = flows_a[0]
+    flow_b = flows_b[0]
+
+    try:
+        ingest_zeek_conn_file(zeek_file, sensor_id="zeek-a", routing_domain_id=dom_a, driver=live_driver)
+        ingest_zeek_conn_file(zeek_file, sensor_id="zeek-b", routing_domain_id=dom_b, driver=live_driver)
+        ingest_suricata_eve_file(
+            eve_file,
+            sensor_id="suri-a",
+            ruleset_namespace=ruleset_ns,
+            log_source_id="eve-a",
+            routing_domain_id=dom_a,
+            driver=live_driver,
+        )
+        ingest_suricata_eve_file(
+            eve_file,
+            sensor_id="suri-b",
+            ruleset_namespace=ruleset_ns,
+            log_source_id="eve-b",
+            routing_domain_id=dom_b,
+            driver=live_driver,
+        )
+
+        with TestClient(create_app(), raise_server_exceptions=False) as client:
+            # 1. Overlapping identical RFC 1918 IPv4 endpoints remain strictly isolated by RoutingDomain
+            res_a = client.get(f"/api/v1/alert-events/{alert_a.event_id}", params={"routing_domain_id": dom_a})
+            res_b = client.get(f"/api/v1/alert-events/{alert_b.event_id}", params={"routing_domain_id": dom_b})
+            assert res_a.status_code == 200 and res_a.json()["src_scoped_id"] == f"{dom_a}#10.99.0.10"
+            assert res_b.status_code == 200 and res_b.json()["src_scoped_id"] == f"{dom_b}#10.99.0.10"
+            assert client.get(f"/api/v1/alert-events/{alert_a.event_id}", params={"routing_domain_id": dom_b}).status_code == 404
+            assert client.get(f"/api/v1/flow-observations/{flow_a.observation_id}", params={"routing_domain_id": dom_b}).status_code == 404
+
+            # 2. Unlinked AlertDefinition returns 200 with engine=None (zero fabrication)
+            with live_driver.session() as session:
+                session.run(
+                    "MATCH (ae:AlertEvent {event_id: $eid})-[r:TRIGGERED_RULE]->(:AlertDefinition) DELETE r",
+                    eid=alert_a.event_id,
+                ).consume()
+            unlinked = client.get(f"/api/v1/alert-events/{alert_a.event_id}", params={"routing_domain_id": dom_a})
+            assert unlinked.status_code == 200
+            assert unlinked.json()["engine"] is None
+
+            # 3. Duplicate parallel TRIGGERED_RULE edges fail closed with sanitized 500
+            with live_driver.session() as session:
+                session.run(
+                    "MATCH (ae:AlertEvent {event_id: $eid}), (ad:AlertDefinition {definition_id: $did}) "
+                    "CREATE (ae)-[:TRIGGERED_RULE]->(ad), (ae)-[:TRIGGERED_RULE]->(ad)",
+                    eid=alert_a.event_id,
+                    did=alert_a.alert_definition_id,
+                ).consume()
+            dup_def = client.get(f"/api/v1/alert-events/{alert_a.event_id}", params={"routing_domain_id": dom_a})
+            assert dup_def.status_code == 500
+            assert dup_def.json() == {"detail": "Internal server error"}
+
+            # Restore single TRIGGERED_RULE before endpoint corruption checks
+            with live_driver.session() as session:
+                session.run(
+                    "MATCH (ae:AlertEvent {event_id: $eid})-[r:TRIGGERED_RULE]->(:AlertDefinition) DELETE r "
+                    "WITH ae MATCH (ad:AlertDefinition {definition_id: $did}) CREATE (ae)-[:TRIGGERED_RULE]->(ad)",
+                    eid=alert_a.event_id,
+                    did=alert_a.alert_definition_id,
+                ).consume()
+
+            # 4. Two HAS_SOURCE links on one AlertEvent (Scenario A) fail closed with 500
+            with live_driver.session() as session:
+                session.run(
+                    "MATCH (ae:AlertEvent {event_id: $eid}) "
+                    "MERGE (rogue:IPAddress {scoped_id: $rogue_sid}) "
+                    "ON CREATE SET rogue.address = '10.99.0.99', rogue.routing_domain_id = $dom "
+                    "CREATE (ae)-[:HAS_SOURCE]->(rogue)",
+                    eid=alert_a.event_id,
+                    rogue_sid=rogue_scoped_id,
+                    dom=dom_a,
+                ).consume()
+            two_src = client.get(f"/api/v1/alert-events/{alert_a.event_id}", params={"routing_domain_id": dom_a})
+            assert two_src.status_code == 500
+            assert two_src.json() == {"detail": "Internal server error"}
+
+            # 5. Single conflicting in-domain HAS_SOURCE (Scenario F: rogue 10.99.0.99 vs ae.src_ip 10.99.0.10) fails closed 500
+            with live_driver.session() as session:
+                session.run(
+                    "MATCH (ae:AlertEvent {event_id: $eid})-[r:HAS_SOURCE]->(ip:IPAddress) "
+                    "WHERE ip.scoped_id <> $rogue_sid DELETE r",
+                    eid=alert_a.event_id,
+                    rogue_sid=rogue_scoped_id,
+                ).consume()
+            conflict_src = client.get(f"/api/v1/alert-events/{alert_a.event_id}", params={"routing_domain_id": dom_a})
+            assert conflict_src.status_code == 500
+            assert conflict_src.json() == {"detail": "Internal server error"}
+
+            # 6. Cross-domain HAS_ORIGINATOR on FlowObservation (Scenario E) fails closed 500
+            with live_driver.session() as session:
+                session.run(
+                    "MATCH (fo:FlowObservation {observation_id: $oid})-[r:HAS_ORIGINATOR]->(:IPAddress) DELETE r "
+                    "WITH fo MATCH (other_ip:IPAddress {scoped_id: $other_sid}) "
+                    "CREATE (fo)-[:HAS_ORIGINATOR]->(other_ip)",
+                    oid=flow_a.observation_id,
+                    other_sid=flow_b.src_scoped_id,
+                ).consume()
+            cross_orig = client.get(f"/api/v1/flow-observations/{flow_a.observation_id}", params={"routing_domain_id": dom_a})
+            assert cross_orig.status_code == 500
+            assert cross_orig.json() == {"detail": "Internal server error"}
+
+            # 7. Linked IPAddress missing required `address` property (Scenario G) fails closed 500
+            with live_driver.session() as session:
+                session.run(
+                    "MATCH (ip:IPAddress {scoped_id: $sid}) REMOVE ip.address",
+                    sid=flow_b.src_scoped_id,
+                ).consume()
+            missing_prop = client.get(f"/api/v1/flow-observations/{flow_b.observation_id}", params={"routing_domain_id": dom_b})
+            assert missing_prop.status_code == 500
+            assert missing_prop.json() == {"detail": "Internal server error"}
+    finally:
         _cleanup_owned_entities(live_driver, **owned)

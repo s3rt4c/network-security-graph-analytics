@@ -13,7 +13,7 @@ from src.api.models import (
 from src.api.dependencies import (
     get_correlation_repository,
     get_read_repository,
-    validate_routing_domain,
+    validate_optional_routing_domain_id,
 )
 from src.graph.correlation_repository import Neo4jCorrelationRepository
 from src.graph.read_repository import Neo4jReadRepository
@@ -25,15 +25,8 @@ _MAX_OFFSET = 2**63 - 1
 
 
 def _validate_optional_routing_domain_id(routing_domain_id: Optional[str]) -> Optional[str]:
-    """Validate optional V2 routing_domain_id filter, failing closed on explicit blank values."""
-    if routing_domain_id is None:
-        return None
-    if not routing_domain_id.strip():
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid routing_domain_id: must not be empty when specified",
-        )
-    return validate_routing_domain(routing_domain_id)
+    """Delegate optional V2 routing_domain_id validation to shared dependency helper."""
+    return validate_optional_routing_domain_id(routing_domain_id)
 
 
 def _resolve_verification_filters(

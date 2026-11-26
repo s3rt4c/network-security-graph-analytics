@@ -81,8 +81,9 @@ src/api/routes/
   ├── health.py        (GET /health, GET /ready)
   ├── import_data.py   (GET /api/v1/import/status, POST /validate, POST /import)
   ├── network.py       (GET /api/v1/network/*, including /analytics/summary and /analytics/endpoints)
-  ├── alerts.py        (GET /api/v1/alerts/*)
+  ├── alerts.py        (GET /api/v1/alerts/* [V1 AlertFact])
   ├── correlations.py  (GET /api/v1/correlations/traffic-alerts [V1], /alert-flows* [V2])
+  ├── observations.py  (GET /api/v1/alert-events/{event_id}, /flow-observations/{observation_id} [V2])
   └── graph.py         (GET /api/v1/graph/*)
                             ▲
                             │ REST / JSON (Vite Dev Proxy)
@@ -98,8 +99,11 @@ frontend/src/
   │   └── ImportDataPage.tsx       (Browser data import, dual-file validation & workspace replacement)
   └── components/
       ├── correlations/
-      │   ├── AlertFlowCorrelationsView.tsx (V2 verified-first read-only table, filters, pagination & retry)
-      │   ├── CorrelationEvidenceModal.tsx  (Factual persisted evidence inspector & copy controls)
+      │   ├── AlertFlowCorrelationsView.tsx (V2 verified-first read-only table, filters, pagination & quick inspect actions)
+      │   ├── CorrelationEvidenceModal.tsx  (Accessible lazy three-tab inspector: Evidence / AlertEvent / FlowObservation)
+      │   ├── AlertEventDetailPanel.tsx     (Read-only Suricata AlertEvent & AlertDefinition forensic panel)
+      │   ├── FlowObservationDetailPanel.tsx (Read-only Zeek FlowObservation metrics & timestamp panel)
+      │   ├── EvidenceFieldRow.tsx          (Shared neutral field renderer & retryable error/loading shell)
       │   └── VerificationStatusBadge.tsx   (Non-color-only verified vs unverified_incomplete badge)
       ├── graph/
       │   ├── CytoscapeCanvas.tsx  (Interactive canvas lifecycle, parallel edge layout & selection)
@@ -163,8 +167,9 @@ frontend/src/
 
 ### 4. REST API Backend (`src/api/`)
 - Built with **FastAPI** and **Pydantic v2**.
-- Structured into modular routers: `health.py`, `import_data.py`, `network.py`, `alerts.py`, `correlations.py`, and `graph.py`.
+- Structured into modular routers: `health.py`, `import_data.py`, `network.py`, `alerts.py`, `correlations.py`, `observations.py`, and `graph.py`.
 - Employs lifespan events for database connectivity lifecycle and FastAPI dependency injection for repository access.
+- Maintains strict V1/V2 route separation: V1 `AlertFact` routes (`/api/v1/alerts*`) remain completely independent from V2 Suricata `AlertEvent` (`/api/v1/alert-events/{event_id}`) and Zeek `FlowObservation` (`/api/v1/flow-observations/{observation_id}`) forensic detail routes. All V2 detail lookups execute read-only `session.execute_read()` transactions, enforce `routing_domain_id` and `source_type`, validate strict `Decimal` and JS safe-integer boundaries without exposing raw `*_epoch_ns`, and propagate Neo4j unavailability as `HTTP 503` (never masking missing drivers as `404`).
 - Global exception handling maps `AmbiguousEndpointError` to machine-readable **HTTP 409 Conflict**:
   ```json
   {
@@ -181,7 +186,7 @@ frontend/src/
 - Single-page application built with **React 19**, **TypeScript 6.x**, and **Vite 8**.
 - **Graph Engine:** Cytoscape.js with custom dark cybersecurity styling, bezier curve multi-edge routing for parallel flows, and node/edge interaction handlers.
 - **Slide Drawers:** Contextual inspectors (`CommunicationEdgePanel`, `IPDetailPanel`, `Layer2DetailPanel`) for deep entity analysis without navigating away from the canvas.
-- **V2 Alert–Flow Correlations Explorer (`CorrelationsPage`, `AlertFlowCorrelationsView`):** Accessible sub-tabbed view preserving the default **Legacy Correlations** (V1 endpoint co-occurrence) tab separately from read-only persisted **Alert–Flow Correlations** (`GET /api/v1/correlations/alert-flows` and `/alert-flows/{event_id}`), with safe `include_unverified=false` default, fail-closed `RoutingDomain`/SHA-256 validation (`utils/correlationHelpers.ts`), server pagination, and `CorrelationEvidenceModal` preserving exact `Decimal` strings and neutral `Not recorded` fields without triggering live correlation runs.
+- **V2 Alert–Flow Correlations Explorer (`CorrelationsPage`, `AlertFlowCorrelationsView`):** Accessible sub-tabbed view preserving the default **Legacy Correlations** (V1 endpoint co-occurrence) tab separately from read-only persisted **Alert–Flow Correlations** (`GET /api/v1/correlations/alert-flows` and `/alert-flows/{event_id}`), with safe `include_unverified=false` default, fail-closed `RoutingDomain`/SHA-256 validation (`utils/correlationHelpers.ts`), server pagination, row quick-inspect actions (**Alert** / **Flow**), and a single accessible three-tab `CorrelationEvidenceModal` (**Correlation Evidence** default | **Suricata AlertEvent** | **Zeek FlowObservation**) that lazily fetches `GET /api/v1/alert-events/{event_id}` and `GET /api/v1/flow-observations/{observation_id}` scoped to the row's `routing_domain_id` with `AbortController` race guards, exact `Decimal` strings, and neutral `Not recorded` fields without triggering live correlation runs or cross-linking into V1 pages.
 
 ---
 

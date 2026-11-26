@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { CorrelationsPage } from '../pages/CorrelationsPage';
-import type { AlertFlowCorrelationResponse } from '../api/types';
+import { CorrelationEvidenceModal } from '../components/correlations/CorrelationEvidenceModal';
+import type {
+  AlertEventDetailResponse,
+  AlertFlowCorrelationResponse,
+  FlowObservationDetailResponse,
+} from '../api/types';
 
 const EVENT_ID_1 = 'a'.repeat(64);
 const EVENT_ID_2 = 'e'.repeat(64);
@@ -900,5 +905,546 @@ describe('CorrelationsPage Component', () => {
     fireEvent.keyDown(v2Tab, { key: 'Home' });
     expect(document.activeElement).toBe(legacyTab);
     unmount();
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 4F.1: Three-Tab Inspector, Lazy Fetch, Quick Actions, Race Safety
+  // -------------------------------------------------------------------------
+
+  function makeAlertDetailPayload(
+    overrides: Partial<AlertEventDetailResponse> = {}
+  ): AlertEventDetailResponse {
+    return {
+      event_id: EVENT_ID_1,
+      alert_definition_id: 'suricata:demo-v2-rules:1:9100001',
+      source_record_id: '8810001',
+      log_source_id: 'corp-eve-demo-01',
+      sensor_id: 'suricata-demo-01',
+      ruleset_namespace: 'demo-v2-rules',
+      routing_domain_id: 'demo-v2-corp',
+      source_type: 'suricata',
+      source_provenance: 'phase4e-corp-eve',
+      engine: 'suricata',
+      gid: 1,
+      sid: 9100001,
+      rev: 1,
+      signature: 'SYNTHETIC Demo Strong Match TLS Observation',
+      category: 'Not Suspicious Traffic',
+      severity: 3,
+      action: 'allowed',
+      app_proto: 'tls',
+      direction: 'to_server',
+      tx_id: 0,
+      pcap_cnt: '9007199254740993',
+      flow_id: '18446744073709551615',
+      src_ip: '192.0.2.10',
+      dst_ip: '198.51.100.20',
+      src_scoped_id: 'demo-v2-corp#192.0.2.10',
+      dst_scoped_id: 'demo-v2-corp#198.51.100.20',
+      protocol: 'TCP',
+      src_port: 54321,
+      dst_port: 443,
+      flow_key: 'c'.repeat(64),
+      community_id: '1:LQU9q+/0Pl8=',
+      timestamp_source: '2026-11-23T10:00:02.123456789123+0000',
+      timestamp_epoch_decimal: '1795428002.123456789123',
+      ...overrides,
+    };
+  }
+
+  function makeFlowDetailPayload(
+    overrides: Partial<FlowObservationDetailResponse> = {}
+  ): FlowObservationDetailResponse {
+    return {
+      observation_id: OBS_ID_1,
+      flow_key: 'c'.repeat(64),
+      zeek_uid: 'CDemoCorpStrong01',
+      routing_domain_id: 'demo-v2-corp',
+      sensor_id: 'zeek-demo-01',
+      source_type: 'zeek',
+      source_provenance: 'phase4e-corp-zeek',
+      community_id: '1:LQU9q+/0Pl8=',
+      src_ip: '192.0.2.10',
+      dst_ip: '198.51.100.20',
+      src_scoped_id: 'demo-v2-corp#192.0.2.10',
+      dst_scoped_id: 'demo-v2-corp#198.51.100.20',
+      protocol: 'TCP',
+      src_port: 54321,
+      dst_port: 443,
+      start_ts: '1795428000.123456789',
+      end_ts: '1795428010.123456789',
+      start_epoch_decimal: '1795428000.123456789',
+      end_epoch_decimal: '1795428010.123456789',
+      duration_decimal: '10',
+      orig_bytes: 640,
+      resp_bytes: 2400,
+      orig_ip_bytes: 928,
+      resp_ip_bytes: 2736,
+      orig_pkts: 7,
+      resp_pkts: 8,
+      missed_bytes: 0,
+      service: 'ssl',
+      conn_state: 'SF',
+      history: 'ShADadFf',
+      local_orig: true,
+      local_resp: false,
+      ...overrides,
+    };
+  }
+
+  it('lazily fetches AlertEvent and FlowObservation details, caches per correlation, supports keyboard tabs, quick actions, and preserves exact/null semantics', async () => {
+    const corr = makeV2Record({
+      event_id: EVENT_ID_1,
+      observation_id: OBS_ID_1,
+      zeek_uid: 'CDemoCorpStrong01',
+      routing_domain_id: 'demo-v2-corp',
+    });
+    const alertPayload = makeAlertDetailPayload({ engine: null, category: null });
+    const flowPayload = makeFlowDetailPayload({ end_ts: null, history: null });
+
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      // Zero browser-side mutations allowed
+      expect(init?.method).toBeUndefined();
+      const url = String(input);
+      if (url.includes('/traffic-alerts')) {
+        return mockJsonResponse({ items: [], total: 0, limit: 50, offset: 0 });
+      }
+      if (url.includes(`/api/v1/alert-events/${EVENT_ID_1}`)) {
+        return mockJsonResponse(alertPayload);
+      }
+      if (url.includes(`/api/v1/flow-observations/${OBS_ID_1}`)) {
+        return mockJsonResponse(flowPayload);
+      }
+      return mockJsonResponse({ items: [corr], total: 1, limit: 50, offset: 0 });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const writeTextMock = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: writeTextMock },
+      configurable: true,
+    });
+
+    render(<CorrelationsPage />);
+    fireEvent.click(screen.getByRole('tab', { name: /Alert–Flow Correlations/i }));
+    await screen.findByText('CDemoCorpStrong01');
+
+    // Initial table load must NOT prefetch AlertEvent or FlowObservation details
+    expect(
+      fetchMock.mock.calls.filter(([u]) => String(u).includes('/alert-events/') || String(u).includes('/flow-observations/'))
+    ).toHaveLength(0);
+
+    // Clicking Inspect opens Evidence tab without fetching AlertEvent or FlowObservation details
+    const inspectBtn = screen.getByRole('button', {
+      name: `Inspect evidence for correlation ${EVENT_ID_1} and ${OBS_ID_1}`,
+    });
+    fireEvent.click(inspectBtn);
+
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Persisted Correlation Evidence Inspector',
+    });
+    const evidenceTab = within(dialog).getByRole('tab', { name: 'Correlation Evidence' });
+    const alertTab = within(dialog).getByRole('tab', { name: 'Suricata AlertEvent' });
+    const flowTab = within(dialog).getByRole('tab', { name: 'Zeek FlowObservation' });
+    expect(evidenceTab).toHaveAttribute('aria-selected', 'true');
+    expect(
+      fetchMock.mock.calls.filter(([u]) => String(u).includes('/alert-events/') || String(u).includes('/flow-observations/'))
+    ).toHaveLength(0);
+
+    // Keyboard ArrowRight switches to Suricata AlertEvent & lazily fetches with routing_domain_id
+    evidenceTab.focus();
+    fireEvent.keyDown(evidenceTab, { key: 'ArrowRight' });
+    expect(document.activeElement).toBe(alertTab);
+    expect(alertTab).toHaveAttribute('aria-selected', 'true');
+
+    await within(dialog).findByText('SYNTHETIC Demo Strong Match TLS Observation');
+    expect(within(dialog).getByText('9100001')).toBeInTheDocument();
+    expect(within(dialog).getByText('1795428002.123456789123')).toBeInTheDocument();
+    expect(within(dialog).getByText('9007199254740993')).toBeInTheDocument();
+    expect(within(dialog).getByText('18446744073709551615')).toBeInTheDocument();
+    // Neutral missing values for unlinked engine & null category
+    expect(within(dialog).getAllByText('Not recorded').length).toBeGreaterThanOrEqual(2);
+    // Suricata epistemic boundary preserved (no confidence / compromise / attacker conclusion)
+    expect(within(dialog).getByText(/prove attacker or victim roles/i)).toBeInTheDocument();
+    expect(within(dialog).queryByText('Confidence Score')).not.toBeInTheDocument();
+    expect(within(dialog).queryByText('Attacker IP')).not.toBeInTheDocument();
+    // Provenance section collapsible via <details>
+    expect(within(dialog).getByText('Provenance & Identity')).toBeInTheDocument();
+
+    const alertUrls = fetchMock.mock.calls
+      .map(([u]) => String(u))
+      .filter((u) => u.includes(`/api/v1/alert-events/${EVENT_ID_1}`));
+    expect(alertUrls).toHaveLength(1);
+    expect(alertUrls[0]).toContain('routing_domain_id=demo-v2-corp');
+
+    // Keyboard End jumps to Zeek FlowObservation & lazily fetches
+    fireEvent.keyDown(alertTab, { key: 'End' });
+    expect(document.activeElement).toBe(flowTab);
+    expect(flowTab).toHaveAttribute('aria-selected', 'true');
+
+    await within(dialog).findByText('640');
+    expect(within(dialog).getAllByText('1795428000.123456789').length).toBeGreaterThanOrEqual(1);
+    expect(within(dialog).getByText('2400')).toBeInTheDocument();
+    expect(within(dialog).getByText('928')).toBeInTheDocument();
+    expect(within(dialog).getByText('2736')).toBeInTheDocument();
+    expect(within(dialog).getByText('SF')).toBeInTheDocument();
+    expect(within(dialog).getByText('ssl')).toBeInTheDocument();
+    expect(within(dialog).getByText(/proof of TCP session closure/i)).toBeInTheDocument();
+    expect(within(dialog).getByText(/universally prove benign traffic/i)).toBeInTheDocument();
+
+    const flowUrls = fetchMock.mock.calls
+      .map(([u]) => String(u))
+      .filter((u) => u.includes(`/api/v1/flow-observations/${OBS_ID_1}`));
+    expect(flowUrls).toHaveLength(1);
+    expect(flowUrls[0]).toContain('routing_domain_id=demo-v2-corp');
+
+    // ArrowLeft back to Suricata uses cached result (no extra HTTP call)
+    fireEvent.keyDown(flowTab, { key: 'ArrowLeft' });
+    expect(alertTab).toHaveAttribute('aria-selected', 'true');
+    expect(
+      fetchMock.mock.calls.filter(([u]) => String(u).includes(`/api/v1/alert-events/${EVENT_ID_1}`))
+    ).toHaveLength(1);
+
+    // Home jumps back to Correlation Evidence tab
+    fireEvent.keyDown(alertTab, { key: 'Home' });
+    expect(evidenceTab).toHaveAttribute('aria-selected', 'true');
+
+    // Escape closes modal and restores focus cleanly
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+
+    // Direct row quick action: Flow opens directly on Zeek FlowObservation tab
+    const flowQuickBtn = screen.getByRole('button', {
+      name: `Inspect Zeek FlowObservation ${OBS_ID_1}`,
+    });
+    flowQuickBtn.focus();
+    fireEvent.click(flowQuickBtn);
+    const dialogFlow = await screen.findByRole('dialog', {
+      name: 'Persisted Correlation Evidence Inspector',
+    });
+    expect(within(dialogFlow).getByRole('tab', { name: 'Zeek FlowObservation' })).toHaveAttribute(
+      'aria-selected',
+      'true'
+    );
+    await within(dialogFlow).findByText('640');
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+    expect(document.activeElement).toBe(flowQuickBtn);
+
+    // Direct row quick action: Alert opens directly on Suricata AlertEvent tab
+    const alertQuickBtn = screen.getByRole('button', {
+      name: `Inspect Suricata AlertEvent ${EVENT_ID_1}`,
+    });
+    fireEvent.click(alertQuickBtn);
+    const dialogAlert = await screen.findByRole('dialog', {
+      name: 'Persisted Correlation Evidence Inspector',
+    });
+    expect(within(dialogAlert).getByRole('tab', { name: 'Suricata AlertEvent' })).toHaveAttribute(
+      'aria-selected',
+      'true'
+    );
+    await within(dialogAlert).findByText('SYNTHETIC Demo Strong Match TLS Observation');
+
+    // Clipboard copy in detail panel works without navigating to V1 pages
+    const copyAlertIdBtn = within(dialogAlert).getByRole('button', {
+      name: 'Copy Suricata AlertEvent ID',
+    });
+    fireEvent.click(copyAlertIdBtn);
+    await waitFor(() => {
+      expect(within(copyAlertIdBtn).getByText('Copied')).toBeInTheDocument();
+    });
+  });
+
+  it('prevents stale async races on row switch, close/abort, repeated retry, and clears errors on retry', async () => {
+    const corrA = makeV2Record({
+      event_id: EVENT_ID_1,
+      observation_id: OBS_ID_1,
+      zeek_uid: 'CzeekRowA',
+      routing_domain_id: 'domain-a',
+    });
+    // Row B shares EVENT_ID_1 with a different observation & routing domain to verify scoped cache isolation
+    const corrB = makeV2Record({
+      event_id: EVENT_ID_1,
+      observation_id: OBS_ID_2,
+      zeek_uid: 'CzeekRowB',
+      routing_domain_id: 'domain-b',
+      evidence_digest: EVIDENCE_DIGEST_2,
+    });
+
+    let resolveSlowA!: (val: unknown) => void;
+    let rejectSlowA!: (err: unknown) => void;
+    let flowBAttempt = 0;
+    let resolveNewFlow200!: (val: unknown) => void;
+    let seenAbortedSignalA: AbortSignal | null | undefined;
+
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/traffic-alerts')) {
+        return mockJsonResponse({ items: [], total: 0, limit: 50, offset: 0 });
+      }
+      if (url.includes(`/api/v1/alert-events/${EVENT_ID_1}`) && url.includes('routing_domain_id=domain-a')) {
+        seenAbortedSignalA = init?.signal;
+        return new Promise((resolve, reject) => {
+          resolveSlowA = resolve;
+          rejectSlowA = reject;
+        });
+      }
+      if (url.includes(`/api/v1/alert-events/${EVENT_ID_1}`) && url.includes('routing_domain_id=domain-b')) {
+        return mockJsonResponse(
+          makeAlertDetailPayload({
+            routing_domain_id: 'domain-b',
+            src_scoped_id: 'domain-b#192.0.2.10',
+            dst_scoped_id: 'domain-b#198.51.100.20',
+            signature: 'Row B Authoritative Alert',
+          })
+        );
+      }
+      if (url.includes(`/api/v1/flow-observations/${OBS_ID_1}`)) {
+        return mockJsonResponse({ detail: 'Flow not found' }, 404);
+      }
+      if (url.includes(`/api/v1/flow-observations/${OBS_ID_2}`)) {
+        flowBAttempt += 1;
+        if (flowBAttempt === 1) {
+          return mockJsonResponse({ detail: 'Database service unavailable' }, 503);
+        }
+        if (flowBAttempt === 2) {
+          return Promise.reject(new DOMException('Network error', 'Error'));
+        }
+        return new Promise((resolve) => {
+          resolveNewFlow200 = resolve;
+        });
+      }
+      return mockJsonResponse({ items: [corrA, corrB], total: 2, limit: 50, offset: 0 });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const { unmount } = render(<CorrelationsPage />);
+    fireEvent.click(screen.getByRole('tab', { name: /Alert–Flow Correlations/i }));
+    await screen.findByText('CzeekRowA');
+    await screen.findByText('CzeekRowB');
+
+    const rows = screen.getAllByRole('row');
+    const rowA = rows.find((r) => within(r).queryByText('CzeekRowA'))!;
+    const rowB = rows.find((r) => within(r).queryByText('CzeekRowB'))!;
+
+    // 1. Open Alert A (slow promise) -> Close modal (aborts A) -> Verify late aborted reject is ignored
+    fireEvent.click(
+      within(rowA).getByRole('button', { name: `Inspect Suricata AlertEvent ${EVENT_ID_1}` })
+    );
+    await screen.findByRole('dialog', { name: 'Persisted Correlation Evidence Inspector' });
+    expect(seenAbortedSignalA?.aborted).toBe(false);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+    expect(seenAbortedSignalA?.aborted).toBe(true);
+    // Simulate fetch rejecting with AbortError (-> ApiError(0)) after cancel
+    rejectSlowA(new DOMException('The operation was aborted', 'AbortError'));
+    await Promise.resolve();
+    expect(screen.queryByText(/Network Connection Error/i)).not.toBeInTheDocument();
+
+    // 2. Check Flow 404 on Row A, then switch to Alert A (slow) -> close -> open Row B -> resolve slow A late
+    fireEvent.click(
+      within(rowA).getByRole('button', { name: `Inspect Zeek FlowObservation ${OBS_ID_1}` })
+    );
+    const dialogA = await screen.findByRole('dialog', {
+      name: 'Persisted Correlation Evidence Inspector',
+    });
+    await within(dialogA).findByText(/Zeek FlowObservation Not Found \(HTTP 404\)/i);
+
+    fireEvent.click(within(dialogA).getByRole('tab', { name: 'Suricata AlertEvent' }));
+    expect(seenAbortedSignalA?.aborted).toBe(false);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+    expect(seenAbortedSignalA?.aborted).toBe(true);
+
+    // Open Row B -> immediately shows Row B Alert without leaking A
+    fireEvent.click(
+      within(rowB).getByRole('button', { name: `Inspect Suricata AlertEvent ${EVENT_ID_1}` })
+    );
+    const dialogB = await screen.findByRole('dialog', {
+      name: 'Persisted Correlation Evidence Inspector',
+    });
+    await within(dialogB).findByText('Row B Authoritative Alert');
+
+    // Resolve slow Row A late -> must NEVER overwrite Row B or corrupt UI
+    resolveSlowA({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(makeAlertDetailPayload({ signature: 'STALE ROW A DATA' })),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(within(dialogB).getByText('Row B Authoritative Alert')).toBeInTheDocument();
+    expect(within(dialogB).queryByText('STALE ROW A DATA')).not.toBeInTheDocument();
+
+    // 3. Row B Flow tab: HTTP 503 -> Retry -> Network failure (ApiError(0)) -> Retry -> 200 success
+    fireEvent.click(within(dialogB).getByRole('tab', { name: 'Zeek FlowObservation' }));
+    await within(dialogB).findByText(/Database Service Temporarily Unavailable \(HTTP 503\)/i);
+
+    fireEvent.click(within(dialogB).getByRole('button', { name: 'Retry' }));
+    await within(dialogB).findByText(/Network Connection Error/i);
+
+    // Retry clears stale error and resolves new 200 cleanly
+    fireEvent.click(within(dialogB).getByRole('button', { name: 'Retry' }));
+    expect(within(dialogB).queryByText(/Network Connection Error/i)).not.toBeInTheDocument();
+    resolveNewFlow200({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve(
+          makeFlowDetailPayload({
+            observation_id: OBS_ID_2,
+            zeek_uid: 'CzeekRowB',
+            routing_domain_id: 'domain-b',
+            src_scoped_id: 'domain-b#192.0.2.10',
+            dst_scoped_id: 'domain-b#198.51.100.20',
+          })
+        ),
+    });
+    await within(dialogB).findByText('640');
+    expect(within(dialogB).queryByText(/Network Connection Error/i)).not.toBeInTheDocument();
+    expect(within(dialogB).queryByText(/Database Service Temporarily Unavailable/i)).not.toBeInTheDocument();
+
+    // Unmount while open produces zero errors
+    unmount();
+  });
+
+  // Review Regression: Valid aria-controls panel DOM targets, mounted close/reopen reset,
+  // mid-flight tab switch abort, zero/false/boundary counter rendering, and duplicate parallel edge isolation
+  it('maintains valid aria-controls targets, resets state on mounted close/reopen, aborts mid-flight tab switches, and renders 0/false/int64-max verbatim', async () => {
+    const corr1 = makeV2Record({
+      event_id: EVENT_ID_1,
+      observation_id: OBS_ID_1,
+      routing_domain_id: 'demo-v2-corp',
+      verification_status: 'verified',
+      evidence_digest: EVIDENCE_DIGEST_1,
+    });
+    const corr2Parallel = makeV2Record({
+      event_id: EVENT_ID_1,
+      observation_id: OBS_ID_1,
+      routing_domain_id: 'demo-v2-corp',
+      verification_status: 'unverified_incomplete',
+      evidence_digest: EVIDENCE_DIGEST_2,
+    });
+
+    let alertAttempts = 0;
+    let firstSlowSignal: AbortSignal | null | undefined;
+    let resolveSlowFirstAlert!: (val: unknown) => void;
+
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes(`/api/v1/alert-events/${EVENT_ID_1}`)) {
+        alertAttempts += 1;
+        if (alertAttempts === 1) {
+          return mockJsonResponse({ detail: 'Database service unavailable' }, 503);
+        }
+        if (alertAttempts === 2) {
+          firstSlowSignal = init?.signal;
+          return new Promise((resolve) => {
+            resolveSlowFirstAlert = resolve;
+          });
+        }
+        return mockJsonResponse(
+          makeAlertDetailPayload({
+            tx_id: 0,
+            pcap_cnt: '9223372036854775807',
+          })
+        );
+      }
+      if (url.includes(`/api/v1/flow-observations/${OBS_ID_1}`)) {
+        return mockJsonResponse(
+          makeFlowDetailPayload({
+            orig_bytes: 0,
+            resp_bytes: '9007199254740992',
+            missed_bytes: 0,
+            local_orig: false,
+            local_resp: false,
+          })
+        );
+      }
+      return mockJsonResponse({ items: [], total: 0, limit: 50, offset: 0 });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const onClose = vi.fn();
+    const { rerender } = render(
+      <CorrelationEvidenceModal correlation={corr1} initialTab="evidence" onClose={onClose} />
+    );
+
+    const dialog = screen.getByRole('dialog', { name: 'Persisted Correlation Evidence Inspector' });
+
+    // Every tab's aria-controls MUST point to a real tabpanel element in the DOM (inactive panels hidden)
+    const tabs = within(dialog).getAllByRole('tab');
+    expect(tabs).toHaveLength(3);
+    for (const tab of tabs) {
+      const controlsId = tab.getAttribute('aria-controls');
+      expect(controlsId).toBeTruthy();
+      const panelEl = document.getElementById(controlsId!);
+      expect(panelEl).not.toBeNull();
+      expect(panelEl?.getAttribute('role')).toBe('tabpanel');
+      expect(panelEl?.getAttribute('aria-labelledby')).toBe(tab.id);
+      const isSelected = tab.getAttribute('aria-selected') === 'true';
+      expect(panelEl?.hasAttribute('hidden')).toBe(!isSelected);
+    }
+
+    // Trigger 503 error on Suricata tab
+    fireEvent.click(within(dialog).getByRole('tab', { name: 'Suricata AlertEvent' }));
+    await within(dialog).findByText(/Database Service Temporarily Unavailable \(HTTP 503\)/i);
+
+    // Close by setting correlation=null while keeping component mounted, then reopen same corr1 on default Evidence tab
+    rerender(<CorrelationEvidenceModal correlation={null} initialTab="evidence" onClose={onClose} />);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    rerender(<CorrelationEvidenceModal correlation={corr1} initialTab="evidence" onClose={onClose} />);
+    const reopenedDialog = screen.getByRole('dialog', {
+      name: 'Persisted Correlation Evidence Inspector',
+    });
+    // Must reset back to Correlation Evidence tab and NOT display stale pre-close 503 error
+    expect(
+      within(reopenedDialog).getByRole('tab', { name: 'Correlation Evidence' })
+    ).toHaveAttribute('aria-selected', 'true');
+    expect(
+      within(reopenedDialog).queryByText(/Database Service Temporarily Unavailable/i)
+    ).not.toBeInTheDocument();
+
+    // Switch to Alert tab (attempt 2 = slow), then immediately switch to Flow tab mid-flight -> aborts Alert cleanly
+    fireEvent.click(within(reopenedDialog).getByRole('tab', { name: 'Suricata AlertEvent' }));
+    expect(firstSlowSignal?.aborted).toBe(false);
+    fireEvent.click(within(reopenedDialog).getByRole('tab', { name: 'Zeek FlowObservation' }));
+    expect(firstSlowSignal?.aborted).toBe(true);
+
+    // Verify Zeek Flow tab renders 0 counters, false booleans ("No (false)"), and unsafe 2^53 string verbatim
+    await within(reopenedDialog).findByText('9007199254740992');
+    expect(within(reopenedDialog).getAllByText('0').length).toBeGreaterThanOrEqual(2);
+    expect(within(reopenedDialog).getAllByText('No (false)').length).toBeGreaterThanOrEqual(2);
+
+    // Late resolution of aborted attempt 2 must not pollute state
+    resolveSlowFirstAlert({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(makeAlertDetailPayload({ signature: 'STALE ABORTED ALERT' })),
+    });
+    await Promise.resolve();
+
+    // Switching back to Suricata triggers clean fresh attempt 3 -> renders int64-max string verbatim
+    fireEvent.click(within(reopenedDialog).getByRole('tab', { name: 'Suricata AlertEvent' }));
+    await within(reopenedDialog).findByText('9223372036854775807');
+    expect(within(reopenedDialog).queryByText('STALE ABORTED ALERT')).not.toBeInTheDocument();
+
+    // Switching directly to a parallel correlation object sharing same IDs resets tab & displays new evidence status
+    rerender(
+      <CorrelationEvidenceModal correlation={corr2Parallel} initialTab="evidence" onClose={onClose} />
+    );
+    expect(
+      within(reopenedDialog).getByRole('tab', { name: 'Correlation Evidence' })
+    ).toHaveAttribute('aria-selected', 'true');
+    expect(within(reopenedDialog).getByText(EVIDENCE_DIGEST_2)).toBeInTheDocument();
   });
 });
