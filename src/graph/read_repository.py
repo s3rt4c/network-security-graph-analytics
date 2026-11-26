@@ -8,6 +8,7 @@ plain Python primitives/dictionaries.
 Supports V2 scoped IP identities and explicit ambiguity detection across RoutingDomains.
 """
 
+import ipaddress
 import logging
 from typing import List, Dict, Any, Optional, Tuple, Union
 
@@ -1440,6 +1441,109 @@ class Neo4jReadRepository:
             raise ValueError("source_type must not be empty or whitespace when specified")
         return cleaned
 
+    @staticmethod
+    def _resolve_endpoint_integrity(
+        *,
+        entity_label: str,
+        entity_id: str,
+        rel_type: str,
+        node_domain: Any,
+        node_scoped_id: Any,
+        node_ip: Any,
+        raw_endpoints: Any,
+    ) -> Tuple[Any, Any]:
+        """Validate linked IPAddress endpoint cardinality, domain, and property consistency.
+
+        Fails closed (ValueError -> sanitized HTTP 500) on multiple/duplicate endpoint
+        relationships, cross-domain linked IPAddress nodes, missing required endpoint
+        properties, or contradictions with persisted node properties.
+        """
+        if raw_endpoints is None:
+            return node_scoped_id, node_ip
+        if not isinstance(raw_endpoints, list):
+            raise ValueError(f"Invalid {rel_type} endpoint collection for {entity_label} '{entity_id}'")
+
+        endpoints = [ep for ep in raw_endpoints if ep is not None]
+        if not endpoints:
+            return node_scoped_id, node_ip
+        if len(endpoints) > 1:
+            raise ValueError(
+                f"Multiple or duplicate {rel_type} relationships ({len(endpoints)}) persisted for "
+                f"{entity_label} '{entity_id}'"
+            )
+
+        ep = endpoints[0]
+        if not isinstance(ep, dict):
+            raise ValueError(f"Invalid {rel_type} endpoint entry for {entity_label} '{entity_id}'")
+
+        if not isinstance(node_domain, str) or not node_domain.strip() or "#" in node_domain:
+            raise ValueError(f"Malformed routing_domain_id on {entity_label} '{entity_id}'")
+        norm_domain = node_domain.strip().lower()
+
+        ep_scoped = ep.get("scoped_id")
+        ep_addr = ep.get("address")
+        ep_domain = ep.get("routing_domain_id")
+
+        if not isinstance(ep_scoped, str) or not ep_scoped.strip() or ep_scoped != ep_scoped.strip():
+            raise ValueError(
+                f"Linked {rel_type} IPAddress missing valid scoped_id for {entity_label} '{entity_id}'"
+            )
+        if not isinstance(ep_addr, str) or not ep_addr.strip() or ep_addr != ep_addr.strip():
+            raise ValueError(
+                f"Linked {rel_type} IPAddress missing valid address for {entity_label} '{entity_id}'"
+            )
+        try:
+            canon_ep_addr = str(ipaddress.ip_address(ep_addr))
+        except ValueError as exc:
+            raise ValueError(
+                f"Linked {rel_type} IPAddress has invalid address {ep_addr!r} for {entity_label} '{entity_id}'"
+            ) from exc
+
+        if (
+            not isinstance(ep_domain, str)
+            or not ep_domain.strip()
+            or ep_domain != ep_domain.strip()
+            or "#" in ep_domain
+            or ep_domain.lower() != norm_domain
+        ):
+            raise ValueError(
+                f"Cross-domain or malformed {rel_type} IPAddress routing_domain_id {ep_domain!r} "
+                f"for {entity_label} '{entity_id}' (expected {norm_domain!r})"
+            )
+
+        expected_scoped = scoped_ip_id(norm_domain, canon_ep_addr)
+        if ep_scoped != expected_scoped:
+            raise ValueError(
+                f"Contradictory {rel_type} IPAddress scoped_id {ep_scoped!r} vs address {canon_ep_addr!r} "
+                f"for {entity_label} '{entity_id}'"
+            )
+
+        if node_scoped_id is not None:
+            if not isinstance(node_scoped_id, str) or node_scoped_id != ep_scoped:
+                raise ValueError(
+                    f"Contradictory {rel_type} scoped_id {ep_scoped!r} vs {entity_label} {node_scoped_id!r}"
+                )
+
+        if node_ip is not None:
+            if not isinstance(node_ip, str) or not node_ip.strip():
+                raise ValueError(
+                    f"Malformed stored IP {node_ip!r} on {entity_label} '{entity_id}'"
+                )
+            try:
+                canon_node_ip = str(ipaddress.ip_address(node_ip.strip()))
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid stored IP {node_ip!r} on {entity_label} '{entity_id}'"
+                ) from exc
+            if canon_node_ip != canon_ep_addr:
+                raise ValueError(
+                    f"Contradictory {rel_type} IPAddress address {canon_ep_addr!r} vs {entity_label} {canon_node_ip!r}"
+                )
+
+        resolved_scoped = node_scoped_id if node_scoped_id is not None else ep_scoped
+        resolved_ip = node_ip if node_ip is not None else ep_addr
+        return resolved_scoped, resolved_ip
+
     def get_flow_observation(
         self,
         observation_id: str,
@@ -1463,21 +1567,28 @@ class Neo4jReadRepository:
           AND NOT fo.routing_domain_id CONTAINS '#'
           AND ($routing_domain_id IS NULL OR toLower(trim(fo.routing_domain_id)) = $routing_domain_id)
           AND ($source_type IS NULL OR fo.source_type = $source_type)
-        OPTIONAL MATCH (fo)-[:HAS_ORIGINATOR]->(orig:IPAddress)
+        OPTIONAL MATCH (fo)-[r_orig:HAS_ORIGINATOR]->(orig:IPAddress)
         WITH fo,
-             collect(DISTINCT CASE WHEN orig IS NOT NULL THEN {scoped_id: orig.scoped_id, address: orig.address} END) AS orig_nodes
-        OPTIONAL MATCH (fo)-[:HAS_RESPONDER]->(resp:IPAddress)
-        WITH fo, orig_nodes[0] AS orig_ep,
-             collect(DISTINCT CASE WHEN resp IS NOT NULL THEN {scoped_id: resp.scoped_id, address: resp.address} END) AS resp_nodes
-        WITH fo, orig_ep, resp_nodes[0] AS resp_ep
+             collect(CASE WHEN r_orig IS NOT NULL THEN {
+                 scoped_id: orig.scoped_id,
+                 address: orig.address,
+                 routing_domain_id: orig.routing_domain_id
+             } END) AS orig_endpoints
+        OPTIONAL MATCH (fo)-[r_resp:HAS_RESPONDER]->(resp:IPAddress)
+        WITH fo, orig_endpoints,
+             collect(CASE WHEN r_resp IS NOT NULL THEN {
+                 scoped_id: resp.scoped_id,
+                 address: resp.address,
+                 routing_domain_id: resp.routing_domain_id
+             } END) AS resp_endpoints
         RETURN fo.observation_id AS observation_id,
                fo.flow_key AS flow_key,
                fo.zeek_uid AS zeek_uid,
                fo.routing_domain_id AS routing_domain_id,
-               coalesce(orig_ep.scoped_id, fo.src_scoped_id) AS src_scoped_id,
-               coalesce(resp_ep.scoped_id, fo.dst_scoped_id) AS dst_scoped_id,
-               coalesce(orig_ep.address, fo.src_ip) AS src_ip,
-               coalesce(resp_ep.address, fo.dst_ip) AS dst_ip,
+               fo.src_scoped_id AS src_scoped_id,
+               fo.dst_scoped_id AS dst_scoped_id,
+               fo.src_ip AS src_ip,
+               fo.dst_ip AS dst_ip,
                fo.protocol AS protocol,
                fo.src_port AS src_port,
                fo.dst_port AS dst_port,
@@ -1503,7 +1614,9 @@ class Neo4jReadRepository:
                fo.local_resp AS local_resp,
                fo.sensor_id AS sensor_id,
                fo.source_type AS source_type,
-               fo.source_provenance AS source_provenance
+               fo.source_provenance AS source_provenance,
+               orig_endpoints AS orig_endpoints,
+               resp_endpoints AS resp_endpoints
         """
 
         def _work(tx) -> Optional[Dict[str, Any]]:
@@ -1516,7 +1629,28 @@ class Neo4jReadRepository:
             rec = res.single()
             if not rec:
                 return None
-            return self._record_to_flow_observation(rec)
+            item = self._record_to_flow_observation(rec)
+            raw_orig = rec.get("orig_endpoints") if hasattr(rec, "get") else None
+            raw_resp = rec.get("resp_endpoints") if hasattr(rec, "get") else None
+            item["src_scoped_id"], item["src_ip"] = self._resolve_endpoint_integrity(
+                entity_label="FlowObservation",
+                entity_id=clean_id,
+                rel_type="HAS_ORIGINATOR",
+                node_domain=item.get("routing_domain_id"),
+                node_scoped_id=item.get("src_scoped_id"),
+                node_ip=item.get("src_ip"),
+                raw_endpoints=raw_orig,
+            )
+            item["dst_scoped_id"], item["dst_ip"] = self._resolve_endpoint_integrity(
+                entity_label="FlowObservation",
+                entity_id=clean_id,
+                rel_type="HAS_RESPONDER",
+                node_domain=item.get("routing_domain_id"),
+                node_scoped_id=item.get("dst_scoped_id"),
+                node_ip=item.get("dst_ip"),
+                raw_endpoints=raw_resp,
+            )
+            return item
 
         with self.driver.session() as session:
             return session.execute_read(_work)
@@ -1721,38 +1855,39 @@ class Neo4jReadRepository:
             )
 
         def_ns = def_row.get("ruleset_namespace")
-        if def_ns is not None:
-            event_ns = alert_item.get("ruleset_namespace")
-            if not isinstance(def_ns, str) or not def_ns.strip():
-                raise ValueError("Invalid AlertDefinition.ruleset_namespace")
-            if not isinstance(event_ns, str) or def_ns.strip().lower() != event_ns.strip().lower():
-                raise ValueError(
-                    f"Contradictory AlertDefinition.ruleset_namespace {def_ns!r} vs AlertEvent {event_ns!r}"
-                )
+        event_ns = alert_item.get("ruleset_namespace")
+        if not isinstance(def_ns, str) or not def_ns.strip() or def_ns != def_ns.strip():
+            raise ValueError("Missing or invalid AlertDefinition.ruleset_namespace")
+        if not isinstance(event_ns, str) or def_ns.lower() != event_ns.strip().lower():
+            raise ValueError(
+                f"Contradictory AlertDefinition.ruleset_namespace {def_ns!r} vs AlertEvent {event_ns!r}"
+            )
 
         def_gid = def_row.get("gid")
-        if def_gid is not None:
-            if isinstance(def_gid, bool) or not isinstance(def_gid, int) or def_gid != alert_item.get("gid"):
-                raise ValueError(
-                    f"Contradictory AlertDefinition.gid {def_gid!r} vs AlertEvent {alert_item.get('gid')!r}"
-                )
+        event_gid = alert_item.get("gid")
+        if def_gid is not None and (isinstance(def_gid, bool) or not isinstance(def_gid, int)):
+            raise ValueError(f"Invalid AlertDefinition.gid {def_gid!r}")
+        if def_gid != event_gid:
+            raise ValueError(
+                f"Contradictory AlertDefinition.gid {def_gid!r} vs AlertEvent {event_gid!r}"
+            )
 
         def_sid = def_row.get("sid")
-        if def_sid is not None:
-            if isinstance(def_sid, bool) or not isinstance(def_sid, int) or def_sid != alert_item.get("sid"):
-                raise ValueError(
-                    f"Contradictory AlertDefinition.sid {def_sid!r} vs AlertEvent {alert_item.get('sid')!r}"
-                )
+        event_sid = alert_item.get("sid")
+        if isinstance(def_sid, bool) or not isinstance(def_sid, int) or def_sid != event_sid:
+            raise ValueError(
+                f"Contradictory or missing AlertDefinition.sid {def_sid!r} vs AlertEvent {event_sid!r}"
+            )
 
         def_engine = def_row.get("engine")
         if def_engine is None:
             return None
-        if not isinstance(def_engine, str) or not def_engine.strip():
+        if not isinstance(def_engine, str) or not def_engine.strip() or def_engine != def_engine.strip():
             raise ValueError(f"Invalid AlertDefinition.engine {def_engine!r}")
 
         event_source_type = alert_item.get("source_type")
         if isinstance(event_source_type, str) and event_source_type.strip():
-            if def_engine.strip().lower() != event_source_type.strip().lower():
+            if def_engine != event_source_type.strip().lower():
                 raise ValueError(
                     f"Contradictory AlertDefinition.engine {def_engine!r} vs AlertEvent.source_type "
                     f"{event_source_type!r}"
@@ -1784,15 +1919,23 @@ class Neo4jReadRepository:
           AND NOT ae.routing_domain_id CONTAINS '#'
           AND ($routing_domain_id IS NULL OR toLower(trim(ae.routing_domain_id)) = $routing_domain_id)
           AND ($source_type IS NULL OR ae.source_type = $source_type)
-        OPTIONAL MATCH (ae)-[:HAS_SOURCE]->(src_ip:IPAddress)
+        OPTIONAL MATCH (ae)-[r_src:HAS_SOURCE]->(src_ip:IPAddress)
         WITH ae,
-             collect(DISTINCT CASE WHEN src_ip IS NOT NULL THEN {scoped_id: src_ip.scoped_id, address: src_ip.address} END) AS src_nodes
-        OPTIONAL MATCH (ae)-[:HAS_DESTINATION]->(dst_ip:IPAddress)
-        WITH ae, src_nodes[0] AS src_ep,
-             collect(DISTINCT CASE WHEN dst_ip IS NOT NULL THEN {scoped_id: dst_ip.scoped_id, address: dst_ip.address} END) AS dst_nodes
-        OPTIONAL MATCH (ae)-[:TRIGGERED_RULE]->(ad:AlertDefinition)
-        WITH ae, src_ep, dst_nodes[0] AS dst_ep,
-             collect(DISTINCT CASE WHEN ad IS NOT NULL THEN {
+             collect(CASE WHEN r_src IS NOT NULL THEN {
+                 scoped_id: src_ip.scoped_id,
+                 address: src_ip.address,
+                 routing_domain_id: src_ip.routing_domain_id
+             } END) AS src_endpoints
+        OPTIONAL MATCH (ae)-[r_dst:HAS_DESTINATION]->(dst_ip:IPAddress)
+        WITH ae, src_endpoints,
+             collect(CASE WHEN r_dst IS NOT NULL THEN {
+                 scoped_id: dst_ip.scoped_id,
+                 address: dst_ip.address,
+                 routing_domain_id: dst_ip.routing_domain_id
+             } END) AS dst_endpoints
+        OPTIONAL MATCH (ae)-[r_def:TRIGGERED_RULE]->(ad:AlertDefinition)
+        WITH ae, src_endpoints, dst_endpoints,
+             collect(CASE WHEN r_def IS NOT NULL THEN {
                  definition_id: ad.definition_id,
                  engine: ad.engine,
                  ruleset_namespace: ad.ruleset_namespace,
@@ -1807,10 +1950,10 @@ class Neo4jReadRepository:
                ae.ruleset_namespace AS ruleset_namespace,
                ae.routing_domain_id AS routing_domain_id,
                ae.flow_key AS flow_key,
-               coalesce(src_ep.scoped_id, ae.src_scoped_id) AS src_scoped_id,
-               coalesce(dst_ep.scoped_id, ae.dst_scoped_id) AS dst_scoped_id,
-               coalesce(src_ep.address, ae.src_ip) AS src_ip,
-               coalesce(dst_ep.address, ae.dst_ip) AS dst_ip,
+               ae.src_scoped_id AS src_scoped_id,
+               ae.dst_scoped_id AS dst_scoped_id,
+               ae.src_ip AS src_ip,
+               ae.dst_ip AS dst_ip,
                ae.timestamp_source AS timestamp_source,
                ae.timestamp_epoch_decimal AS timestamp_epoch_decimal,
                ae.timestamp_epoch_ns AS timestamp_epoch_ns,
@@ -1832,6 +1975,8 @@ class Neo4jReadRepository:
                ae.pcap_cnt AS pcap_cnt,
                ae.source_type AS source_type,
                ae.source_provenance AS source_provenance,
+               src_endpoints AS src_endpoints,
+               dst_endpoints AS dst_endpoints,
                alert_definitions AS alert_definitions
         """
 
@@ -1845,6 +1990,26 @@ class Neo4jReadRepository:
             if not record:
                 return None
             item = self._record_to_alert_event(record)
+            raw_src = record.get("src_endpoints") if hasattr(record, "get") else None
+            raw_dst = record.get("dst_endpoints") if hasattr(record, "get") else None
+            item["src_scoped_id"], item["src_ip"] = self._resolve_endpoint_integrity(
+                entity_label="AlertEvent",
+                entity_id=cleaned_id,
+                rel_type="HAS_SOURCE",
+                node_domain=item.get("routing_domain_id"),
+                node_scoped_id=item.get("src_scoped_id"),
+                node_ip=item.get("src_ip"),
+                raw_endpoints=raw_src,
+            )
+            item["dst_scoped_id"], item["dst_ip"] = self._resolve_endpoint_integrity(
+                entity_label="AlertEvent",
+                entity_id=cleaned_id,
+                rel_type="HAS_DESTINATION",
+                node_domain=item.get("routing_domain_id"),
+                node_scoped_id=item.get("dst_scoped_id"),
+                node_ip=item.get("dst_ip"),
+                raw_endpoints=raw_dst,
+            )
             raw_defs = record.get("alert_definitions") if hasattr(record, "get") else None
             item["engine"] = self._resolve_alert_definition_engine(item, raw_defs)
             return item

@@ -12,6 +12,7 @@ JS_MAX_SAFE_INTEGER = (1 << 53) - 1  # 9007199254740991
 _INT64_MAX = (1 << 63) - 1
 _UINT64_MAX = (1 << 64) - 1
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_FIXED_DECIMAL_RE = re.compile(r"^-?[0-9]+(?:\.[0-9]+)?$")
 
 
 def _require_non_empty_text(value: Any, field_name: str) -> str:
@@ -48,16 +49,25 @@ def _validate_optional_non_empty_text(value: Any, field_name: str) -> Optional[s
     return _require_non_empty_text(value, field_name)
 
 
-def _validate_optional_finite_decimal_str(value: Any, field_name: str) -> Optional[str]:
+def _validate_optional_finite_decimal_str(
+    value: Any,
+    field_name: str,
+    *,
+    non_negative: bool = False,
+) -> Optional[str]:
     if value is None:
         return None
     cleaned = _require_non_empty_text(value, field_name)
+    if not _FIXED_DECIMAL_RE.fullmatch(cleaned):
+        raise ValueError(f"{field_name} must be a fixed-point decimal string, got {value!r}")
     try:
         dec = Decimal(cleaned)
     except InvalidOperation as exc:
         raise ValueError(f"{field_name} must be a valid decimal string, got {value!r}") from exc
     if not dec.is_finite():
         raise ValueError(f"{field_name} must be finite, got {value!r}")
+    if non_negative and dec < 0:
+        raise ValueError(f"{field_name} must be non-negative, got {value!r}")
     return cleaned
 
 
@@ -532,7 +542,13 @@ class AlertEventDetailResponse(BaseModel):
             )
         return self
 
-    @field_serializer("gid", "sid", "rev", "severity", "tx_id", "pcap_cnt", when_used="json")
+    @field_serializer("sid", when_used="json")
+    def _serialize_safe_sid(self, value: int) -> Union[int, str]:
+        if abs(value) > JS_MAX_SAFE_INTEGER:
+            return str(value)
+        return value
+
+    @field_serializer("gid", "rev", "severity", "tx_id", "pcap_cnt", when_used="json")
     def _serialize_safe_integers(self, value: Optional[int]) -> Optional[Union[int, str]]:
         return _serialize_js_safe_int(value)
 
@@ -632,10 +648,15 @@ class FlowObservationDetailResponse(BaseModel):
     def _check_optional_text(cls, value: Optional[str], info) -> Optional[str]:
         return _validate_optional_non_empty_text(value, info.field_name)
 
-    @field_validator("start_epoch_decimal", "end_epoch_decimal", "duration_decimal")
+    @field_validator("start_epoch_decimal", "end_epoch_decimal")
     @classmethod
     def _check_decimals(cls, value: Optional[str], info) -> Optional[str]:
         return _validate_optional_finite_decimal_str(value, info.field_name)
+
+    @field_validator("duration_decimal")
+    @classmethod
+    def _check_duration_decimal(cls, value: Optional[str], info) -> Optional[str]:
+        return _validate_optional_finite_decimal_str(value, info.field_name, non_negative=True)
 
     @field_validator("src_port", "dst_port")
     @classmethod

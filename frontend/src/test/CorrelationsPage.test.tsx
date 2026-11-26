@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { CorrelationsPage } from '../pages/CorrelationsPage';
+import { CorrelationEvidenceModal } from '../components/correlations/CorrelationEvidenceModal';
 import type {
   AlertEventDetailResponse,
   AlertFlowCorrelationResponse,
@@ -1313,5 +1314,137 @@ describe('CorrelationsPage Component', () => {
 
     // Unmount while open produces zero errors
     unmount();
+  });
+
+  // Review Regression: Valid aria-controls panel DOM targets, mounted close/reopen reset,
+  // mid-flight tab switch abort, zero/false/boundary counter rendering, and duplicate parallel edge isolation
+  it('maintains valid aria-controls targets, resets state on mounted close/reopen, aborts mid-flight tab switches, and renders 0/false/int64-max verbatim', async () => {
+    const corr1 = makeV2Record({
+      event_id: EVENT_ID_1,
+      observation_id: OBS_ID_1,
+      routing_domain_id: 'demo-v2-corp',
+      verification_status: 'verified',
+      evidence_digest: EVIDENCE_DIGEST_1,
+    });
+    const corr2Parallel = makeV2Record({
+      event_id: EVENT_ID_1,
+      observation_id: OBS_ID_1,
+      routing_domain_id: 'demo-v2-corp',
+      verification_status: 'unverified_incomplete',
+      evidence_digest: EVIDENCE_DIGEST_2,
+    });
+
+    let alertAttempts = 0;
+    let firstSlowSignal: AbortSignal | null | undefined;
+    let resolveSlowFirstAlert!: (val: unknown) => void;
+
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes(`/api/v1/alert-events/${EVENT_ID_1}`)) {
+        alertAttempts += 1;
+        if (alertAttempts === 1) {
+          return mockJsonResponse({ detail: 'Database service unavailable' }, 503);
+        }
+        if (alertAttempts === 2) {
+          firstSlowSignal = init?.signal;
+          return new Promise((resolve) => {
+            resolveSlowFirstAlert = resolve;
+          });
+        }
+        return mockJsonResponse(
+          makeAlertDetailPayload({
+            tx_id: 0,
+            pcap_cnt: '9223372036854775807',
+          })
+        );
+      }
+      if (url.includes(`/api/v1/flow-observations/${OBS_ID_1}`)) {
+        return mockJsonResponse(
+          makeFlowDetailPayload({
+            orig_bytes: 0,
+            resp_bytes: '9007199254740992',
+            missed_bytes: 0,
+            local_orig: false,
+            local_resp: false,
+          })
+        );
+      }
+      return mockJsonResponse({ items: [], total: 0, limit: 50, offset: 0 });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const onClose = vi.fn();
+    const { rerender } = render(
+      <CorrelationEvidenceModal correlation={corr1} initialTab="evidence" onClose={onClose} />
+    );
+
+    const dialog = screen.getByRole('dialog', { name: 'Persisted Correlation Evidence Inspector' });
+
+    // Every tab's aria-controls MUST point to a real tabpanel element in the DOM (inactive panels hidden)
+    const tabs = within(dialog).getAllByRole('tab');
+    expect(tabs).toHaveLength(3);
+    for (const tab of tabs) {
+      const controlsId = tab.getAttribute('aria-controls');
+      expect(controlsId).toBeTruthy();
+      const panelEl = document.getElementById(controlsId!);
+      expect(panelEl).not.toBeNull();
+      expect(panelEl?.getAttribute('role')).toBe('tabpanel');
+      expect(panelEl?.getAttribute('aria-labelledby')).toBe(tab.id);
+      const isSelected = tab.getAttribute('aria-selected') === 'true';
+      expect(panelEl?.hasAttribute('hidden')).toBe(!isSelected);
+    }
+
+    // Trigger 503 error on Suricata tab
+    fireEvent.click(within(dialog).getByRole('tab', { name: 'Suricata AlertEvent' }));
+    await within(dialog).findByText(/Database Service Temporarily Unavailable \(HTTP 503\)/i);
+
+    // Close by setting correlation=null while keeping component mounted, then reopen same corr1 on default Evidence tab
+    rerender(<CorrelationEvidenceModal correlation={null} initialTab="evidence" onClose={onClose} />);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    rerender(<CorrelationEvidenceModal correlation={corr1} initialTab="evidence" onClose={onClose} />);
+    const reopenedDialog = screen.getByRole('dialog', {
+      name: 'Persisted Correlation Evidence Inspector',
+    });
+    // Must reset back to Correlation Evidence tab and NOT display stale pre-close 503 error
+    expect(
+      within(reopenedDialog).getByRole('tab', { name: 'Correlation Evidence' })
+    ).toHaveAttribute('aria-selected', 'true');
+    expect(
+      within(reopenedDialog).queryByText(/Database Service Temporarily Unavailable/i)
+    ).not.toBeInTheDocument();
+
+    // Switch to Alert tab (attempt 2 = slow), then immediately switch to Flow tab mid-flight -> aborts Alert cleanly
+    fireEvent.click(within(reopenedDialog).getByRole('tab', { name: 'Suricata AlertEvent' }));
+    expect(firstSlowSignal?.aborted).toBe(false);
+    fireEvent.click(within(reopenedDialog).getByRole('tab', { name: 'Zeek FlowObservation' }));
+    expect(firstSlowSignal?.aborted).toBe(true);
+
+    // Verify Zeek Flow tab renders 0 counters, false booleans ("No (false)"), and unsafe 2^53 string verbatim
+    await within(reopenedDialog).findByText('9007199254740992');
+    expect(within(reopenedDialog).getAllByText('0').length).toBeGreaterThanOrEqual(2);
+    expect(within(reopenedDialog).getAllByText('No (false)').length).toBeGreaterThanOrEqual(2);
+
+    // Late resolution of aborted attempt 2 must not pollute state
+    resolveSlowFirstAlert({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(makeAlertDetailPayload({ signature: 'STALE ABORTED ALERT' })),
+    });
+    await Promise.resolve();
+
+    // Switching back to Suricata triggers clean fresh attempt 3 -> renders int64-max string verbatim
+    fireEvent.click(within(reopenedDialog).getByRole('tab', { name: 'Suricata AlertEvent' }));
+    await within(reopenedDialog).findByText('9223372036854775807');
+    expect(within(reopenedDialog).queryByText('STALE ABORTED ALERT')).not.toBeInTheDocument();
+
+    // Switching directly to a parallel correlation object sharing same IDs resets tab & displays new evidence status
+    rerender(
+      <CorrelationEvidenceModal correlation={corr2Parallel} initialTab="evidence" onClose={onClose} />
+    );
+    expect(
+      within(reopenedDialog).getByRole('tab', { name: 'Correlation Evidence' })
+    ).toHaveAttribute('aria-selected', 'true');
+    expect(within(reopenedDialog).getByText(EVIDENCE_DIGEST_2)).toBeInTheDocument();
   });
 });

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { ShieldAlert } from 'lucide-react';
 import { getAlertEvent, getFlowObservation } from '../../api/observations';
 import type {
@@ -24,7 +24,14 @@ interface CorrelationEvidenceModalProps {
   onClose: () => void;
 }
 
+interface CorrelationEvidenceModalContentProps {
+  correlation: AlertFlowCorrelationResponse;
+  initialTab: InspectorTab;
+  onClose: () => void;
+}
+
 interface DetailSlotState<T> {
+  target: AlertFlowCorrelationResponse;
   correlationKey: string;
   status: 'idle' | 'success' | 'error';
   data: T | null;
@@ -37,25 +44,16 @@ const INSPECTOR_TABS: ReadonlyArray<{ id: InspectorTab; label: string }> = [
   { id: 'flow', label: 'Zeek FlowObservation' },
 ];
 
-function buildCorrelationKey(
-  correlation: AlertFlowCorrelationResponse | null,
-  initialTab: InspectorTab
-): string {
-  if (!correlation) {
-    return '';
-  }
-  return `${correlation.routing_domain_id}|${correlation.event_id}|${correlation.observation_id}|${initialTab}`;
-}
-
-function buildDataCacheKey(correlation: AlertFlowCorrelationResponse | null): string {
-  if (!correlation) {
-    return '';
-  }
+function buildDataCacheKey(correlation: AlertFlowCorrelationResponse): string {
   return `${correlation.routing_domain_id}|${correlation.event_id}|${correlation.observation_id}`;
 }
 
-function createIdleSlot<T>(correlationKey: string): DetailSlotState<T> {
+function createIdleSlot<T>(
+  target: AlertFlowCorrelationResponse,
+  correlationKey: string
+): DetailSlotState<T> {
   return {
+    target,
     correlationKey,
     status: 'idle',
     data: null,
@@ -63,29 +61,28 @@ function createIdleSlot<T>(correlationKey: string): DetailSlotState<T> {
   };
 }
 
-/**
- * Read-only three-tab correlation inspector modal displaying:
- * 1. Persisted Correlation Evidence (default)
- * 2. Lazily fetched Suricata AlertEvent & AlertDefinition details
- * 3. Lazily fetched Zeek FlowObservation details
- */
-export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> = ({
+const CorrelationEvidenceModalContent: React.FC<CorrelationEvidenceModalContentProps> = ({
   correlation,
-  initialTab = 'evidence',
+  initialTab,
   onClose,
 }) => {
+  const idPrefix = useId();
   const dataKey = buildDataCacheKey(correlation);
-  const tabScopeKey = buildCorrelationKey(correlation, initialTab);
 
-  const [tabState, setTabState] = useState<{ scopeKey: string; tab: InspectorTab }>(() => ({
-    scopeKey: tabScopeKey,
+  const [tabState, setTabState] = useState<{
+    target: AlertFlowCorrelationResponse;
+    initialTab: InspectorTab;
+    tab: InspectorTab;
+  }>(() => ({
+    target: correlation,
+    initialTab,
     tab: initialTab,
   }));
   const [alertSlot, setAlertSlot] = useState<DetailSlotState<AlertEventDetailResponse>>(() =>
-    createIdleSlot<AlertEventDetailResponse>(dataKey)
+    createIdleSlot<AlertEventDetailResponse>(correlation, dataKey)
   );
   const [flowSlot, setFlowSlot] = useState<DetailSlotState<FlowObservationDetailResponse>>(() =>
-    createIdleSlot<FlowObservationDetailResponse>(dataKey)
+    createIdleSlot<FlowObservationDetailResponse>(correlation, dataKey)
   );
   const [alertRetryNonce, setAlertRetryNonce] = useState<number>(0);
   const [flowRetryNonce, setFlowRetryNonce] = useState<number>(0);
@@ -94,21 +91,24 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
     field: string;
   } | null>(null);
 
-  const activeTab: InspectorTab = tabState.scopeKey === tabScopeKey ? tabState.tab : initialTab;
+  const activeTab: InspectorTab =
+    tabState.target === correlation && tabState.initialTab === initialTab
+      ? tabState.tab
+      : initialTab;
 
   const effectiveAlertSlot =
-    alertSlot.correlationKey === dataKey
+    alertSlot.target === correlation && alertSlot.correlationKey === dataKey
       ? alertSlot
-      : createIdleSlot<AlertEventDetailResponse>(dataKey);
+      : createIdleSlot<AlertEventDetailResponse>(correlation, dataKey);
 
   const effectiveFlowSlot =
-    flowSlot.correlationKey === dataKey
+    flowSlot.target === correlation && flowSlot.correlationKey === dataKey
       ? flowSlot
-      : createIdleSlot<FlowObservationDetailResponse>(dataKey);
+      : createIdleSlot<FlowObservationDetailResponse>(correlation, dataKey);
 
   const copyTimerRef = useRef<number | null>(null);
   const isMountedRef = useRef<boolean>(true);
-  const activeCorrelationRef = useRef<AlertFlowCorrelationResponse | null>(correlation);
+  const activeCorrelationRef = useRef<AlertFlowCorrelationResponse>(correlation);
   const activeDataKeyRef = useRef<string>(dataKey);
 
   const alertReqIdRef = useRef<number>(0);
@@ -160,7 +160,7 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
 
   // Lazy AlertEvent fetch (only when Suricata tab is active and slot is idle)
   useEffect(() => {
-    if (!correlation || !dataKey || activeTab !== 'alert' || effectiveAlertSlot.status !== 'idle') {
+    if (activeTab !== 'alert' || effectiveAlertSlot.status !== 'idle') {
       return;
     }
 
@@ -185,6 +185,7 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
           return;
         }
         setAlertSlot({
+          target,
           correlationKey: targetKey,
           status: 'success',
           data,
@@ -202,6 +203,7 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
           return;
         }
         setAlertSlot({
+          target,
           correlationKey: targetKey,
           status: 'error',
           data: null,
@@ -216,12 +218,15 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
     return () => {
       alertReqIdRef.current += 1;
       controller.abort();
+      if (alertControllerRef.current === controller) {
+        alertControllerRef.current = null;
+      }
     };
   }, [correlation, dataKey, activeTab, effectiveAlertSlot.status, alertRetryNonce]);
 
   // Lazy FlowObservation fetch (only when Zeek tab is active and slot is idle)
   useEffect(() => {
-    if (!correlation || !dataKey || activeTab !== 'flow' || effectiveFlowSlot.status !== 'idle') {
+    if (activeTab !== 'flow' || effectiveFlowSlot.status !== 'idle') {
       return;
     }
 
@@ -246,6 +251,7 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
           return;
         }
         setFlowSlot({
+          target,
           correlationKey: targetKey,
           status: 'success',
           data,
@@ -263,6 +269,7 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
           return;
         }
         setFlowSlot({
+          target,
           correlationKey: targetKey,
           status: 'error',
           data: null,
@@ -277,6 +284,9 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
     return () => {
       flowReqIdRef.current += 1;
       controller.abort();
+      if (flowControllerRef.current === controller) {
+        flowControllerRef.current = null;
+      }
     };
   }, [correlation, dataKey, activeTab, effectiveFlowSlot.status, flowRetryNonce]);
 
@@ -291,12 +301,12 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
   };
 
   const handleRetryAlert = () => {
-    setAlertSlot(createIdleSlot<AlertEventDetailResponse>(dataKey));
+    setAlertSlot(createIdleSlot<AlertEventDetailResponse>(correlation, dataKey));
     setAlertRetryNonce((n) => n + 1);
   };
 
   const handleRetryFlow = () => {
-    setFlowSlot(createIdleSlot<FlowObservationDetailResponse>(dataKey));
+    setFlowSlot(createIdleSlot<FlowObservationDetailResponse>(correlation, dataKey));
     setFlowRetryNonce((n) => n + 1);
   };
 
@@ -346,14 +356,10 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
     if (nextIndex !== null) {
       e.preventDefault();
       const nextTab = INSPECTOR_TABS[nextIndex].id;
-      setTabState({ scopeKey: tabScopeKey, tab: nextTab });
+      setTabState({ target: correlation, initialTab, tab: nextTab });
       tabRefs.current[nextTab]?.focus();
     }
   };
-
-  if (!correlation) {
-    return null;
-  }
 
   const isFieldCopied = (fieldKey: string) =>
     copiedState?.target === correlation && copiedState.field === fieldKey;
@@ -408,14 +414,14 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
                 ref={(el) => {
                   tabRefs.current[tab.id] = el;
                 }}
-                id={`inspector-tab-${tab.id}`}
+                id={`${idPrefix}-tab-${tab.id}`}
                 type="button"
                 role="tab"
                 aria-selected={isSelected}
-                aria-controls={`inspector-panel-${tab.id}`}
+                aria-controls={`${idPrefix}-panel-${tab.id}`}
                 tabIndex={isSelected ? 0 : -1}
                 className={isSelected ? 'btn-primary' : 'btn-secondary'}
-                onClick={() => setTabState({ scopeKey: tabScopeKey, tab: tab.id })}
+                onClick={() => setTabState({ target: correlation, initialTab, tab: tab.id })}
                 onKeyDown={(e) => handleTabKeyDown(e, idx)}
                 style={{ fontSize: '0.8rem', padding: '0.4rem 0.75rem' }}
               >
@@ -425,12 +431,13 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
           })}
         </div>
 
-        {/* Active Tab Panel */}
+        {/* Persistent Tabpanel Containers (valid aria-controls IDREFs; lazy panel body mounting) */}
         <div
-          id={`inspector-panel-${activeTab}`}
+          id={`${idPrefix}-panel-evidence`}
           role="tabpanel"
-          aria-labelledby={`inspector-tab-${activeTab}`}
-          tabIndex={0}
+          aria-labelledby={`${idPrefix}-tab-evidence`}
+          hidden={activeTab !== 'evidence'}
+          tabIndex={activeTab === 'evidence' ? 0 : undefined}
         >
           {activeTab === 'evidence' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
@@ -575,7 +582,15 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
               </div>
             </div>
           )}
+        </div>
 
+        <div
+          id={`${idPrefix}-panel-alert`}
+          role="tabpanel"
+          aria-labelledby={`${idPrefix}-tab-alert`}
+          hidden={activeTab !== 'alert'}
+          tabIndex={activeTab === 'alert' ? 0 : undefined}
+        >
           {activeTab === 'alert' && (
             <AlertEventDetailPanel
               data={effectiveAlertSlot.data}
@@ -586,7 +601,15 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
               onCopyField={(fieldKey, val) => handleCopy(correlation, fieldKey, val)}
             />
           )}
+        </div>
 
+        <div
+          id={`${idPrefix}-panel-flow`}
+          role="tabpanel"
+          aria-labelledby={`${idPrefix}-tab-flow`}
+          hidden={activeTab !== 'flow'}
+          tabIndex={activeTab === 'flow' ? 0 : undefined}
+        >
           {activeTab === 'flow' && (
             <FlowObservationDetailPanel
               data={effectiveFlowSlot.data}
@@ -606,5 +629,32 @@ export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> =
         </div>
       </div>
     </Modal>
+  );
+};
+
+/**
+ * Read-only three-tab correlation inspector modal displaying:
+ * 1. Persisted Correlation Evidence (default)
+ * 2. Lazily fetched Suricata AlertEvent & AlertDefinition details
+ * 3. Lazily fetched Zeek FlowObservation details
+ *
+ * Unmounts inner state completely whenever `correlation` is null so closing and
+ * reopening cleanly resets active tab, cached detail slots, and abort controllers.
+ */
+export const CorrelationEvidenceModal: React.FC<CorrelationEvidenceModalProps> = ({
+  correlation,
+  initialTab = 'evidence',
+  onClose,
+}) => {
+  if (!correlation) {
+    return null;
+  }
+
+  return (
+    <CorrelationEvidenceModalContent
+      correlation={correlation}
+      initialTab={initialTab}
+      onClose={onClose}
+    />
   );
 };

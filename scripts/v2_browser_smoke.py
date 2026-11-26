@@ -776,6 +776,19 @@ def run_browser_smoke() -> None:
                     )
                     == "true"
                 )
+                # Verify every tab's aria-controls points to an existing role="tabpanel" in DOM
+                all_tabs_valid = dialog.evaluate(
+                    """(dlg) => {
+                        const tabs = Array.from(dlg.querySelectorAll('[role="tab"]'));
+                        return tabs.length === 3 && tabs.every((t) => {
+                            const cid = t.getAttribute('aria-controls');
+                            const panel = cid ? document.getElementById(cid) : null;
+                            return panel !== null && panel.getAttribute('role') === 'tabpanel';
+                        });
+                    }"""
+                )
+                assert all_tabs_valid, "Expected all three inspector tabs to reference valid DOM tabpanels"
+
                 with page.expect_response(
                     lambda r: urlparse(r.url).path == f"/api/v1/alert-events/{alert_a.event_id}"
                     and parse_qs(urlparse(r.url).query).get("routing_domain_id") == [_CORP_DOMAIN],
@@ -821,6 +834,9 @@ def run_browser_smoke() -> None:
 
                 page.keyboard.press("Escape")
                 dialog.wait_for(state="detached", timeout=10000)
+                assert inspect_btn.evaluate("el => el === document.activeElement"), (
+                    "Expected Escape to restore keyboard focus to triggering Inspect button"
+                )
 
                 # Filter by RoutingDomain=demo-v2-branch -> wait explicitly for API response & DOM detach
                 page.get_by_role("textbox", name="RoutingDomain").fill(_BRANCH_DOMAIN)

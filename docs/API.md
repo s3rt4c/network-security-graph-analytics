@@ -192,7 +192,7 @@ Preserved unverified correlation (`GET /api/v1/correlations/alert-flows?include_
 - **Path ID (`event_id` / `observation_id`):** Must match `^[0-9a-f]{64}$` (invalid values return **HTTP 422**).
 - **`routing_domain_id` *(optional query string)*:** When specified, trimmed lowercase normalization applies; blank/whitespace values or values containing `#` return **HTTP 422**. Mismatched domain returns **HTTP 404**. Persisted nodes with missing/malformed `routing_domain_id` fail closed.
 - **`source_type` Enforcement:** `AlertEvent` lookups enforce `source_type = 'suricata'` (`Literal["suricata"]`), and `FlowObservation` lookups enforce `source_type = 'zeek'` (`Literal["zeek"]`). Wrong-source nodes never leak across endpoints.
-- **Missing or Contradictory `AlertDefinition`:** When `:TRIGGERED_RULE` is absent, `engine` is returned as `null` without fabricating rule-definition metadata. Multiple or contradictory `:TRIGGERED_RULE` definitions fail closed with sanitized **HTTP 500**.
+- **Missing or Contradictory Graph Links:** When `:TRIGGERED_RULE` is absent, `engine` is returned as `null` without fabricating rule-definition metadata. Multiple/duplicate `:TRIGGERED_RULE` edges, missing/contradictory `AlertDefinition` properties, or multiple/duplicate/cross-domain/contradictory endpoint links (`:HAS_SOURCE`, `:HAS_DESTINATION`, `:HAS_ORIGINATOR`, `:HAS_RESPONDER`) fail closed with sanitized **HTTP 500**.
 - **Exact Decimal & Numeric Safety:**
   - `timestamp_epoch_decimal`, `start_epoch_decimal`, `end_epoch_decimal`, and `duration_decimal` are serialized verbatim as canonical `Decimal` strings (never converted to float).
   - Raw Neo4j nanosecond index integers (`timestamp_epoch_ns`, `start_epoch_ns`, `end_epoch_ns`) are **never** serialized to JSON.
@@ -214,7 +214,7 @@ Suricata `AlertEvent` detail (`GET /api/v1/alert-events/1b13c85e13fe14e06380701d
 {
   "event_id": "1b13c85e13fe14e06380701d8abe0dfc466d843d90eef1709d6969f39fea2e8d",
   "alert_definition_id": "suricata:demo-v2-rules:1:9100001",
-  "source_record_id": "8810001",
+  "source_record_id": "corp-eve-demo-01:line:1:7b33a1892796e5e55f3fd79497e3b2e603c06cc778b01ed2f6bdb54a19019e4a",
   "log_source_id": "corp-eve-demo-01",
   "sensor_id": "suricata-demo-01",
   "ruleset_namespace": "demo-v2-rules",

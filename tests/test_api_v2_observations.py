@@ -628,3 +628,262 @@ def test_u_v_v1_alerts_route_unchanged_and_legacy_repo_calls_work():
         repo.get_alert_event(_EVENT_ID, routing_domain_id="bad#domain")
     with pytest.raises(ValueError, match="must not be empty or whitespace"):
         repo.get_flow_observation(_OBS_ID, routing_domain_id="   ")
+
+
+# ---------------------------------------------------------------------------
+# Review Regression Suite: Contradictory Graph Links, Safe-Int Boundaries,
+# OpenAPI Non-Null Schema, and Fixed-Point Decimal Hardening
+# ---------------------------------------------------------------------------
+
+
+def _repo_returning_single(record):
+    mock_tx = MagicMock()
+    res_mock = MagicMock()
+    res_mock.single.return_value = record
+    mock_tx.run.return_value = res_mock
+    mock_session = MagicMock()
+    mock_session.execute_read.side_effect = lambda fn: fn(mock_tx)
+    mock_driver = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+    return Neo4jReadRepository(mock_driver)
+
+
+@pytest.mark.parametrize(
+    "case_name,override_key,bad_endpoints",
+    [
+        (
+            "A_two_has_source",
+            "src_endpoints",
+            [
+                {"scoped_id": "demo-v2-corp#192.0.2.10", "address": "192.0.2.10", "routing_domain_id": "demo-v2-corp"},
+                {"scoped_id": "demo-v2-corp#192.0.2.99", "address": "192.0.2.99", "routing_domain_id": "demo-v2-corp"},
+            ],
+        ),
+        (
+            "B_two_has_destination",
+            "dst_endpoints",
+            [
+                {"scoped_id": "demo-v2-corp#198.51.100.20", "address": "198.51.100.20", "routing_domain_id": "demo-v2-corp"},
+                {"scoped_id": "demo-v2-corp#198.51.100.99", "address": "198.51.100.99", "routing_domain_id": "demo-v2-corp"},
+            ],
+        ),
+        (
+            "duplicate_parallel_has_source",
+            "src_endpoints",
+            [
+                {"scoped_id": "demo-v2-corp#192.0.2.10", "address": "192.0.2.10", "routing_domain_id": "demo-v2-corp"},
+                {"scoped_id": "demo-v2-corp#192.0.2.10", "address": "192.0.2.10", "routing_domain_id": "demo-v2-corp"},
+            ],
+        ),
+        (
+            "E_cross_domain_has_source",
+            "src_endpoints",
+            [
+                {"scoped_id": "other-domain#192.0.2.10", "address": "192.0.2.10", "routing_domain_id": "other-domain"},
+            ],
+        ),
+        (
+            "F_single_conflicting_in_domain_ip",
+            "src_endpoints",
+            [
+                {"scoped_id": "demo-v2-corp#192.0.2.99", "address": "192.0.2.99", "routing_domain_id": "demo-v2-corp"},
+            ],
+        ),
+        (
+            "G_missing_address_property",
+            "src_endpoints",
+            [
+                {"scoped_id": "demo-v2-corp#192.0.2.10", "address": None, "routing_domain_id": "demo-v2-corp"},
+            ],
+        ),
+        (
+            "G_missing_routing_domain_property",
+            "dst_endpoints",
+            [
+                {"scoped_id": "demo-v2-corp#198.51.100.20", "address": "198.51.100.20", "routing_domain_id": None},
+            ],
+        ),
+    ],
+)
+def test_review_contradictory_alert_endpoint_links_fail_closed(case_name, override_key, bad_endpoints):
+    """Section 7 A/B/E/F/G: Multiple, duplicate, cross-domain, conflicting, or partial AlertEvent links fail closed."""
+    row = _sample_alert_record()
+    row["src_endpoints"] = [
+        {"scoped_id": "demo-v2-corp#192.0.2.10", "address": "192.0.2.10", "routing_domain_id": "demo-v2-corp"}
+    ]
+    row["dst_endpoints"] = [
+        {"scoped_id": "demo-v2-corp#198.51.100.20", "address": "198.51.100.20", "routing_domain_id": "demo-v2-corp"}
+    ]
+    row["alert_definitions"] = [
+        {
+            "definition_id": "suricata:demo-v2-rules:1:9100001",
+            "engine": "suricata",
+            "ruleset_namespace": "demo-v2-rules",
+            "gid": 1,
+            "sid": 9100001,
+        }
+    ]
+    row[override_key] = bad_endpoints
+
+    repo = _repo_returning_single(row)
+    with pytest.raises(ValueError):
+        repo.get_alert_event(_EVENT_ID, routing_domain_id="demo-v2-corp", source_type="suricata")
+
+    # End-to-end API maps repository ValueError to sanitized HTTP 500
+    app = create_app()
+    app.dependency_overrides[get_read_repository] = lambda: repo
+    client = TestClient(app, raise_server_exceptions=False)
+    res = client.get(f"/api/v1/alert-events/{_EVENT_ID}?routing_domain_id=demo-v2-corp")
+    assert res.status_code == 500
+    assert res.json() == {"detail": "Internal server error"}
+
+
+@pytest.mark.parametrize(
+    "case_name,override_key,bad_endpoints",
+    [
+        (
+            "C_two_has_originator",
+            "orig_endpoints",
+            [
+                {"scoped_id": "demo-v2-corp#192.0.2.10", "address": "192.0.2.10", "routing_domain_id": "demo-v2-corp"},
+                {"scoped_id": "demo-v2-corp#192.0.2.99", "address": "192.0.2.99", "routing_domain_id": "demo-v2-corp"},
+            ],
+        ),
+        (
+            "D_two_has_responder",
+            "resp_endpoints",
+            [
+                {"scoped_id": "demo-v2-corp#198.51.100.20", "address": "198.51.100.20", "routing_domain_id": "demo-v2-corp"},
+                {"scoped_id": "demo-v2-corp#198.51.100.99", "address": "198.51.100.99", "routing_domain_id": "demo-v2-corp"},
+            ],
+        ),
+        (
+            "E_cross_domain_originator",
+            "orig_endpoints",
+            [
+                {"scoped_id": "other-domain#192.0.2.10", "address": "192.0.2.10", "routing_domain_id": "other-domain"},
+            ],
+        ),
+        (
+            "F_single_conflicting_in_domain_responder",
+            "resp_endpoints",
+            [
+                {"scoped_id": "demo-v2-corp#198.51.100.99", "address": "198.51.100.99", "routing_domain_id": "demo-v2-corp"},
+            ],
+        ),
+        (
+            "G_missing_scoped_id_property",
+            "orig_endpoints",
+            [
+                {"scoped_id": None, "address": "192.0.2.10", "routing_domain_id": "demo-v2-corp"},
+            ],
+        ),
+    ],
+)
+def test_review_contradictory_flow_endpoint_links_fail_closed(case_name, override_key, bad_endpoints):
+    """Section 7 C/D/E/F/G: Multiple, cross-domain, conflicting, or partial FlowObservation links fail closed."""
+    row = _sample_flow_record()
+    row["orig_endpoints"] = [
+        {"scoped_id": "demo-v2-corp#192.0.2.10", "address": "192.0.2.10", "routing_domain_id": "demo-v2-corp"}
+    ]
+    row["resp_endpoints"] = [
+        {"scoped_id": "demo-v2-corp#198.51.100.20", "address": "198.51.100.20", "routing_domain_id": "demo-v2-corp"}
+    ]
+    row[override_key] = bad_endpoints
+
+    repo = _repo_returning_single(row)
+    with pytest.raises(ValueError):
+        repo.get_flow_observation(_OBS_ID, routing_domain_id="demo-v2-corp", source_type="zeek")
+
+    app = create_app()
+    app.dependency_overrides[get_read_repository] = lambda: repo
+    client = TestClient(app, raise_server_exceptions=False)
+    res = client.get(f"/api/v1/flow-observations/{_OBS_ID}?routing_domain_id=demo-v2-corp")
+    assert res.status_code == 500
+    assert res.json() == {"detail": "Internal server error"}
+
+
+@pytest.mark.parametrize(
+    "bad_def_list",
+    [
+        # Duplicate parallel TRIGGERED_RULE edges with identical projected properties
+        [
+            {"definition_id": "suricata:demo-v2-rules:1:9100001", "engine": "suricata", "ruleset_namespace": "demo-v2-rules", "gid": 1, "sid": 9100001},
+            {"definition_id": "suricata:demo-v2-rules:1:9100001", "engine": "suricata", "ruleset_namespace": "demo-v2-rules", "gid": 1, "sid": 9100001},
+        ],
+        # Missing required AlertDefinition.sid
+        [
+            {"definition_id": "suricata:demo-v2-rules:1:9100001", "engine": "suricata", "ruleset_namespace": "demo-v2-rules", "gid": 1, "sid": None},
+        ],
+        # Missing required AlertDefinition.ruleset_namespace
+        [
+            {"definition_id": "suricata:demo-v2-rules:1:9100001", "engine": "suricata", "ruleset_namespace": None, "gid": 1, "sid": 9100001},
+        ],
+        # Missing AlertDefinition.gid when AlertEvent.gid is 1
+        [
+            {"definition_id": "suricata:demo-v2-rules:1:9100001", "engine": "suricata", "ruleset_namespace": "demo-v2-rules", "gid": None, "sid": 9100001},
+        ],
+        # Non-canonical uppercase AlertDefinition.engine
+        [
+            {"definition_id": "suricata:demo-v2-rules:1:9100001", "engine": "SURICATA", "ruleset_namespace": "demo-v2-rules", "gid": 1, "sid": 9100001},
+        ],
+    ],
+)
+def test_review_alert_definition_duplicate_and_missing_fields_fail_closed(bad_def_list):
+    """Section 8: Duplicate TRIGGERED_RULE edges and incomplete/non-canonical AlertDefinition metadata fail closed."""
+    row = _sample_alert_record()
+    row["alert_definitions"] = bad_def_list
+    repo = _repo_returning_single(row)
+    with pytest.raises(ValueError):
+        repo.get_alert_event(_EVENT_ID, routing_domain_id="demo-v2-corp", source_type="suricata")
+
+
+def test_review_js_safe_int_exact_boundaries_openapi_and_fixed_point_decimals():
+    """Sections 11-13: Exact boundary serialization (0, 2^53-1, 2^53, 2^53+1, 2^63-1), non-null OpenAPI sid, and fixed-point decimals."""
+    app, client, mock_repo = _client_with_mock_repo()
+
+    # OpenAPI schema: sid must NOT be nullable, optional counters advertise integer | string | null
+    schema = app.openapi()
+    alert_props = schema["components"]["schemas"]["AlertEventDetailResponse"]["properties"]
+    sid_types = {entry.get("type") for entry in alert_props["sid"].get("anyOf", [])}
+    assert sid_types == {"integer", "string"}
+
+    # Test every required JS_MAX_SAFE_INTEGER boundary over actual HTTP JSON serialization
+    int64_max = (1 << 63) - 1
+    boundaries = [
+        (0, int, 0),
+        (JS_MAX_SAFE_INTEGER, int, 9007199254740991),
+        (JS_MAX_SAFE_INTEGER + 1, str, "9007199254740992"),
+        (JS_MAX_SAFE_INTEGER + 2, str, "9007199254740993"),
+        (int64_max, str, "9223372036854775807"),
+    ]
+    for raw_val, expected_type, expected_json_val in boundaries:
+        mock_repo.get_flow_observation.return_value = _sample_flow_record(
+            orig_bytes=raw_val,
+            start_epoch_decimal="1795428000.123456789000",  # trailing zeros preserved verbatim
+        )
+        res = client.get(f"/api/v1/flow-observations/{_OBS_ID}")
+        assert res.status_code == 200
+        parsed = json.loads(res.text)
+        assert type(parsed["orig_bytes"]) is expected_type
+        assert parsed["orig_bytes"] == expected_json_val
+        assert parsed["start_epoch_decimal"] == "1795428000.123456789000"
+
+    # flow_id boundary: "0" and max uint64 "18446744073709551615"
+    for valid_fid in ("0", "18446744073709551615"):
+        mock_repo.get_alert_event.return_value = _sample_alert_record(flow_id=valid_fid)
+        res = client.get(f"/api/v1/alert-events/{_EVENT_ID}")
+        assert res.status_code == 200
+        assert res.json()["flow_id"] == valid_fid
+
+    # Non-fixed-point decimals (scientific notation, Python underscores, leading +, negative duration) fail closed
+    for bad_flow_override in (
+        {"duration_decimal": "-5"},
+        {"duration_decimal": "1E+50000"},
+        {"start_epoch_decimal": "1_000.5"},
+        {"end_epoch_decimal": "+1795428010"},
+    ):
+        mock_repo.get_flow_observation.return_value = _sample_flow_record(**bad_flow_override)
+        res = client.get(f"/api/v1/flow-observations/{_OBS_ID}")
+        assert res.status_code == 500
+        assert res.json() == {"detail": "Internal server error"}
