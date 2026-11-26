@@ -154,6 +154,85 @@ export interface TrafficAlertCorrelationResponse {
 
 export type CorrelationVerificationStatus = 'verified' | 'unverified_incomplete';
 
+/** Count integer serialized losslessly as number up to 2^53-1 or string when larger. */
+export type SafeCount = number | string;
+
+export interface AlertEventDetailResponse {
+  event_id: string;
+  alert_definition_id: string;
+  source_record_id: string;
+  log_source_id: string;
+  sensor_id: string;
+  ruleset_namespace: string;
+  routing_domain_id: string;
+  source_type: 'suricata';
+  source_provenance: string | null;
+  engine: string | null;
+  gid: SafeCount | null;
+  sid: SafeCount;
+  rev: SafeCount | null;
+  signature: string | null;
+  category: string | null;
+  severity: SafeCount | null;
+  action: string | null;
+  app_proto: string | null;
+  direction: string | null;
+  tx_id: SafeCount | null;
+  pcap_cnt: SafeCount | null;
+  flow_id: string | null;
+  src_ip: string;
+  dst_ip: string;
+  src_scoped_id: string;
+  dst_scoped_id: string;
+  protocol: string | null;
+  src_port: number | null;
+  dst_port: number | null;
+  flow_key: string;
+  community_id: string | null;
+  timestamp_source: string;
+  /** Exact arbitrary-precision Decimal epoch seconds string (never coerce to number). */
+  timestamp_epoch_decimal: string | null;
+}
+
+export interface FlowObservationDetailResponse {
+  observation_id: string;
+  flow_key: string;
+  zeek_uid: string;
+  routing_domain_id: string;
+  sensor_id: string;
+  source_type: 'zeek';
+  source_provenance: string | null;
+  community_id: string | null;
+  src_ip: string;
+  dst_ip: string;
+  src_scoped_id: string;
+  dst_scoped_id: string;
+  protocol: string;
+  src_port: number | null;
+  dst_port: number | null;
+  start_ts: string;
+  /** Derived last-observed timestamp (start_epoch + duration; not confirmed TCP close). */
+  end_ts: string | null;
+  /** Exact arbitrary-precision Decimal start epoch seconds string (never coerce to number). */
+  start_epoch_decimal: string | null;
+  /** Exact arbitrary-precision Decimal last-observed epoch seconds string (never coerce to number). */
+  end_epoch_decimal: string | null;
+  /** Exact arbitrary-precision Decimal duration seconds string (never coerce to number). */
+  duration_decimal: string | null;
+  orig_bytes: SafeCount | null;
+  resp_bytes: SafeCount | null;
+  orig_ip_bytes: SafeCount | null;
+  resp_ip_bytes: SafeCount | null;
+  orig_pkts: SafeCount | null;
+  resp_pkts: SafeCount | null;
+  missed_bytes: SafeCount | null;
+  service: string | null;
+  conn_state: string | null;
+  history: string | null;
+  local_orig: boolean | null;
+  local_resp: boolean | null;
+}
+
 export interface AlertFlowCorrelationResponse {
   event_id: string;
   observation_id: string;

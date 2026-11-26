@@ -10,7 +10,7 @@ from neo4j.exceptions import ServiceUnavailable, AuthError
 
 from src.config import get_cors_origins, APP_NAME
 from src.api.dependencies import lifespan
-from src.api.routes import health, network, alerts, correlations, graph, import_data
+from src.api.routes import health, network, alerts, correlations, observations, graph, import_data
 from src.graph.read_repository import AmbiguousEndpointError
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,7 @@ def create_app() -> FastAPI:
     app.include_router(network.router)
     app.include_router(alerts.router)
     app.include_router(correlations.router)
+    app.include_router(observations.router)
     app.include_router(graph.router)
     app.include_router(import_data.router)
 

@@ -31,8 +31,10 @@ When the API server is running (`uvicorn src.api.app:app --port 8000`), interact
 | **Network** | `GET` | `/api/v1/network/ips/{address}/layer2` | Paginated Layer 2 associations for an IP | `address` (path), `domain`, `limit`, `offset` |
 | **Network** | `GET` | `/api/v1/network/layer2` | Paginated list of Layer 2 identifiers | `limit`, `offset` |
 | **Network** | `GET` | `/api/v1/network/communications` | Filterable and sortable Layer 3 communication aggregates | `source_ip`, `target_ip`, `protocol`, `src_port`, `dst_port`, `sort_by`, `limit`, `offset` |
-| **Alerts** | `GET` | `/api/v1/alerts` | Filterable normalized security alert facts | `source_ip`, `target_ip`, `priority`, `sid`, `protocol`, `limit`, `offset` |
-| **Alerts** | `GET` | `/api/v1/alerts/{fact_key}` | Retrieve single alert fact by SHA-256 key | `fact_key` (path) |
+| **Alerts** | `GET` | `/api/v1/alerts` | Filterable legacy V1 normalized security alert facts (`AlertFact`) | `source_ip`, `target_ip`, `priority`, `sid`, `protocol`, `limit`, `offset` |
+| **Alerts** | `GET` | `/api/v1/alerts/{fact_key}` | Retrieve single legacy V1 alert fact (`AlertFact`) by SHA-256 key | `fact_key` (path) |
+| **Observations (V2)** | `GET` | `/api/v1/alert-events/{event_id}` | Read-only forensic detail lookup for a V2 Suricata `AlertEvent` and linked `AlertDefinition` | `event_id` (path), `routing_domain_id` (optional query) |
+| **Observations (V2)** | `GET` | `/api/v1/flow-observations/{observation_id}` | Read-only forensic detail lookup for a V2 Zeek `FlowObservation` | `observation_id` (path), `routing_domain_id` (optional query) |
 | **Correlations** | `GET` | `/api/v1/correlations/traffic-alerts` | Legacy V1 communicating IP pairs with matching `AlertFact` records (with flow keys and transport ports) | `limit`, `offset` |
 | **Correlations (V2)** | `GET` | `/api/v1/correlations/alert-flows` | Read-only paginated list of persisted V2 Suricata `AlertEvent` → Zeek `FlowObservation` correlations | `routing_domain_id`, `event_id`, `observation_id`, `include_unverified`, `verification_status`, `limit`, `offset` |
 | **Correlations (V2)** | `GET` | `/api/v1/correlations/alert-flows/{event_id}` | Read-only persisted V2 correlations for a specific Suricata `AlertEvent` | `event_id` (path), `routing_domain_id`, `include_unverified`, `verification_status`, `limit`, `offset` |
@@ -175,6 +177,114 @@ Preserved unverified correlation (`GET /api/v1/correlations/alert-flows?include_
 - **503 Service Unavailable:** Neo4j driver unavailable, `ServiceUnavailable`, or `AuthError` (sanitized error message, never confused with `404`).
 - **500 Internal Server Error:** Sanitized unexpected server error without leaking connection strings or stack traces.
 - **Deployment Authentication Note:** These routes inherit the application's existing read-oriented CORS/trust boundary; multi-user authentication/RBAC for external multi-tenant deployments is a separate deployment concern.
+
+---
+
+### 7. V2 Forensic Observation Detail Endpoints (`GET /api/v1/alert-events/{event_id}` & `/api/v1/flow-observations/{observation_id}`)
+
+#### V1 / V2 Separation & Read-Only Scope
+- **`/api/v1/alerts` & `/api/v1/alerts/{fact_key}`** remain exclusively for legacy **V1 `AlertFact`** nodes and are unchanged.
+- **`GET /api/v1/alert-events/{event_id}`** retrieves a single persisted V2 **Suricata `AlertEvent`** (`source_type = 'suricata'`) and its factual linked `(:AlertEvent)-[:TRIGGERED_RULE]->(:AlertDefinition)` engine metadata.
+- **`GET /api/v1/flow-observations/{observation_id}`** retrieves a single persisted V2 **Zeek `FlowObservation`** (`source_type = 'zeek'`).
+- Both endpoints execute strictly inside `session.execute_read()` managed read transactions on the shared Neo4j driver, use existing unique constraints (`AlertEvent.event_id`, `FlowObservation.observation_id`), perform zero graph writes/schema DDL/correlation runs, and never expose internal Neo4j `elementId` values.
+
+#### Path, RoutingDomain, Source-Type & Precision Contracts
+- **Path ID (`event_id` / `observation_id`):** Must match `^[0-9a-f]{64}$` (invalid values return **HTTP 422**).
+- **`routing_domain_id` *(optional query string)*:** When specified, trimmed lowercase normalization applies; blank/whitespace values or values containing `#` return **HTTP 422**. Mismatched domain returns **HTTP 404**. Persisted nodes with missing/malformed `routing_domain_id` fail closed.
+- **`source_type` Enforcement:** `AlertEvent` lookups enforce `source_type = 'suricata'` (`Literal["suricata"]`), and `FlowObservation` lookups enforce `source_type = 'zeek'` (`Literal["zeek"]`). Wrong-source nodes never leak across endpoints.
+- **Missing or Contradictory `AlertDefinition`:** When `:TRIGGERED_RULE` is absent, `engine` is returned as `null` without fabricating rule-definition metadata. Multiple or contradictory `:TRIGGERED_RULE` definitions fail closed with sanitized **HTTP 500**.
+- **Exact Decimal & Numeric Safety:**
+  - `timestamp_epoch_decimal`, `start_epoch_decimal`, `end_epoch_decimal`, and `duration_decimal` are serialized verbatim as canonical `Decimal` strings (never converted to float).
+  - Raw Neo4j nanosecond index integers (`timestamp_epoch_ns`, `start_epoch_ns`, `end_epoch_ns`) are **never** serialized to JSON.
+  - `flow_id` is serialized as a canonical unsigned 64-bit decimal string (or `null`).
+  - Integer counters (`gid`, `sid`, `rev`, `severity`, `tx_id`, `pcap_cnt`, `orig_bytes`, `resp_bytes`, `orig_ip_bytes`, `resp_ip_bytes`, `orig_pkts`, `resp_pkts`, `missed_bytes`) remain exact JSON integers when `0 <= n <= 9007199254740991` (`2^53 - 1`, JavaScript `Number.MAX_SAFE_INTEGER`) and serialize losslessly as decimal strings when larger.
+- **Null Neutrality:** Missing persisted optional fields remain `null` (rendered as `Not recorded` in the UI).
+- **Epistemic Boundary & Caveats:**
+  - Suricata `src_ip`/`dst_ip` and Zeek `orig`/`resp` endpoints reflect observed packet/flow direction, **not** proof of attacker or victim roles.
+  - Suricata `action` records rule/alert metadata only and does **not** prove end-to-end network enforcement.
+  - Zeek `end_ts` is a derived last-observed timestamp (`start_epoch + duration`), **not** confirmed TCP session closure.
+  - Zeek `conn_state = "SF"` does **not** universally prove benign traffic or successful application activity.
+- **HTTP Status Semantics:** `200` (valid matching record), `404` (unknown entity, wrong `routing_domain_id`, or non-matching `source_type`), `422` (invalid SHA-256 ID or blank/`#` `routing_domain_id`), `503` (missing Neo4j driver, `ServiceUnavailable`, or `AuthError` — never masked as `404`), `500` (sanitized internal error or corrupt/contradictory persisted record rejected by strict Pydantic `ConfigDict(strict=True)` validation).
+- **Authentication Limitation:** Like the rest of the Phase 4 API, these endpoints trust the local deployment boundary; multi-user authentication/RBAC is out of scope for Phase 4F.1 and required before multi-tenant or untrusted exposure. `routing_domain_id` is a namespace scope filter, not an authentication mechanism.
+
+#### Example Scenario A Requests & Responses (Synthetic `demo_v2` Fixtures)
+
+Suricata `AlertEvent` detail (`GET /api/v1/alert-events/1b13c85e13fe14e06380701d8abe0dfc466d843d90eef1709d6969f39fea2e8d?routing_domain_id=demo-v2-corp`):
+```json
+{
+  "event_id": "1b13c85e13fe14e06380701d8abe0dfc466d843d90eef1709d6969f39fea2e8d",
+  "alert_definition_id": "suricata:demo-v2-rules:1:9100001",
+  "source_record_id": "8810001",
+  "log_source_id": "corp-eve-demo-01",
+  "sensor_id": "suricata-demo-01",
+  "ruleset_namespace": "demo-v2-rules",
+  "routing_domain_id": "demo-v2-corp",
+  "source_type": "suricata",
+  "source_provenance": "phase4e-corp-eve",
+  "engine": "suricata",
+  "gid": 1,
+  "sid": 9100001,
+  "rev": 1,
+  "signature": "SYNTHETIC Demo Strong Match TLS Observation",
+  "category": "Not Suspicious Traffic",
+  "severity": 3,
+  "action": "allowed",
+  "app_proto": "tls",
+  "direction": "to_server",
+  "tx_id": 0,
+  "pcap_cnt": 11,
+  "flow_id": "8810001",
+  "src_ip": "192.0.2.10",
+  "dst_ip": "198.51.100.20",
+  "src_scoped_id": "demo-v2-corp#192.0.2.10",
+  "dst_scoped_id": "demo-v2-corp#198.51.100.20",
+  "protocol": "TCP",
+  "src_port": 54321,
+  "dst_port": 443,
+  "flow_key": "40e772cb8ffeb90d27357c81784f78cba88b2410e431be11029f30be6e0c16a6",
+  "community_id": "1:g8RTrAfW0W5D3mT1i4M4X+Atwmw=",
+  "timestamp_source": "2026-11-23T10:00:02.123456789123+0000",
+  "timestamp_epoch_decimal": "1795428002.123456789123"
+}
+```
+
+Zeek `FlowObservation` detail (`GET /api/v1/flow-observations/b0e9ea368ed1cbbab586e61e755a6a3bbf2bfa2403c67b8bc153650c36e3d3b8?routing_domain_id=demo-v2-corp`):
+```json
+{
+  "observation_id": "b0e9ea368ed1cbbab586e61e755a6a3bbf2bfa2403c67b8bc153650c36e3d3b8",
+  "flow_key": "40e772cb8ffeb90d27357c81784f78cba88b2410e431be11029f30be6e0c16a6",
+  "zeek_uid": "CDemoCorpStrong01",
+  "routing_domain_id": "demo-v2-corp",
+  "sensor_id": "zeek-demo-01",
+  "source_type": "zeek",
+  "source_provenance": "phase4e-corp-zeek",
+  "community_id": "1:g8RTrAfW0W5D3mT1i4M4X+Atwmw=",
+  "src_ip": "192.0.2.10",
+  "dst_ip": "198.51.100.20",
+  "src_scoped_id": "demo-v2-corp#192.0.2.10",
+  "dst_scoped_id": "demo-v2-corp#198.51.100.20",
+  "protocol": "TCP",
+  "src_port": 54321,
+  "dst_port": 443,
+  "start_ts": "1795428000.123456789",
+  "end_ts": "1795428010.123456789",
+  "start_epoch_decimal": "1795428000.123456789",
+  "end_epoch_decimal": "1795428010.123456789",
+  "duration_decimal": "10",
+  "orig_bytes": 640,
+  "resp_bytes": 2400,
+  "orig_ip_bytes": 928,
+  "resp_ip_bytes": 2736,
+  "orig_pkts": 7,
+  "resp_pkts": 8,
+  "missed_bytes": 0,
+  "service": "ssl",
+  "conn_state": "SF",
+  "history": "ShADadFf",
+  "local_orig": true,
+  "local_resp": false
+}
+```
 
 ---
 

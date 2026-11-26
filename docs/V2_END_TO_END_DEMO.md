@@ -218,10 +218,13 @@ curl -s http://127.0.0.1:8000/health
 curl -s http://127.0.0.1:8000/ready
 curl -s "http://127.0.0.1:8000/api/v1/correlations/alert-flows"
 curl -s "http://127.0.0.1:8000/api/v1/correlations/alert-flows?routing_domain_id=demo-v2-corp&include_unverified=true"
+curl -s "http://127.0.0.1:8000/api/v1/alert-events/1b13c85e13fe14e06380701d8abe0dfc466d843d90eef1709d6969f39fea2e8d?routing_domain_id=demo-v2-corp"
+curl -s "http://127.0.0.1:8000/api/v1/flow-observations/b0e9ea368ed1cbbab586e61e755a6a3bbf2bfa2403c67b8bc153650c36e3d3b8?routing_domain_id=demo-v2-corp"
 ```
 
 - Verified-only default (`include_unverified` omitted or `false`) returns only `verification_status: "verified"` rows.
 - `/api/v1/correlations/alert-flows/{event_id}` returns `HTTP 200` with `total: 0` when the `AlertEvent` exists without matching edges, and `HTTP 404` when unknown (or outside filtered `routing_domain_id`).
+- `/api/v1/alert-events/{event_id}` and `/api/v1/flow-observations/{observation_id}` enforce `source_type` (`suricata` vs `zeek`), validate `routing_domain_id`, omit internal Neo4j `*_epoch_ns` / `elementId`, preserve exact `Decimal` strings and uint64 `flow_id`, return `HTTP 404` when out-of-domain or absent, and return `HTTP 503` when the database driver is unavailable.
 
 ---
 
@@ -238,7 +241,10 @@ Manual walkthrough at `http://localhost:5173`:
 2. Click **Correlations** in the top navigation bar; confirm **Legacy Correlations** is selected by default.
 3. Click the **Alert–Flow Correlations** tab.
 4. Observe persisted `verified` rows (`CDemoCorpStrong01`, `CDemoCorpIsoFlow01`, `CDemoBranchIsoFlow01`); notice `unverified_incomplete` edges remain hidden under the safe default.
-5. Click **Inspect** on `CDemoCorpStrong01` to open **Persisted Correlation Evidence Inspector**; verify full 64-character `AlertEvent ID`, `FlowObservation ID`, `Policy Fingerprint`, `Evidence Digest`, verbatim `Exact Temporal Delta`, and `Decimal Fallback Used`. Press `Escape` to close.
+5. Click **Inspect** on `CDemoCorpStrong01` to open **Persisted Correlation Evidence Inspector** (**Correlation Evidence** default tab); verify full 64-character `AlertEvent ID`, `FlowObservation ID`, `Policy Fingerprint`, `Evidence Digest`, verbatim `Exact Temporal Delta`, and `Decimal Fallback Used`.
+   - Switch to the **Suricata AlertEvent** tab to lazily load `GET /api/v1/alert-events/{event_id}?routing_domain_id=demo-v2-corp` and inspect SID `9100001`, signature `"SYNTHETIC Demo Strong Match TLS Observation"`, `192.0.2.10:54321` → `198.51.100.20:443`, `1795428002.123456789123`, `flow_id` `8810001`, and neutral `Not recorded` handling.
+   - Switch to the **Zeek FlowObservation** tab to lazily load `GET /api/v1/flow-observations/{observation_id}?routing_domain_id=demo-v2-corp` and inspect `CDemoCorpStrong01`, `1795428000.123456789`, `duration_decimal` `10`, distinct payload (`640` / `2400`) vs IP bytes (`928` / `2736`), `SF`, `ssl`, and derived `end_ts` notice. (Or click the **Alert** / **Flow** row quick actions to open the corresponding tab directly.)
+   - Press `Escape` to close.
 6. Filter `RoutingDomain` = `demo-v2-branch` and click **Apply Filters** to verify domain isolation.
 7. Click **Reset**, check **Include unverified correlations**, and click **Apply Filters** to inspect any `Previously Verified — Current Check Incomplete` edges and explanatory warning banner.
 8. Switch back to **Legacy Correlations** to verify legacy V1 remains functional and unaffected.
@@ -341,11 +347,11 @@ docker compose down
 
 ## 13. Known Limitations
 
-- **Read-Only V2 UI & CLI-Driven V2 Ingestion:** The V2 browser interface and `/api/v1/correlations/alert-flows*` endpoints are strictly read-only. Zeek and Suricata V2 ingestion and Phase 4B correlation runs remain CLI/service operations; the legacy browser **Import Data** workflow does not ingest V2 logs.
+- **Read-Only V2 UI & CLI-Driven V2 Ingestion:** The V2 browser interface, `/api/v1/correlations/alert-flows*`, `/api/v1/alert-events/{event_id}`, and `/api/v1/flow-observations/{observation_id}` endpoints are strictly read-only. Zeek and Suricata V2 ingestion and Phase 4B correlation runs remain CLI/service operations; the legacy browser **Import Data** workflow does not ingest V2 logs.
 - **Persisted vs Real-Time Verification:** `verification_status` reflects the last stored Phase 4B evaluation, not live revalidation during read requests.
-- **Phase 4C API Field Scope:** V2 correlation responses expose correlation IDs, verification state, and factual evidence fields only — not source/destination IPs, transport ports, full Suricata alert signatures, full Zeek flow bytes/packets, or unpersisted Phase 4A candidate reason arrays.
+- **Phase 4C vs 4F.1 Field Scope:** `/api/v1/correlations/alert-flows*` remains compact correlation edge metadata, while the three-tab inspector lazily retrieves full persisted `AlertEvent` / `AlertDefinition` and `FlowObservation` forensic attributes through `/api/v1/alert-events/{event_id}` and `/api/v1/flow-observations/{observation_id}` (still omitting unpersisted Phase 4A candidate arrays, raw `*_epoch_ns`, and internal `elementId` values).
 - **Read Committed Isolation:** Neo4j Read Committed isolation does not provide cross-query snapshot isolation; concurrent ingestion and multi-page count/item API reads can observe committed changes between queries.
-- **Authentication / RBAC:** Multi-user authentication and role-based access control are not implemented in Phases 3A–4E.
+- **Authentication / RBAC:** Multi-user authentication and role-based access control are not implemented in Phases 3A–4F.1; `routing_domain_id` scoping is a data filter, not an authentication boundary. This synthetic demonstration is for engineering evaluation and is not a production-hardened deployment.
 - **Small Synthetic Dataset:** Validates semantic correctness and workflow wiring, not production performance or high-volume telemetry throughput.
 - **Vite Development Server in Browser Smoke:** `scripts/v2_browser_smoke.py` and the CI `v2-browser-smoke` job exercise the Vite development server proxy against local `uvicorn`, not a hardened production reverse-proxy deployment serving static built assets.
 

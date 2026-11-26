@@ -21,7 +21,7 @@ import {
 import { Tag } from '../common/Badge';
 import { Pagination } from '../common/Pagination';
 import { Skeleton } from '../common/Skeleton';
-import { CorrelationEvidenceModal } from './CorrelationEvidenceModal';
+import { CorrelationEvidenceModal, type InspectorTab } from './CorrelationEvidenceModal';
 import { VerificationStatusBadge } from './VerificationStatusBadge';
 
 const PAGE_LIMIT = 50;
@@ -68,8 +68,10 @@ export const AlertFlowCorrelationsView: React.FC = () => {
   const [total, setTotal] = useState<number>(0);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<CorrelationErrorSummary | null>(null);
-  const [selectedCorrelation, setSelectedCorrelation] =
-    useState<AlertFlowCorrelationResponse | null>(null);
+  const [inspectorTarget, setInspectorTarget] = useState<{
+    correlation: AlertFlowCorrelationResponse;
+    initialTab: InspectorTab;
+  } | null>(null);
   const [copiedCellKey, setCopiedCellKey] = useState<string | null>(null);
 
   // Race-condition & unmount protection
@@ -203,7 +205,7 @@ export const AlertFlowCorrelationsView: React.FC = () => {
           : includeUnverifiedInput;
 
     setValidationError(null);
-    setSelectedCorrelation(null);
+    setInspectorTarget(null);
     setCopiedCellKey(null);
     setError(null);
     setLoading(true);
@@ -225,7 +227,7 @@ export const AlertFlowCorrelationsView: React.FC = () => {
     setIncludeUnverifiedInput(false);
     setVerificationStatusInput('');
     setValidationError(null);
-    setSelectedCorrelation(null);
+    setInspectorTarget(null);
     setCopiedCellKey(null);
     setError(null);
     setLoading(true);
@@ -236,7 +238,7 @@ export const AlertFlowCorrelationsView: React.FC = () => {
   };
 
   const handlePageChange = (newOffset: number) => {
-    setSelectedCorrelation(null);
+    setInspectorTarget(null);
     setCopiedCellKey(null);
     setError(null);
     setLoading(true);
@@ -600,7 +602,7 @@ export const AlertFlowCorrelationsView: React.FC = () => {
               <th>Correlation Method</th>
               <th>Temporal Relation</th>
               <th>Decided At</th>
-              <th style={{ width: '110px' }}>Actions</th>
+              <th style={{ minWidth: '185px' }}>Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -786,16 +788,42 @@ export const AlertFlowCorrelationsView: React.FC = () => {
                       {formatPersistedValue(item.decided_at_utc)}
                     </td>
                     <td>
-                      <button
-                        type="button"
-                        className="btn-secondary"
-                        onClick={() => setSelectedCorrelation(item)}
-                        aria-label={`Inspect evidence for correlation ${item.event_id} and ${item.observation_id}`}
-                        style={{ fontSize: '0.75rem', padding: '0.25rem 0.55rem' }}
-                      >
-                        <Eye size={13} aria-hidden="true" />
-                        <span>Inspect</span>
-                      </button>
+                      <div style={{ display: 'inline-flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.35rem' }}>
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() =>
+                            setInspectorTarget({ correlation: item, initialTab: 'evidence' })
+                          }
+                          aria-label={`Inspect evidence for correlation ${item.event_id} and ${item.observation_id}`}
+                          style={{ fontSize: '0.75rem', padding: '0.25rem 0.55rem' }}
+                        >
+                          <Eye size={13} aria-hidden="true" />
+                          <span>Inspect</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          onClick={() =>
+                            setInspectorTarget({ correlation: item, initialTab: 'alert' })
+                          }
+                          aria-label={`Inspect Suricata AlertEvent ${item.event_id}`}
+                          style={{ fontSize: '0.74rem', padding: '0.22rem 0.45rem' }}
+                        >
+                          Alert
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          onClick={() =>
+                            setInspectorTarget({ correlation: item, initialTab: 'flow' })
+                          }
+                          aria-label={`Inspect Zeek FlowObservation ${item.observation_id}`}
+                          style={{ fontSize: '0.74rem', padding: '0.22rem 0.45rem' }}
+                        >
+                          Flow
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );
@@ -816,11 +844,12 @@ export const AlertFlowCorrelationsView: React.FC = () => {
         />
       )}
 
-      {/* Evidence Inspector Modal */}
-      {selectedCorrelation && (
+      {/* Evidence & Observation Inspector Modal */}
+      {inspectorTarget && (
         <CorrelationEvidenceModal
-          correlation={selectedCorrelation}
-          onClose={() => setSelectedCorrelation(null)}
+          correlation={inspectorTarget.correlation}
+          initialTab={inspectorTarget.initialTab}
+          onClose={() => setInspectorTarget(null)}
         />
       )}
     </div>

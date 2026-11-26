@@ -1414,7 +1414,39 @@ class Neo4jReadRepository:
             "source_provenance": record["source_provenance"],
         }
 
-    def get_flow_observation(self, observation_id: str) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _normalize_optional_filter_domain(routing_domain_id: Optional[str]) -> Optional[str]:
+        """Validate and normalize an optional routing_domain_id filter, failing closed."""
+        if routing_domain_id is None:
+            return None
+        if not isinstance(routing_domain_id, str):
+            raise ValueError(f"routing_domain_id must be a string or None, got {routing_domain_id!r}")
+        cleaned = routing_domain_id.strip().lower()
+        if not cleaned:
+            raise ValueError("routing_domain_id must not be empty or whitespace when specified")
+        if "#" in cleaned:
+            raise ValueError(f"routing_domain_id cannot contain delimiter '#': {routing_domain_id!r}")
+        return cleaned
+
+    @staticmethod
+    def _normalize_optional_source_type(source_type: Optional[str]) -> Optional[str]:
+        """Validate and normalize an optional source_type predicate."""
+        if source_type is None:
+            return None
+        if not isinstance(source_type, str):
+            raise ValueError(f"source_type must be a string or None, got {source_type!r}")
+        cleaned = source_type.strip().lower()
+        if not cleaned:
+            raise ValueError("source_type must not be empty or whitespace when specified")
+        return cleaned
+
+    def get_flow_observation(
+        self,
+        observation_id: str,
+        *,
+        routing_domain_id: Optional[str] = None,
+        source_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Retrieve a single discrete FlowObservation by its unique observation_id."""
         if self.driver is None:
             raise ConnectionError("Database driver unavailable")
@@ -1422,18 +1454,30 @@ class Neo4jReadRepository:
             raise ValueError("observation_id must be a non-empty string")
 
         clean_id = observation_id.strip()
+        norm_domain = self._normalize_optional_filter_domain(routing_domain_id)
+        norm_source_type = self._normalize_optional_source_type(source_type)
         cypher = """
         MATCH (fo:FlowObservation {observation_id: $observation_id})
+        WHERE fo.routing_domain_id IS NOT NULL
+          AND trim(fo.routing_domain_id) <> ''
+          AND NOT fo.routing_domain_id CONTAINS '#'
+          AND ($routing_domain_id IS NULL OR toLower(trim(fo.routing_domain_id)) = $routing_domain_id)
+          AND ($source_type IS NULL OR fo.source_type = $source_type)
         OPTIONAL MATCH (fo)-[:HAS_ORIGINATOR]->(orig:IPAddress)
+        WITH fo,
+             collect(DISTINCT CASE WHEN orig IS NOT NULL THEN {scoped_id: orig.scoped_id, address: orig.address} END) AS orig_nodes
         OPTIONAL MATCH (fo)-[:HAS_RESPONDER]->(resp:IPAddress)
+        WITH fo, orig_nodes[0] AS orig_ep,
+             collect(DISTINCT CASE WHEN resp IS NOT NULL THEN {scoped_id: resp.scoped_id, address: resp.address} END) AS resp_nodes
+        WITH fo, orig_ep, resp_nodes[0] AS resp_ep
         RETURN fo.observation_id AS observation_id,
                fo.flow_key AS flow_key,
                fo.zeek_uid AS zeek_uid,
                fo.routing_domain_id AS routing_domain_id,
-               coalesce(orig.scoped_id, fo.src_scoped_id) AS src_scoped_id,
-               coalesce(resp.scoped_id, fo.dst_scoped_id) AS dst_scoped_id,
-               coalesce(orig.address, fo.src_ip) AS src_ip,
-               coalesce(resp.address, fo.dst_ip) AS dst_ip,
+               coalesce(orig_ep.scoped_id, fo.src_scoped_id) AS src_scoped_id,
+               coalesce(resp_ep.scoped_id, fo.dst_scoped_id) AS dst_scoped_id,
+               coalesce(orig_ep.address, fo.src_ip) AS src_ip,
+               coalesce(resp_ep.address, fo.dst_ip) AS dst_ip,
                fo.protocol AS protocol,
                fo.src_port AS src_port,
                fo.dst_port AS dst_port,
@@ -1463,7 +1507,12 @@ class Neo4jReadRepository:
         """
 
         def _work(tx) -> Optional[Dict[str, Any]]:
-            res = tx.run(cypher, observation_id=clean_id)
+            res = tx.run(
+                cypher,
+                observation_id=clean_id,
+                routing_domain_id=norm_domain,
+                source_type=norm_source_type,
+            )
             rec = res.single()
             if not rec:
                 return None
@@ -1636,16 +1685,120 @@ class Neo4jReadRepository:
             "source_provenance": record["source_provenance"],
         }
 
-    def get_alert_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _resolve_alert_definition_engine(
+        alert_item: Dict[str, Any],
+        raw_definitions: Any,
+    ) -> Optional[str]:
+        """Resolve AlertDefinition.engine factually without fabricating missing links.
+
+        Raises ValueError (fail closed -> HTTP 500 at API boundary) if multiple or
+        contradictory AlertDefinition relationships exist for the AlertEvent.
+        """
+        if raw_definitions is None:
+            return None
+        if not isinstance(raw_definitions, list):
+            raise ValueError("Invalid alert_definitions structure returned from repository query")
+
+        defs = [d for d in raw_definitions if d is not None]
+        if not defs:
+            return None
+        if len(defs) > 1:
+            raise ValueError(
+                f"Contradictory AlertDefinition relationships ({len(defs)}) persisted for AlertEvent "
+                f"'{alert_item.get('event_id')}'"
+            )
+
+        def_row = defs[0]
+        if not isinstance(def_row, dict):
+            raise ValueError("Invalid AlertDefinition metadata entry")
+
+        def_id = def_row.get("definition_id")
+        if not isinstance(def_id, str) or not def_id.strip() or def_id != alert_item.get("alert_definition_id"):
+            raise ValueError(
+                f"Contradictory AlertDefinition.definition_id {def_id!r} for AlertEvent "
+                f"'{alert_item.get('event_id')}' (expected {alert_item.get('alert_definition_id')!r})"
+            )
+
+        def_ns = def_row.get("ruleset_namespace")
+        if def_ns is not None:
+            event_ns = alert_item.get("ruleset_namespace")
+            if not isinstance(def_ns, str) or not def_ns.strip():
+                raise ValueError("Invalid AlertDefinition.ruleset_namespace")
+            if not isinstance(event_ns, str) or def_ns.strip().lower() != event_ns.strip().lower():
+                raise ValueError(
+                    f"Contradictory AlertDefinition.ruleset_namespace {def_ns!r} vs AlertEvent {event_ns!r}"
+                )
+
+        def_gid = def_row.get("gid")
+        if def_gid is not None:
+            if isinstance(def_gid, bool) or not isinstance(def_gid, int) or def_gid != alert_item.get("gid"):
+                raise ValueError(
+                    f"Contradictory AlertDefinition.gid {def_gid!r} vs AlertEvent {alert_item.get('gid')!r}"
+                )
+
+        def_sid = def_row.get("sid")
+        if def_sid is not None:
+            if isinstance(def_sid, bool) or not isinstance(def_sid, int) or def_sid != alert_item.get("sid"):
+                raise ValueError(
+                    f"Contradictory AlertDefinition.sid {def_sid!r} vs AlertEvent {alert_item.get('sid')!r}"
+                )
+
+        def_engine = def_row.get("engine")
+        if def_engine is None:
+            return None
+        if not isinstance(def_engine, str) or not def_engine.strip():
+            raise ValueError(f"Invalid AlertDefinition.engine {def_engine!r}")
+
+        event_source_type = alert_item.get("source_type")
+        if isinstance(event_source_type, str) and event_source_type.strip():
+            if def_engine.strip().lower() != event_source_type.strip().lower():
+                raise ValueError(
+                    f"Contradictory AlertDefinition.engine {def_engine!r} vs AlertEvent.source_type "
+                    f"{event_source_type!r}"
+                )
+        return def_engine
+
+    def get_alert_event(
+        self,
+        event_id: str,
+        *,
+        routing_domain_id: Optional[str] = None,
+        source_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Retrieve a single discrete AlertEvent by its unique event_id."""
         if self.driver is None:
-            return None
+            raise ConnectionError("Database driver unavailable")
+
+        norm_domain = self._normalize_optional_filter_domain(routing_domain_id)
+        norm_source_type = self._normalize_optional_source_type(source_type)
+
         if not event_id or not str(event_id).strip():
             return None
 
         cleaned_id = str(event_id).strip()
         cypher = """
         MATCH (ae:AlertEvent {event_id: $event_id})
+        WHERE ae.routing_domain_id IS NOT NULL
+          AND trim(ae.routing_domain_id) <> ''
+          AND NOT ae.routing_domain_id CONTAINS '#'
+          AND ($routing_domain_id IS NULL OR toLower(trim(ae.routing_domain_id)) = $routing_domain_id)
+          AND ($source_type IS NULL OR ae.source_type = $source_type)
+        OPTIONAL MATCH (ae)-[:HAS_SOURCE]->(src_ip:IPAddress)
+        WITH ae,
+             collect(DISTINCT CASE WHEN src_ip IS NOT NULL THEN {scoped_id: src_ip.scoped_id, address: src_ip.address} END) AS src_nodes
+        OPTIONAL MATCH (ae)-[:HAS_DESTINATION]->(dst_ip:IPAddress)
+        WITH ae, src_nodes[0] AS src_ep,
+             collect(DISTINCT CASE WHEN dst_ip IS NOT NULL THEN {scoped_id: dst_ip.scoped_id, address: dst_ip.address} END) AS dst_nodes
+        OPTIONAL MATCH (ae)-[:TRIGGERED_RULE]->(ad:AlertDefinition)
+        WITH ae, src_ep, dst_nodes[0] AS dst_ep,
+             collect(DISTINCT CASE WHEN ad IS NOT NULL THEN {
+                 definition_id: ad.definition_id,
+                 engine: ad.engine,
+                 ruleset_namespace: ad.ruleset_namespace,
+                 gid: ad.gid,
+                 sid: ad.sid
+             } END) AS alert_definitions
         RETURN ae.event_id AS event_id,
                ae.alert_definition_id AS alert_definition_id,
                ae.source_record_id AS source_record_id,
@@ -1654,10 +1807,10 @@ class Neo4jReadRepository:
                ae.ruleset_namespace AS ruleset_namespace,
                ae.routing_domain_id AS routing_domain_id,
                ae.flow_key AS flow_key,
-               ae.src_scoped_id AS src_scoped_id,
-               ae.dst_scoped_id AS dst_scoped_id,
-               ae.src_ip AS src_ip,
-               ae.dst_ip AS dst_ip,
+               coalesce(src_ep.scoped_id, ae.src_scoped_id) AS src_scoped_id,
+               coalesce(dst_ep.scoped_id, ae.dst_scoped_id) AS dst_scoped_id,
+               coalesce(src_ep.address, ae.src_ip) AS src_ip,
+               coalesce(dst_ep.address, ae.dst_ip) AS dst_ip,
                ae.timestamp_source AS timestamp_source,
                ae.timestamp_epoch_decimal AS timestamp_epoch_decimal,
                ae.timestamp_epoch_ns AS timestamp_epoch_ns,
@@ -1678,15 +1831,23 @@ class Neo4jReadRepository:
                ae.tx_id AS tx_id,
                ae.pcap_cnt AS pcap_cnt,
                ae.source_type AS source_type,
-               ae.source_provenance AS source_provenance
-        LIMIT 1
+               ae.source_provenance AS source_provenance,
+               alert_definitions AS alert_definitions
         """
 
         def _work(tx) -> Optional[Dict[str, Any]]:
-            record = tx.run(cypher, event_id=cleaned_id).single()
+            record = tx.run(
+                cypher,
+                event_id=cleaned_id,
+                routing_domain_id=norm_domain,
+                source_type=norm_source_type,
+            ).single()
             if not record:
                 return None
-            return self._record_to_alert_event(record)
+            item = self._record_to_alert_event(record)
+            raw_defs = record.get("alert_definitions") if hasattr(record, "get") else None
+            item["engine"] = self._resolve_alert_definition_engine(item, raw_defs)
+            return item
 
         with self.driver.session() as session:
             return session.execute_read(_work)
@@ -1720,7 +1881,7 @@ class Neo4jReadRepository:
         bounds are provided and ordered last (`NULLS LAST`) otherwise.
         """
         if self.driver is None:
-            return [], 0
+            raise ConnectionError("Database driver unavailable")
 
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError(f"limit must be a positive integer, got {limit!r}")

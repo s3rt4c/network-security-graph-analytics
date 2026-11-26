@@ -685,6 +685,7 @@ def run_browser_smoke() -> None:
         unexpected_external_requests: List[str] = []
         observed_api_statuses: List[Tuple[str, int]] = []
         observed_v2_payloads: List[Tuple[str, Dict[str, Any]]] = []
+        observed_detail_payloads: List[Tuple[str, Dict[str, Any]]] = []
         page_errors: List[str] = []
 
         with sync_playwright() as p:
@@ -767,6 +768,57 @@ def run_browser_smoke() -> None:
                 dialog.get_by_text("Yes (true)").wait_for(timeout=10000)
                 dialog.get_by_text(expected_policy_fp).wait_for(timeout=10000)
                 dialog.get_by_text(expected_evidence_digest).wait_for(timeout=10000)
+
+                # Phase 4F.1 Scenario A Suricata AlertEvent tab -> real GET + rendered values
+                assert (
+                    dialog.get_by_role("tab", name="Correlation Evidence").get_attribute(
+                        "aria-selected"
+                    )
+                    == "true"
+                )
+                with page.expect_response(
+                    lambda r: urlparse(r.url).path == f"/api/v1/alert-events/{alert_a.event_id}"
+                    and parse_qs(urlparse(r.url).query).get("routing_domain_id") == [_CORP_DOMAIN],
+                    timeout=15000,
+                ) as alert_detail_resp_info:
+                    dialog.get_by_role("tab", name="Suricata AlertEvent").click()
+                alert_detail_resp = alert_detail_resp_info.value
+                assert alert_detail_resp.status == 200
+                observed_detail_payloads.append((alert_detail_resp.url, alert_detail_resp.json()))
+
+                dialog.get_by_text("9100001", exact=True).wait_for(timeout=10000)
+                dialog.get_by_text(
+                    "SYNTHETIC Demo Strong Match TLS Observation", exact=True
+                ).wait_for(timeout=10000)
+                dialog.get_by_text("192.0.2.10", exact=True).wait_for(timeout=10000)
+                dialog.get_by_text("198.51.100.20", exact=True).wait_for(timeout=10000)
+                dialog.get_by_text("1795428002.123456789123", exact=True).wait_for(timeout=10000)
+
+                # Phase 4F.1 Scenario A Zeek FlowObservation tab -> real GET + rendered values
+                with page.expect_response(
+                    lambda r: urlparse(r.url).path
+                    == f"/api/v1/flow-observations/{flow_a.observation_id}"
+                    and parse_qs(urlparse(r.url).query).get("routing_domain_id") == [_CORP_DOMAIN],
+                    timeout=15000,
+                ) as flow_detail_resp_info:
+                    dialog.get_by_role("tab", name="Zeek FlowObservation").click()
+                flow_detail_resp = flow_detail_resp_info.value
+                assert flow_detail_resp.status == 200
+                observed_detail_payloads.append((flow_detail_resp.url, flow_detail_resp.json()))
+
+                dialog.get_by_text("CDemoCorpStrong01", exact=True).wait_for(timeout=10000)
+                dialog.get_by_text("1795428000.123456789", exact=True).first.wait_for(timeout=10000)
+                dialog.get_by_text("640", exact=True).wait_for(timeout=10000)
+                dialog.get_by_text("2400", exact=True).wait_for(timeout=10000)
+                dialog.get_by_text("928", exact=True).wait_for(timeout=10000)
+                dialog.get_by_text("2736", exact=True).wait_for(timeout=10000)
+                dialog.get_by_text("SF", exact=True).wait_for(timeout=10000)
+                dialog.get_by_text("ssl", exact=True).wait_for(timeout=10000)
+
+                # Switch back to Correlation Evidence tab and confirm persisted evidence remains intact
+                dialog.get_by_role("tab", name="Correlation Evidence").click()
+                dialog.get_by_text(expected_evidence_digest).wait_for(timeout=10000)
+
                 page.keyboard.press("Escape")
                 dialog.wait_for(state="detached", timeout=10000)
 
@@ -865,6 +917,29 @@ def run_browser_smoke() -> None:
             )
             for u, body in observed_v2_payloads
         ), f"Missing expected include_unverified=true API response: {observed_v2_payloads}"
+
+        assert any(
+            urlparse(u).path == f"/api/v1/alert-events/{alert_a.event_id}"
+            and parse_qs(urlparse(u).query).get("routing_domain_id") == [_CORP_DOMAIN]
+            and body.get("sid") == 9100001
+            and body.get("signature") == "SYNTHETIC Demo Strong Match TLS Observation"
+            and body.get("timestamp_epoch_decimal") == "1795428002.123456789123"
+            and "timestamp_epoch_ns" not in body
+            for u, body in observed_detail_payloads
+        ), f"Missing expected AlertEvent detail API response: {observed_detail_payloads}"
+
+        assert any(
+            urlparse(u).path == f"/api/v1/flow-observations/{flow_a.observation_id}"
+            and parse_qs(urlparse(u).query).get("routing_domain_id") == [_CORP_DOMAIN]
+            and body.get("zeek_uid") == "CDemoCorpStrong01"
+            and body.get("orig_bytes") == 640
+            and body.get("resp_bytes") == 2400
+            and body.get("conn_state") == "SF"
+            and body.get("service") == "ssl"
+            and "start_epoch_ns" not in body
+            and "end_epoch_ns" not in body
+            for u, body in observed_detail_payloads
+        ), f"Missing expected FlowObservation detail API response: {observed_detail_payloads}"
 
         # 5. Confirm zero observable graph or schema mutations during real browser browsing
         post_browser_snapshot = _snapshot_full_disposable_graph(driver)

@@ -2,8 +2,108 @@
 Pydantic response models and schemas for the FastAPI backend API.
 """
 
-from typing import Generic, List, Optional, TypeVar, Literal, Dict
-from pydantic import BaseModel, ConfigDict, Field
+import ipaddress
+import re
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, Generic, List, Literal, Optional, TypeVar, Union
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+
+JS_MAX_SAFE_INTEGER = (1 << 53) - 1  # 9007199254740991
+_INT64_MAX = (1 << 63) - 1
+_UINT64_MAX = (1 << 64) - 1
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _require_non_empty_text(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string without leading/trailing whitespace")
+    return value
+
+
+def _validate_sha256_hex_str(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not _SHA256_HEX_RE.fullmatch(value):
+        raise ValueError(f"{field_name} must be a 64-character lowercase SHA-256 hex string")
+    return value
+
+
+def _validate_persisted_routing_domain(value: Any) -> str:
+    cleaned = _require_non_empty_text(value, "routing_domain_id")
+    if "#" in cleaned:
+        raise ValueError("routing_domain_id cannot contain reserved '#' delimiter")
+    return cleaned
+
+
+def _validate_strict_ip_str(value: Any, field_name: str) -> str:
+    cleaned = _require_non_empty_text(value, field_name)
+    try:
+        ipaddress.ip_address(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} is not a valid IP address: {cleaned!r}") from exc
+    return cleaned
+
+
+def _validate_optional_non_empty_text(value: Any, field_name: str) -> Optional[str]:
+    if value is None:
+        return None
+    return _require_non_empty_text(value, field_name)
+
+
+def _validate_optional_finite_decimal_str(value: Any, field_name: str) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = _require_non_empty_text(value, field_name)
+    try:
+        dec = Decimal(cleaned)
+    except InvalidOperation as exc:
+        raise ValueError(f"{field_name} must be a valid decimal string, got {value!r}") from exc
+    if not dec.is_finite():
+        raise ValueError(f"{field_name} must be finite, got {value!r}")
+    return cleaned
+
+
+def _validate_optional_port_int(value: Any, field_name: str) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= 65535):
+        raise ValueError(f"{field_name} must be an integer in 0..65535 or None, got {value!r}")
+    return value
+
+
+def _validate_strict_non_neg_int(
+    value: Any,
+    field_name: str,
+    *,
+    allow_none: bool,
+) -> Optional[int]:
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"{field_name} is required and cannot be null")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > _INT64_MAX:
+        raise ValueError(f"{field_name} must be an integer in 0..{_INT64_MAX}, got {value!r}")
+    return value
+
+
+def _validate_optional_uint64_decimal_str(value: Any, field_name: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or not value.isascii() or not value.isdigit():
+        raise ValueError(f"{field_name} must be an ASCII decimal string or None, got {value!r}")
+    if value != "0" and value.startswith("0"):
+        raise ValueError(f"{field_name} must be a canonical unsigned integer string without leading zeros")
+    parsed = int(value)
+    if parsed > _UINT64_MAX:
+        raise ValueError(f"{field_name} exceeds uint64 max ({_UINT64_MAX})")
+    return value
+
+
+def _serialize_js_safe_int(value: Optional[int]) -> Optional[Union[int, str]]:
+    """Preserve exact JSON numbers up to 2**53-1 and serialize larger integers as strings."""
+    if value is None:
+        return None
+    if value > JS_MAX_SAFE_INTEGER:
+        return str(value)
+    return value
 
 T = TypeVar("T")
 
@@ -281,6 +381,307 @@ class AlertFlowCorrelationResponse(BaseModel):
         default=None,
         description="UTC ISO-8601 timestamp when the verified correlation edge was persisted or updated",
     )
+
+
+class AlertEventDetailResponse(BaseModel):
+    """Persisted V2 Suricata AlertEvent forensic detail model (strict, read-only)."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    # Identity & provenance
+    event_id: str = Field(description="Deterministic 64-character lowercase SHA-256 Suricata AlertEvent identifier")
+    alert_definition_id: str = Field(description="Canonical rule definition identifier ({engine}:{namespace}:{gid}:{sid})")
+    source_record_id: str = Field(description="Native source record identifier")
+    log_source_id: str = Field(description="Log source provenance identifier")
+    sensor_id: str = Field(description="Sensor vantage identifier")
+    ruleset_namespace: str = Field(description="Rule namespace (e.g. et-open, local)")
+    routing_domain_id: str = Field(description="Isolated Layer 3 RoutingDomain identifier")
+    source_type: Literal["suricata"] = Field(description="Enforced telemetry source type ('suricata')")
+    source_provenance: Optional[str] = Field(default=None, description="Optional ingested source dataset provenance")
+
+    # Rule & alert metadata (engine resolved strictly from AlertDefinition; null when unlinked)
+    engine: Optional[str] = Field(
+        default=None,
+        description="Detection engine from linked AlertDefinition (null when AlertDefinition relationship is absent)",
+    )
+    gid: Optional[int] = Field(default=None, description="Rule generator ID (GID)")
+    sid: int = Field(description="Suricata signature ID (SID)")
+    rev: Optional[int] = Field(default=None, description="Rule revision")
+    signature: Optional[str] = Field(default=None, description="Suricata rule signature message")
+    category: Optional[str] = Field(default=None, description="Suricata alert category")
+    severity: Optional[int] = Field(default=None, description="Recorded Suricata alert severity integer")
+    action: Optional[str] = Field(
+        default=None,
+        description="Recorded Suricata alert action field (not proof of end-to-end enforcement)",
+    )
+    app_proto: Optional[str] = Field(default=None, description="Recorded application protocol")
+    direction: Optional[str] = Field(default=None, description="Recorded Suricata packet direction hint")
+    tx_id: Optional[int] = Field(default=None, description="Recorded Suricata transaction identifier")
+    pcap_cnt: Optional[int] = Field(default=None, description="Recorded packet counter")
+    flow_id: Optional[str] = Field(
+        default=None,
+        description="Lossless canonical unsigned 64-bit decimal string Suricata flow_id",
+    )
+
+    # Network evidence
+    src_ip: str = Field(description="Observed source IP address (packet direction, not attacker proof)")
+    dst_ip: str = Field(description="Observed destination IP address (packet direction, not victim proof)")
+    src_scoped_id: str = Field(description="RoutingDomain-scoped source IP identifier")
+    dst_scoped_id: str = Field(description="RoutingDomain-scoped destination IP identifier")
+    protocol: Optional[str] = Field(default=None, description="Observed transport protocol")
+    src_port: Optional[int] = Field(default=None, description="Observed source transport port (0..65535)")
+    dst_port: Optional[int] = Field(default=None, description="Observed destination transport port (0..65535)")
+    flow_key: str = Field(description="Directional V2 SHA-256 communication profile key")
+    community_id: Optional[str] = Field(default=None, description="Bidirectional Community ID flow hash")
+
+    # Time evidence (never exposes raw timestamp_epoch_ns)
+    timestamp_source: str = Field(description="Original recorded EVE timestamp string")
+    timestamp_epoch_decimal: Optional[str] = Field(
+        default=None,
+        description="Exact arbitrary-precision Decimal epoch seconds string (null if timezone-naive)",
+    )
+
+    @field_validator("event_id")
+    @classmethod
+    def _check_event_id(cls, value: str) -> str:
+        return _validate_sha256_hex_str(value, "event_id")
+
+    @field_validator("flow_key")
+    @classmethod
+    def _check_flow_key(cls, value: str) -> str:
+        return _require_non_empty_text(value, "flow_key")
+
+    @field_validator(
+        "alert_definition_id",
+        "source_record_id",
+        "log_source_id",
+        "sensor_id",
+        "ruleset_namespace",
+        "src_scoped_id",
+        "dst_scoped_id",
+        "timestamp_source",
+    )
+    @classmethod
+    def _check_required_text(cls, value: str, info) -> str:
+        return _require_non_empty_text(value, info.field_name)
+
+    @field_validator("routing_domain_id")
+    @classmethod
+    def _check_domain(cls, value: str) -> str:
+        return _validate_persisted_routing_domain(value)
+
+    @field_validator("src_ip", "dst_ip")
+    @classmethod
+    def _check_ips(cls, value: str, info) -> str:
+        return _validate_strict_ip_str(value, info.field_name)
+
+    @field_validator(
+        "source_provenance",
+        "engine",
+        "signature",
+        "category",
+        "action",
+        "app_proto",
+        "direction",
+        "protocol",
+        "community_id",
+    )
+    @classmethod
+    def _check_optional_text(cls, value: Optional[str], info) -> Optional[str]:
+        return _validate_optional_non_empty_text(value, info.field_name)
+
+    @field_validator("timestamp_epoch_decimal")
+    @classmethod
+    def _check_decimal(cls, value: Optional[str], info) -> Optional[str]:
+        return _validate_optional_finite_decimal_str(value, info.field_name)
+
+    @field_validator("src_port", "dst_port")
+    @classmethod
+    def _check_ports(cls, value: Optional[int], info) -> Optional[int]:
+        return _validate_optional_port_int(value, info.field_name)
+
+    @field_validator("sid")
+    @classmethod
+    def _check_sid(cls, value: int) -> int:
+        checked = _validate_strict_non_neg_int(value, "sid", allow_none=False)
+        assert checked is not None
+        return checked
+
+    @field_validator("gid", "rev", "severity", "tx_id", "pcap_cnt")
+    @classmethod
+    def _check_optional_counts(cls, value: Optional[int], info) -> Optional[int]:
+        return _validate_strict_non_neg_int(value, info.field_name, allow_none=True)
+
+    @field_validator("flow_id")
+    @classmethod
+    def _check_flow_id(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_optional_uint64_decimal_str(value, "flow_id")
+
+    @model_validator(mode="after")
+    def _check_domain_scoped_endpoints(self) -> "AlertEventDetailResponse":
+        norm_domain = self.routing_domain_id.lower()
+        expected_src = f"{norm_domain}#{str(ipaddress.ip_address(self.src_ip))}"
+        expected_dst = f"{norm_domain}#{str(ipaddress.ip_address(self.dst_ip))}"
+        if self.src_scoped_id != expected_src:
+            raise ValueError(
+                f"Inconsistent src_scoped_id {self.src_scoped_id!r} for routing_domain_id {norm_domain!r}"
+            )
+        if self.dst_scoped_id != expected_dst:
+            raise ValueError(
+                f"Inconsistent dst_scoped_id {self.dst_scoped_id!r} for routing_domain_id {norm_domain!r}"
+            )
+        return self
+
+    @field_serializer("gid", "sid", "rev", "severity", "tx_id", "pcap_cnt", when_used="json")
+    def _serialize_safe_integers(self, value: Optional[int]) -> Optional[Union[int, str]]:
+        return _serialize_js_safe_int(value)
+
+
+class FlowObservationDetailResponse(BaseModel):
+    """Persisted V2 Zeek FlowObservation forensic detail model (strict, read-only)."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    # Identity & provenance
+    observation_id: str = Field(description="Deterministic 64-character lowercase SHA-256 FlowObservation identifier")
+    flow_key: str = Field(description="Directional V2 SHA-256 communication profile key")
+    zeek_uid: str = Field(description="Native Zeek connection UID")
+    routing_domain_id: str = Field(description="Isolated Layer 3 RoutingDomain identifier")
+    sensor_id: str = Field(description="Sensor vantage identifier")
+    source_type: Literal["zeek"] = Field(description="Enforced telemetry source type ('zeek')")
+    source_provenance: Optional[str] = Field(default=None, description="Optional ingested source dataset provenance")
+    community_id: Optional[str] = Field(default=None, description="Bidirectional Community ID flow hash")
+
+    # Network evidence
+    src_ip: str = Field(description="Observed Zeek originator IP (not attacker proof)")
+    dst_ip: str = Field(description="Observed Zeek responder IP (not victim proof)")
+    src_scoped_id: str = Field(description="RoutingDomain-scoped originator IP identifier")
+    dst_scoped_id: str = Field(description="RoutingDomain-scoped responder IP identifier")
+    protocol: str = Field(description="Observed transport protocol")
+    src_port: Optional[int] = Field(default=None, description="Observed originator transport port (0..65535)")
+    dst_port: Optional[int] = Field(default=None, description="Observed responder transport port (0..65535)")
+
+    # Time evidence (never exposes raw start_epoch_ns / end_epoch_ns)
+    start_ts: str = Field(description="Original canonical Zeek start timestamp string")
+    end_ts: Optional[str] = Field(
+        default=None,
+        description="Derived last-observed timestamp string (start_epoch + duration; not confirmed TCP close)",
+    )
+    start_epoch_decimal: Optional[str] = Field(
+        default=None,
+        description="Exact arbitrary-precision Decimal start epoch seconds string",
+    )
+    end_epoch_decimal: Optional[str] = Field(
+        default=None,
+        description="Exact arbitrary-precision Decimal derived last-observed epoch seconds string",
+    )
+    duration_decimal: Optional[str] = Field(
+        default=None,
+        description="Exact arbitrary-precision Decimal flow duration seconds string",
+    )
+
+    # Traffic metrics (payload bytes kept distinct from IP-level bytes and packets)
+    orig_bytes: Optional[int] = Field(default=None, description="Originator payload bytes recorded by Zeek")
+    resp_bytes: Optional[int] = Field(default=None, description="Responder payload bytes recorded by Zeek")
+    orig_ip_bytes: Optional[int] = Field(default=None, description="Originator IP-level bytes recorded by Zeek")
+    resp_ip_bytes: Optional[int] = Field(default=None, description="Responder IP-level bytes recorded by Zeek")
+    orig_pkts: Optional[int] = Field(default=None, description="Originator packet count recorded by Zeek")
+    resp_pkts: Optional[int] = Field(default=None, description="Responder packet count recorded by Zeek")
+    missed_bytes: Optional[int] = Field(default=None, description="Missed bytes reported by Zeek")
+
+    # Zeek metadata
+    service: Optional[str] = Field(default=None, description="Zeek detected application service")
+    conn_state: Optional[str] = Field(
+        default=None,
+        description="Zeek conn_state symbol (e.g. SF; does not prove benign or successful application traffic)",
+    )
+    history: Optional[str] = Field(default=None, description="Zeek connection state history string")
+    local_orig: Optional[bool] = Field(default=None, description="Zeek local originator indicator")
+    local_resp: Optional[bool] = Field(default=None, description="Zeek local responder indicator")
+
+    @field_validator("observation_id")
+    @classmethod
+    def _check_observation_id(cls, value: str) -> str:
+        return _validate_sha256_hex_str(value, "observation_id")
+
+    @field_validator(
+        "flow_key",
+        "zeek_uid",
+        "sensor_id",
+        "src_scoped_id",
+        "dst_scoped_id",
+        "protocol",
+        "start_ts",
+    )
+    @classmethod
+    def _check_required_text(cls, value: str, info) -> str:
+        return _require_non_empty_text(value, info.field_name)
+
+    @field_validator("routing_domain_id")
+    @classmethod
+    def _check_domain(cls, value: str) -> str:
+        return _validate_persisted_routing_domain(value)
+
+    @field_validator("src_ip", "dst_ip")
+    @classmethod
+    def _check_ips(cls, value: str, info) -> str:
+        return _validate_strict_ip_str(value, info.field_name)
+
+    @field_validator("source_provenance", "community_id", "end_ts", "service", "conn_state", "history")
+    @classmethod
+    def _check_optional_text(cls, value: Optional[str], info) -> Optional[str]:
+        return _validate_optional_non_empty_text(value, info.field_name)
+
+    @field_validator("start_epoch_decimal", "end_epoch_decimal", "duration_decimal")
+    @classmethod
+    def _check_decimals(cls, value: Optional[str], info) -> Optional[str]:
+        return _validate_optional_finite_decimal_str(value, info.field_name)
+
+    @field_validator("src_port", "dst_port")
+    @classmethod
+    def _check_ports(cls, value: Optional[int], info) -> Optional[int]:
+        return _validate_optional_port_int(value, info.field_name)
+
+    @field_validator(
+        "orig_bytes",
+        "resp_bytes",
+        "orig_ip_bytes",
+        "resp_ip_bytes",
+        "orig_pkts",
+        "resp_pkts",
+        "missed_bytes",
+    )
+    @classmethod
+    def _check_counts(cls, value: Optional[int], info) -> Optional[int]:
+        return _validate_strict_non_neg_int(value, info.field_name, allow_none=True)
+
+    @model_validator(mode="after")
+    def _check_domain_scoped_endpoints(self) -> "FlowObservationDetailResponse":
+        norm_domain = self.routing_domain_id.lower()
+        expected_src = f"{norm_domain}#{str(ipaddress.ip_address(self.src_ip))}"
+        expected_dst = f"{norm_domain}#{str(ipaddress.ip_address(self.dst_ip))}"
+        if self.src_scoped_id != expected_src:
+            raise ValueError(
+                f"Inconsistent src_scoped_id {self.src_scoped_id!r} for routing_domain_id {norm_domain!r}"
+            )
+        if self.dst_scoped_id != expected_dst:
+            raise ValueError(
+                f"Inconsistent dst_scoped_id {self.dst_scoped_id!r} for routing_domain_id {norm_domain!r}"
+            )
+        return self
+
+    @field_serializer(
+        "orig_bytes",
+        "resp_bytes",
+        "orig_ip_bytes",
+        "resp_ip_bytes",
+        "orig_pkts",
+        "resp_pkts",
+        "missed_bytes",
+        when_used="json",
+    )
+    def _serialize_safe_integers(self, value: Optional[int]) -> Optional[Union[int, str]]:
+        return _serialize_js_safe_int(value)
 
 
 # --- Graph Traversal & Topology Schemas ---

@@ -747,6 +747,62 @@ def test_e2e_01_ingestion_correlation_pagination_idempotency_and_api(
             assert branch_empty_res.status_code == 200
             assert branch_empty_res.json()["total"] == 0
 
+            # Phase 4F.1 Scenario A detail endpoints -> exact persisted Suricata AlertEvent & Zeek FlowObservation
+            alert_detail_res = client.get(
+                f"/api/v1/alert-events/{alert_a.event_id}",
+                params={"routing_domain_id": corp_domain},
+            )
+            assert alert_detail_res.status_code == 200
+            alert_detail = alert_detail_res.json()
+            assert alert_detail["event_id"] == alert_a.event_id
+            assert alert_detail["routing_domain_id"] == corp_domain
+            assert alert_detail["source_type"] == "suricata"
+            assert alert_detail["engine"] == "suricata"
+            assert alert_detail["sid"] == 9100001
+            assert alert_detail["signature"] == "SYNTHETIC Demo Strong Match TLS Observation"
+            assert alert_detail["src_ip"] == "192.0.2.10"
+            assert alert_detail["src_port"] == 54321
+            assert alert_detail["dst_ip"] == "198.51.100.20"
+            assert alert_detail["dst_port"] == 443
+            assert alert_detail["flow_id"] == "8810001"
+            assert isinstance(alert_detail["timestamp_epoch_decimal"], str)
+            assert alert_detail["timestamp_epoch_decimal"] == "1795428002.123456789123"
+            assert "timestamp_epoch_ns" not in alert_detail
+
+            flow_detail_res = client.get(
+                f"/api/v1/flow-observations/{flow_a.observation_id}",
+                params={"routing_domain_id": corp_domain},
+            )
+            assert flow_detail_res.status_code == 200
+            flow_detail = flow_detail_res.json()
+            assert flow_detail["observation_id"] == flow_a.observation_id
+            assert flow_detail["zeek_uid"] == "CDemoCorpStrong01"
+            assert flow_detail["routing_domain_id"] == corp_domain
+            assert flow_detail["source_type"] == "zeek"
+            assert flow_detail["start_epoch_decimal"] == "1795428000.123456789"
+            assert flow_detail["duration_decimal"] == "10"
+            assert flow_detail["orig_bytes"] == 640
+            assert flow_detail["resp_bytes"] == 2400
+            assert flow_detail["orig_ip_bytes"] == 928
+            assert flow_detail["resp_ip_bytes"] == 2736
+            assert flow_detail["conn_state"] == "SF"
+            assert flow_detail["service"] == "ssl"
+            assert "start_epoch_ns" not in flow_detail
+            assert "end_epoch_ns" not in flow_detail
+
+            # Cross-domain wrong-scope checks fail closed with HTTP 404
+            wrong_domain_alert = client.get(
+                f"/api/v1/alert-events/{alert_a.event_id}",
+                params={"routing_domain_id": branch_domain},
+            )
+            assert wrong_domain_alert.status_code == 404
+
+            wrong_domain_flow = client.get(
+                f"/api/v1/flow-observations/{flow_a.observation_id}",
+                params={"routing_domain_id": branch_domain},
+            )
+            assert wrong_domain_flow.status_code == 404
+
         # Confirm zero observable graph or schema mutations occurred during GET requests
         assert (
             _snapshot_demo_graph(live_driver, [corp_domain, branch_domain], [ruleset_ns])
@@ -1000,6 +1056,8 @@ def test_e2e_03_subnanosecond_decimal_delta_and_db_unavailable_503(
         with TestClient(create_app()) as unavail_client:
             unavail_res = unavail_client.get("/api/v1/correlations/alert-flows")
             assert unavail_res.status_code == 503
+            assert unavail_client.get(f"/api/v1/alert-events/{tol_alerts[0].event_id}").status_code == 503
+            assert unavail_client.get(f"/api/v1/flow-observations/{tol_flows[0].observation_id}").status_code == 503
     finally:
         _cleanup_owned_entities(live_driver, **owned)
 
