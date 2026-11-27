@@ -218,11 +218,13 @@ curl -s http://127.0.0.1:8000/health
 curl -s http://127.0.0.1:8000/ready
 curl -s "http://127.0.0.1:8000/api/v1/correlations/alert-flows"
 curl -s "http://127.0.0.1:8000/api/v1/correlations/alert-flows?routing_domain_id=demo-v2-corp&include_unverified=true"
+curl -s "http://127.0.0.1:8000/api/v1/alert-events?routing_domain_id=demo-v2-corp&limit=50&offset=0"
 curl -s "http://127.0.0.1:8000/api/v1/alert-events/1b13c85e13fe14e06380701d8abe0dfc466d843d90eef1709d6969f39fea2e8d?routing_domain_id=demo-v2-corp"
 curl -s "http://127.0.0.1:8000/api/v1/flow-observations/b0e9ea368ed1cbbab586e61e755a6a3bbf2bfa2403c67b8bc153650c36e3d3b8?routing_domain_id=demo-v2-corp"
 ```
 
 - Verified-only default (`include_unverified` omitted or `false`) returns only `verification_status: "verified"` rows.
+- `/api/v1/alert-events` returns all in-scope persisted Suricata `AlertEvent` records regardless of whether a `CORRELATED_WITH` edge exists, ordered by `timestamp_epoch_ns` ascending (`NULLS LAST`) + `event_id`, with factual `has_persisted_correlation`.
 - `/api/v1/correlations/alert-flows/{event_id}` returns `HTTP 200` with `total: 0` when the `AlertEvent` exists without matching edges, and `HTTP 404` when unknown (or outside filtered `routing_domain_id`).
 - `/api/v1/alert-events/{event_id}` and `/api/v1/flow-observations/{observation_id}` enforce `source_type` (`suricata` vs `zeek`), validate `routing_domain_id`, omit internal Neo4j `*_epoch_ns` / `elementId`, preserve exact `Decimal` strings and uint64 `flow_id`, return `HTTP 404` when out-of-domain or absent, and return `HTTP 503` when the database driver is unavailable.
 
@@ -248,6 +250,8 @@ Manual walkthrough at `http://localhost:5173`:
 6. Filter `RoutingDomain` = `demo-v2-branch` and click **Apply Filters** to verify domain isolation.
 7. Click **Reset**, check **Include unverified correlations**, and click **Apply Filters** to inspect any `Previously Verified — Current Check Incomplete` edges and explanatory warning banner.
 8. Switch back to **Legacy Correlations** to verify legacy V1 remains functional and unaffected.
+9. Click **Alert Explorer** in the top navigation bar; confirm **Legacy Alert Facts** (V1) is selected by default, then click the **Suricata Events** tab.
+10. Observe all ingested `AlertEvent` occurrences (linked `Persisted link present` and unlinked `No persisted link recorded`), filter by `RoutingDomain=demo-v2-corp`, `Severity=2`, `SID=9100002`, click **Inspect** on Scenario B (`SYNTHETIC Demo Ambiguous Dual Flow Probe`), verify its forensic detail modal loads independently via `/api/v1/alert-events/{event_id}`, press `Escape`, and switch back to **Legacy Alert Facts**.
 
 Automated real-stack headless Chromium verification (requires Playwright Chromium, an **empty** disposable `neo4j-test` container, and unoccupied local ports `127.0.0.1:8000` and `127.0.0.1:5173`):
 
@@ -347,11 +351,11 @@ docker compose down
 
 ## 13. Known Limitations
 
-- **Read-Only V2 UI & CLI-Driven V2 Ingestion:** The V2 browser interface, `/api/v1/correlations/alert-flows*`, `/api/v1/alert-events/{event_id}`, and `/api/v1/flow-observations/{observation_id}` endpoints are strictly read-only. Zeek and Suricata V2 ingestion and Phase 4B correlation runs remain CLI/service operations; the legacy browser **Import Data** workflow does not ingest V2 logs.
-- **Persisted vs Real-Time Verification:** `verification_status` reflects the last stored Phase 4B evaluation, not live revalidation during read requests.
-- **Phase 4C vs 4F.1 Field Scope:** `/api/v1/correlations/alert-flows*` remains compact correlation edge metadata, while the three-tab inspector lazily retrieves full persisted `AlertEvent` / `AlertDefinition` and `FlowObservation` forensic attributes through `/api/v1/alert-events/{event_id}` and `/api/v1/flow-observations/{observation_id}` (still omitting unpersisted Phase 4A candidate arrays, raw `*_epoch_ns`, and internal `elementId` values).
+- **Read-Only V2 UI & CLI-Driven V2 Ingestion:** The V2 browser interface, `/api/v1/correlations/alert-flows*`, `/api/v1/alert-events`, `/api/v1/alert-events/{event_id}`, and `/api/v1/flow-observations/{observation_id}` endpoints are strictly read-only. Zeek and Suricata V2 ingestion and Phase 4B correlation runs remain CLI/service operations; the legacy browser **Import Data** workflow does not ingest V2 logs.
+- **Persisted vs Real-Time Verification:** `verification_status` reflects the last stored Phase 4B evaluation, and `has_persisted_correlation` in the triage list only indicates persisted edge presence (never evaluation completeness or a security verdict).
+- **Phase 4C vs 4F.1/4F.2 Scope:** `/api/v1/correlations/alert-flows*` remains compact correlation edge metadata; `/api/v1/alert-events` enables independent V2 Suricata `AlertEvent` triage, while the modal inspector lazily retrieves full persisted `AlertEvent` / `AlertDefinition` and `FlowObservation` forensic attributes through `/api/v1/alert-events/{event_id}` and `/api/v1/flow-observations/{observation_id}` (still omitting unpersisted Phase 4A candidate arrays, raw `*_epoch_ns`, and internal `elementId` values). No V2 FlowObservation listing UI or Phase 4A decision history persistence is introduced in Phase 4F.2.
 - **Read Committed Isolation:** Neo4j Read Committed isolation does not provide cross-query snapshot isolation; concurrent ingestion and multi-page count/item API reads can observe committed changes between queries.
-- **Authentication / RBAC:** Multi-user authentication and role-based access control are not implemented in Phases 3A–4F.1; `routing_domain_id` scoping is a data filter, not an authentication boundary. This synthetic demonstration is for engineering evaluation and is not a production-hardened deployment.
+- **Authentication / RBAC:** Multi-user authentication and role-based access control are not implemented in Phases 3A–4F.2; `routing_domain_id` scoping is a data filter, not an authentication boundary. This synthetic demonstration is for engineering evaluation and is not a production-hardened deployment.
 - **Small Synthetic Dataset:** Validates semantic correctness and workflow wiring, not production performance or high-volume telemetry throughput.
 - **Vite Development Server in Browser Smoke:** `scripts/v2_browser_smoke.py` and the CI `v2-browser-smoke` job exercise the Vite development server proxy against local `uvicorn`, not a hardened production reverse-proxy deployment serving static built assets.
 

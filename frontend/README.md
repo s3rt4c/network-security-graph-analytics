@@ -39,12 +39,13 @@ By default, Vite runs at `http://localhost:5173`.
 - **`src/pages/`**: Single-page application views:
   - `OverviewPage`: Global volume metrics, metric completeness mode, and endpoint rankings.
   - `NetworkExplorerPage`: Center-rooted neighborhood graph, parallel flow rendering, and inspection drawers.
-  - `AlertExplorerPage`: Normalized security alert facts table and detail modal.
+  - `AlertExplorerPage`: Accessible sub-tabbed view separating Legacy V1 normalized alert facts (`Legacy Alert Facts`, default) from V2 discrete Suricata triage (`Suricata Events`).
   - `CorrelationsPage`: Accessible sub-tabbed view separating Legacy V1 endpoint co-occurrence (`Legacy Correlations`, default) from V2 persisted Zeek–Suricata correlations (`Alert–Flow Correlations`).
   - `PathFinderPage`: Observed directional communication hop chain visualizer.
   - `ImportDataPage`: Browser data import, dual-file validation, and workspace replacement.
-- **`src/components/correlations/`**: Modular V2 correlation explorer UI (`AlertFlowCorrelationsView`, `CorrelationEvidenceModal`, `VerificationStatusBadge`).
-- **`src/utils/correlationHelpers.ts`**: Fail-closed filter validators, deterministic row-key builder preserving duplicate parallel edges, verbatim value formatter, and structured API error translator.
+- **`src/components/alerts/`**: Modular V1/V2 Alert Explorer views (`LegacyAlertFactsView`, `SuricataEventsView`, `AlertEventDetailModal`, `SuricataSeverityBadge`).
+- **`src/components/correlations/`**: Modular V2 correlation explorer UI (`AlertFlowCorrelationsView`, `CorrelationEvidenceModal`, `AlertEventDetailPanel`, `FlowObservationDetailPanel`, `VerificationStatusBadge`).
+- **`src/utils/correlationHelpers.ts` & `src/utils/alertTriageHelpers.ts`**: Fail-closed filter validators, lossless BigInt UTC nanosecond converter, deterministic row-key builder, verbatim value formatter, and structured API error translators.
 
 ## V2 Alert–Flow Correlations Explorer (Phase 4D)
 
@@ -64,3 +65,10 @@ By default, Vite runs at `http://localhost:5173`.
 - **Missing Correlation Semantics:** A `404` on `/alert-flows/{event_id}` indicates the requested Suricata `AlertEvent` does not exist (or not in the filtered `RoutingDomain`), whereas `HTTP 200` with `0` rows indicates the `AlertEvent` exists with no matching persisted edges under the current filters. An empty result never proves an alert was `REJECTED`, `AMBIGUOUS`, `INSUFFICIENT`, or benign — it may mean no Phase 4B run completed, no edge met persistence criteria, or verified-only/other filters excluded it.
 - **Backend Dependency & No Live Recalculation:** The V2 explorer is strictly read-only (`GET` requests only). It never executes live correlation runs or writes Neo4j state; persisted edges must first be produced by ingestion + the Phase 4B correlation service.
 - **Current Payload Scope:** Per Phase 4C API contracts, this view displays persisted correlation IDs, verification metadata, and factual correlation evidence only — it does not fabricate unexposed IP addresses, ports, alert signatures, Zeek flow fields, attacker/victim attribution, causation claims, or unpersisted Phase 4A candidate reason arrays.
+
+## V2 Suricata AlertEvent Triage Explorer (Phase 4F.2)
+
+- Navigate to **Alert Explorer** in the top bar: **Legacy Alert Facts** (V1 `GET /api/v1/alerts`) remains the default tab, while **Suricata Events** (V2 `GET /api/v1/alert-events`) lists ingested Suricata `AlertEvent` occurrences regardless of whether a `CORRELATED_WITH` edge exists.
+- Filter server-side by `RoutingDomain`, `Severity`, `SID`, `Sensor ID`, and UTC ISO-8601 time bounds (converted via `BigInt` nanoseconds without unsafe JS `Number` coercion; active time bounds exclude null `timestamp_epoch_ns` records).
+- **Neutral Persisted-Link Wording:** `Persisted link present` vs `No persisted link recorded`. The absence of a persisted relationship does not establish `REJECTED`, `AMBIGUOUS`, `INSUFFICIENT`, or benign traffic.
+- Click **Inspect** on any linked or unlinked row to open the independent **Suricata AlertEvent Forensic Detail** modal reusing `AlertEventDetailPanel` (`GET /api/v1/alert-events/{event_id}`) with no `observation_id` required.

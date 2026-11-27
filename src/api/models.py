@@ -115,6 +115,13 @@ def _serialize_js_safe_int(value: Optional[int]) -> Optional[Union[int, str]]:
         return str(value)
     return value
 
+
+def _serialize_non_nullable_js_safe_int(value: int) -> Union[int, str]:
+    """Preserve exact JSON numbers up to 2**53-1 for required integer fields."""
+    if value > JS_MAX_SAFE_INTEGER:
+        return str(value)
+    return value
+
 T = TypeVar("T")
 
 
@@ -544,12 +551,115 @@ class AlertEventDetailResponse(BaseModel):
 
     @field_serializer("sid", when_used="json")
     def _serialize_safe_sid(self, value: int) -> Union[int, str]:
-        if abs(value) > JS_MAX_SAFE_INTEGER:
-            return str(value)
-        return value
+        return _serialize_non_nullable_js_safe_int(value)
 
     @field_serializer("gid", "rev", "severity", "tx_id", "pcap_cnt", when_used="json")
     def _serialize_safe_integers(self, value: Optional[int]) -> Optional[Union[int, str]]:
+        return _serialize_js_safe_int(value)
+
+
+class AlertEventTriageItemResponse(BaseModel):
+    """Compact persisted V2 Suricata AlertEvent triage summary item (strict, read-only)."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    event_id: str = Field(description="Deterministic 64-character lowercase SHA-256 Suricata AlertEvent identifier")
+    routing_domain_id: str = Field(description="Isolated Layer 3 RoutingDomain identifier")
+    source_type: Literal["suricata"] = Field(description="Enforced telemetry source type ('suricata')")
+    sensor_id: str = Field(description="Sensor vantage identifier")
+
+    sid: int = Field(description="Suricata signature ID (SID)")
+    signature: Optional[str] = Field(default=None, description="Suricata rule signature message")
+    severity: Optional[int] = Field(
+        default=None,
+        description="Recorded Suricata alert severity integer (not a universal risk score)",
+    )
+    category: Optional[str] = Field(default=None, description="Suricata alert category")
+
+    src_ip: str = Field(description="Observed source IP address (packet direction, not attacker proof)")
+    dst_ip: str = Field(description="Observed destination IP address (packet direction, not victim proof)")
+    src_port: Optional[int] = Field(default=None, description="Observed source transport port (0..65535)")
+    dst_port: Optional[int] = Field(default=None, description="Observed destination transport port (0..65535)")
+    protocol: Optional[str] = Field(default=None, description="Observed transport protocol")
+
+    timestamp_source: str = Field(description="Original recorded EVE timestamp string")
+    timestamp_epoch_decimal: Optional[str] = Field(
+        default=None,
+        description="Exact arbitrary-precision Decimal epoch seconds string (null if timezone-naive)",
+    )
+    has_persisted_correlation: bool = Field(
+        description=(
+            "Whether at least one in-domain persisted CORRELATED_WITH relationship to a Zeek "
+            "FlowObservation exists in the graph (true includes verified and unverified_incomplete/"
+            "potentially stale links and is not proof of a currently verified match; false means "
+            "only that no persisted link is recorded and does not imply REJECTED, AMBIGUOUS, "
+            "INSUFFICIENT, or benign)"
+        ),
+    )
+
+    @field_validator("event_id")
+    @classmethod
+    def _check_event_id(cls, value: str) -> str:
+        return _validate_sha256_hex_str(value, "event_id")
+
+    @field_validator("routing_domain_id")
+    @classmethod
+    def _check_domain(cls, value: str) -> str:
+        return _validate_persisted_routing_domain(value)
+
+    @field_validator("sensor_id", "timestamp_source")
+    @classmethod
+    def _check_required_text(cls, value: str, info) -> str:
+        return _require_non_empty_text(value, info.field_name)
+
+    @field_validator("src_ip", "dst_ip")
+    @classmethod
+    def _check_ips(cls, value: str, info) -> str:
+        return _validate_strict_ip_str(value, info.field_name)
+
+    @field_validator("signature", "category", "protocol")
+    @classmethod
+    def _check_optional_text(cls, value: Optional[str], info) -> Optional[str]:
+        return _validate_optional_non_empty_text(value, info.field_name)
+
+    @field_validator("timestamp_epoch_decimal")
+    @classmethod
+    def _check_decimal(cls, value: Optional[str], info) -> Optional[str]:
+        return _validate_optional_finite_decimal_str(value, info.field_name)
+
+    @field_validator("src_port", "dst_port")
+    @classmethod
+    def _check_ports(cls, value: Optional[int], info) -> Optional[int]:
+        return _validate_optional_port_int(value, info.field_name)
+
+    @field_validator("sid")
+    @classmethod
+    def _check_sid(cls, value: int) -> int:
+        checked = _validate_strict_non_neg_int(value, "sid", allow_none=False)
+        assert checked is not None
+        return checked
+
+    @field_validator("severity")
+    @classmethod
+    def _check_severity(cls, value: Optional[int]) -> Optional[int]:
+        return _validate_strict_non_neg_int(value, "severity", allow_none=True)
+
+    @model_validator(mode="after")
+    def _check_matching_ip_families(self) -> "AlertEventTriageItemResponse":
+        src_ver = ipaddress.ip_address(self.src_ip).version
+        dst_ver = ipaddress.ip_address(self.dst_ip).version
+        if src_ver != dst_ver:
+            raise ValueError(
+                f"Mismatched src_ip/dst_ip address families: IPv{src_ver} vs IPv{dst_ver}"
+            )
+        return self
+
+    @field_serializer("sid", when_used="json")
+    def _serialize_safe_sid(self, value: int) -> Union[int, str]:
+        return _serialize_non_nullable_js_safe_int(value)
+
+    @field_serializer("severity", when_used="json")
+    def _serialize_safe_severity(self, value: Optional[int]) -> Optional[Union[int, str]]:
         return _serialize_js_safe_int(value)
 
 
@@ -757,6 +867,30 @@ class PaginatedResponse(BaseModel, Generic[T]):
     offset: int = Field(description="Offset of the first item in the collection")
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+class SafePaginatedResponse(PaginatedResponse[T], Generic[T]):
+    """Strict pagination envelope preserving lossless strings for counts above 2**53-1."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, strict=True, extra="forbid")
+
+    @field_validator("total", "offset")
+    @classmethod
+    def _check_non_neg_int64_counts(cls, value: int, info) -> int:
+        checked = _validate_strict_non_neg_int(value, info.field_name, allow_none=False)
+        assert checked is not None
+        return checked
+
+    @field_validator("limit")
+    @classmethod
+    def _check_positive_limit(cls, value: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"limit must be a positive integer, got {value!r}")
+        return value
+
+    @field_serializer("total", "offset", when_used="json")
+    def _serialize_safe_counts(self, value: int) -> Union[int, str]:
+        return _serialize_non_nullable_js_safe_int(value)
 
 
 # --- Data Import & Workspace Replacement Schemas (Phase 6.5) ---

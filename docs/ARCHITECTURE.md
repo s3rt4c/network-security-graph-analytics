@@ -83,7 +83,7 @@ src/api/routes/
   ├── network.py       (GET /api/v1/network/*, including /analytics/summary and /analytics/endpoints)
   ├── alerts.py        (GET /api/v1/alerts/* [V1 AlertFact])
   ├── correlations.py  (GET /api/v1/correlations/traffic-alerts [V1], /alert-flows* [V2])
-  ├── observations.py  (GET /api/v1/alert-events/{event_id}, /flow-observations/{observation_id} [V2])
+  ├── observations.py  (GET /api/v1/alert-events [V2 triage], /alert-events/{event_id}, /flow-observations/{observation_id})
   └── graph.py         (GET /api/v1/graph/*)
                             ▲
                             │ REST / JSON (Vite Dev Proxy)
@@ -93,11 +93,16 @@ frontend/src/
   ├── pages/
   │   ├── OverviewPage.tsx         (Global metrics, mode banners, distribution grids, endpoint rankings)
   │   ├── NetworkExplorerPage.tsx  (Cytoscape graph canvas, parallel edge rendering, edge & IP inspectors)
-  │   ├── AlertExplorerPage.tsx    (Normalized alert facts table & detail modal)
+  │   ├── AlertExplorerPage.tsx    (Accessible tabs separating Legacy V1 AlertFacts & V2 Suricata AlertEvents)
   │   ├── CorrelationsPage.tsx     (Accessible tabs separating Legacy V1 co-occurrence & V2 alert–flow explorer)
   │   ├── PathFinderPage.tsx       (Directional L3 communication hop chain visualizer)
   │   └── ImportDataPage.tsx       (Browser data import, dual-file validation & workspace replacement)
   └── components/
+      ├── alerts/
+      │   ├── LegacyAlertFactsView.tsx  (Preserved V1 AlertFact table & fact modal)
+      │   ├── SuricataEventsView.tsx    (Read-only V2 AlertEvent triage list, filters, pagination & neutral link badges)
+      │   ├── AlertEventDetailModal.tsx (Independent modal reusing Phase 4F.1 AlertEventDetailPanel)
+      │   └── SuricataSeverityBadge.tsx (Non-color-only exact recorded Suricata severity badge)
       ├── correlations/
       │   ├── AlertFlowCorrelationsView.tsx (V2 verified-first read-only table, filters, pagination & quick inspect actions)
       │   ├── CorrelationEvidenceModal.tsx  (Accessible lazy three-tab inspector: Evidence / AlertEvent / FlowObservation)
@@ -163,13 +168,13 @@ frontend/src/
     - If `domain` and `address` are supplied, resolves deterministically via `scoped_ip_id(domain, address)`.
     - If only `address` is supplied and exactly one IP node exists across all domains, returns it seamlessly (preserving 100% single-domain backwards compatibility).
     - If only `address` is supplied and multiple IP nodes exist with that address across different routing domains, raises `AmbiguousEndpointError`.
-- Provides aggregated analytics summaries, paginated endpoint volume rankings, filtered communication queries, bounded graph neighborhood traversals, directional shortest-path computations, discrete `FlowObservation` lookup/paginated reads (`get_flow_observation`, `list_flow_observations`), and discrete `AlertEvent` lookup/paginated reads (`get_alert_event`, `list_alert_events`).
+- Provides aggregated analytics summaries, paginated endpoint volume rankings, filtered communication queries, bounded graph neighborhood traversals, directional shortest-path computations, discrete `FlowObservation` lookup/paginated reads (`get_flow_observation`, `list_flow_observations`), and discrete `AlertEvent` lookup/paginated reads (`get_alert_event`, `list_alert_events`, `list_alert_events_for_triage`).
 
 ### 4. REST API Backend (`src/api/`)
 - Built with **FastAPI** and **Pydantic v2**.
 - Structured into modular routers: `health.py`, `import_data.py`, `network.py`, `alerts.py`, `correlations.py`, `observations.py`, and `graph.py`.
 - Employs lifespan events for database connectivity lifecycle and FastAPI dependency injection for repository access.
-- Maintains strict V1/V2 route separation: V1 `AlertFact` routes (`/api/v1/alerts*`) remain completely independent from V2 Suricata `AlertEvent` (`/api/v1/alert-events/{event_id}`) and Zeek `FlowObservation` (`/api/v1/flow-observations/{observation_id}`) forensic detail routes. All V2 detail lookups execute read-only `session.execute_read()` transactions, enforce `routing_domain_id` and `source_type`, validate strict `Decimal` and JS safe-integer boundaries without exposing raw `*_epoch_ns`, and propagate Neo4j unavailability as `HTTP 503` (never masking missing drivers as `404`).
+- Maintains strict V1/V2 route separation: V1 `AlertFact` routes (`/api/v1/alerts*`) remain completely independent from V2 Suricata `AlertEvent` triage (`/api/v1/alert-events`), forensic `AlertEvent` detail (`/api/v1/alert-events/{event_id}`), and Zeek `FlowObservation` (`/api/v1/flow-observations/{observation_id}`) routes. All V2 queries execute read-only `session.execute_read()` transactions, enforce `routing_domain_id` and `source_type`, validate strict `Decimal` and JS safe-integer boundaries without exposing raw `*_epoch_ns`, and propagate Neo4j unavailability as `HTTP 503` (never masking missing drivers as `404`).
 - Global exception handling maps `AmbiguousEndpointError` to machine-readable **HTTP 409 Conflict**:
   ```json
   {

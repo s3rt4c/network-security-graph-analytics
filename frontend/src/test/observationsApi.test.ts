@@ -1,7 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
-import { getAlertEvent, getFlowObservation } from '../api/observations';
-import type { AlertEventDetailResponse, FlowObservationDetailResponse } from '../api/types';
+import { getAlertEvent, getFlowObservation, listAlertEvents } from '../api/observations';
+import type {
+  AlertEventDetailResponse,
+  AlertEventTriageItemResponse,
+  FlowObservationDetailResponse,
+} from '../api/types';
+import {
+  formatSafeCount,
+  parseUtcTimestampToEpochNs,
+  validateNonNegativeInt64Input,
+  validateUtcTimeRange,
+} from '../utils/alertTriageHelpers';
 
 const SAMPLE_EVENT_ID = 'a'.repeat(64);
 const SAMPLE_OBS_ID = 'b'.repeat(64);
@@ -170,5 +180,132 @@ describe('Observations Detail API Client (V2)', () => {
       detail,
     });
     await expect(getFlowObservation(SAMPLE_OBS_ID, 'demo-v2-corp')).rejects.toBeInstanceOf(ApiError);
+  });
+
+  it('lists V2 Suricata AlertEvents with lossless BigInt string filters, pagination, and AbortSignal', async () => {
+    const triageItem: AlertEventTriageItemResponse = {
+      event_id: SAMPLE_EVENT_ID,
+      routing_domain_id: 'demo-v2-corp',
+      source_type: 'suricata',
+      sensor_id: 'suricata-demo-01',
+      sid: '9007199254740992',
+      signature: 'SYNTHETIC Triage Alert',
+      severity: 2,
+      category: 'Potentially Bad Traffic',
+      src_ip: '192.0.2.30',
+      dst_ip: '198.51.100.40',
+      src_port: 55000,
+      dst_port: 8080,
+      protocol: 'TCP',
+      timestamp_source: '2026-11-23T10:01:05.123456789+0000',
+      timestamp_epoch_decimal: '1795428065.123456789',
+      has_persisted_correlation: false,
+    };
+
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          items: [triageItem],
+          total: '9007199254740992',
+          limit: 50,
+          offset: 0,
+        }),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const controller = new AbortController();
+    const res = await listAlertEvents(
+      {
+        routing_domain_id: 'demo-v2-corp',
+        severity: 2,
+        sid: '9007199254740992',
+        sensor_id: 'suricata-demo-01',
+        start_epoch_ns: '1795428000000000001',
+        end_epoch_ns: '1795428065123456789',
+        limit: 50,
+        offset: 0,
+      },
+      controller.signal
+    );
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const parsed = new URL(url, 'http://localhost');
+    expect(parsed.pathname).toBe('/api/v1/alert-events');
+    expect(parsed.searchParams.get('routing_domain_id')).toBe('demo-v2-corp');
+    expect(parsed.searchParams.get('severity')).toBe('2');
+    expect(parsed.searchParams.get('sid')).toBe('9007199254740992');
+    expect(parsed.searchParams.get('sensor_id')).toBe('suricata-demo-01');
+    expect(parsed.searchParams.get('start_epoch_ns')).toBe('1795428000000000001');
+    expect(parsed.searchParams.get('end_epoch_ns')).toBe('1795428065123456789');
+    expect(parsed.searchParams.get('limit')).toBe('50');
+    expect(parsed.searchParams.get('offset')).toBe('0');
+    expect(init.signal).toBe(controller.signal);
+    expect(res.total).toBe('9007199254740992');
+    expect(res.items[0].sid).toBe('9007199254740992');
+    expect(res.items[0].has_persisted_correlation).toBe(false);
+  });
+
+  it('converts UTC ISO-8601 inputs to lossless nanosecond strings and validates int64 filters fail-closed', () => {
+    expect(parseUtcTimestampToEpochNs('2026-11-23T10:00:02.123456789Z', 'Start Time').ns).toBe(
+      '1795428002123456789'
+    );
+    expect(parseUtcTimestampToEpochNs('2026-11-23T10:00', 'Start Time').ns).toBe(
+      '1795428000000000000'
+    );
+    expect(parseUtcTimestampToEpochNs('2026-02-30T10:00:00Z', 'Start Time').error).toBeTruthy();
+    expect(parseUtcTimestampToEpochNs('2026-11-23T10:00:00+03:00', 'Start Time').error).toBeTruthy();
+    expect(
+      validateUtcTimeRange('2026-11-23T10:05:00Z', '2026-11-23T10:00:00Z').error
+    ).toContain('must not be earlier');
+
+    expect(validateNonNegativeInt64Input('0', 'Severity')).toBeNull();
+    expect(validateNonNegativeInt64Input('9223372036854775807', 'SID')).toBeNull();
+    expect(validateNonNegativeInt64Input('9223372036854775808', 'SID')).toBeTruthy();
+    expect(validateNonNegativeInt64Input('-1', 'Severity')).toBeTruthy();
+    expect(formatSafeCount(0)).toBe('0');
+    expect(formatSafeCount(null)).toBe('Not recorded');
+  });
+
+  it('validates leap years, month-end, midnight, negative epochs, 1..9 frac precision, and exact int64 UTC boundaries', () => {
+    // Leap years & non-leap centuries
+    expect(parseUtcTimestampToEpochNs('2024-02-29T00:00:00Z', 'Start Time').ns).toBe(
+      '1709164800000000000'
+    );
+    expect(parseUtcTimestampToEpochNs('2000-02-29T23:59:59.1Z', 'Start Time').ns).toBe(
+      '951868799100000000'
+    );
+    expect(parseUtcTimestampToEpochNs('2023-02-29T00:00:00Z', 'Start Time').error).toBeTruthy();
+    expect(parseUtcTimestampToEpochNs('1900-02-29T00:00:00Z', 'Start Time').error).toBeTruthy();
+
+    // Month-end & midnight & fractional digit bounds (1..9 valid, >9 rejected)
+    expect(parseUtcTimestampToEpochNs('2026-04-31T00:00:00Z', 'Start Time').error).toBeTruthy();
+    expect(parseUtcTimestampToEpochNs('2026-01-31T23:59:59.123456789Z', 'Start Time').ns).toBe(
+      '1769903999123456789'
+    );
+    expect(parseUtcTimestampToEpochNs('2026-11-23T00:00:00.5Z', 'Start Time').ns).toBe(
+      '1795392000500000000'
+    );
+    expect(parseUtcTimestampToEpochNs('2026-11-23T10:00:00.1234567890Z', 'Start Time').error).toBeTruthy();
+
+    // Negative Unix epochs & exact signed int64 boundaries
+    expect(parseUtcTimestampToEpochNs('1970-01-01T00:00:00Z', 'Start Time').ns).toBe('0');
+    expect(parseUtcTimestampToEpochNs('1969-12-31T23:59:59.123456789Z', 'Start Time').ns).toBe(
+      '-876543211'
+    );
+    expect(parseUtcTimestampToEpochNs('1969-12-31T23:59:59.999999999Z', 'Start Time').ns).toBe('-1');
+    expect(parseUtcTimestampToEpochNs('1677-09-21T00:12:43.145224192Z', 'Start Time').ns).toBe(
+      '-9223372036854775808'
+    );
+    expect(parseUtcTimestampToEpochNs('1677-09-21T00:12:43.145224191Z', 'Start Time').error).toBeTruthy();
+    expect(parseUtcTimestampToEpochNs('2262-04-11T23:47:16.854775807Z', 'End Time').ns).toBe(
+      '9223372036854775807'
+    );
+    expect(parseUtcTimestampToEpochNs('2262-04-11T23:47:16.854775808Z', 'End Time').error).toBeTruthy();
+
+    // Whitespace & non-UTC offsets fail closed
+    expect(parseUtcTimestampToEpochNs('   ', 'Start Time').error).toBeTruthy();
+    expect(parseUtcTimestampToEpochNs('2026-11-23T10:00:00-05:00', 'Start Time').error).toBeTruthy();
+    expect(parseUtcTimestampToEpochNs('2026-11-23T10:00:00+00:00', 'Start Time').error).toBeTruthy();
   });
 });
