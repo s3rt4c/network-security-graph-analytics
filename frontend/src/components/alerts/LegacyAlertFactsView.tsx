@@ -33,6 +33,7 @@ export const LegacyAlertFactsView: React.FC<LegacyAlertFactsViewProps> = ({ onNa
   const [limit] = useState<number>(50);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [refreshNonce, setRefreshNonce] = useState<number>(0);
 
   // Inspector modal state
   const [selectedFactKey, setSelectedFactKey] = useState<string | null>(null);
@@ -79,14 +80,14 @@ export const LegacyAlertFactsView: React.FC<LegacyAlertFactsViewProps> = ({ onNa
     const controller = new AbortController();
     loadAlerts(controller.signal);
     return () => controller.abort();
-  }, [loadAlerts]);
+  }, [loadAlerts, refreshNonce]);
 
   const handleFilterSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
     setOffset(0);
-    loadAlerts();
+    setRefreshNonce((n) => n + 1);
   };
 
   const handleClearFilters = () => {
@@ -98,6 +99,7 @@ export const LegacyAlertFactsView: React.FC<LegacyAlertFactsViewProps> = ({ onNa
     setLoading(true);
     setError(null);
     setOffset(0);
+    setRefreshNonce((n) => n + 1);
   };
 
   const handlePageChange = (newOffset: number) => {

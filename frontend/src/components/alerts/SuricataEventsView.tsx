@@ -145,6 +145,13 @@ export const SuricataEventsView: React.FC = () => {
     };
   }, [appliedQuery]);
 
+  const clearCopyTimer = () => {
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = null;
+    }
+  };
+
   const handleFilterSubmit = (e: React.FormEvent) => {
     e.preventDefault();
 
@@ -183,6 +190,7 @@ export const SuricataEventsView: React.FC = () => {
 
     setValidationError(null);
     setSelectedEvent(null);
+    clearCopyTimer();
     setCopiedEventId(null);
     setError(null);
     setLoading(true);
@@ -207,6 +215,7 @@ export const SuricataEventsView: React.FC = () => {
     setEndTimeInput('');
     setValidationError(null);
     setSelectedEvent(null);
+    clearCopyTimer();
     setCopiedEventId(null);
     setError(null);
     setLoading(true);
@@ -218,6 +227,7 @@ export const SuricataEventsView: React.FC = () => {
 
   const handlePageChange = (newOffset: number) => {
     setSelectedEvent(null);
+    clearCopyTimer();
     setCopiedEventId(null);
     setError(null);
     setLoading(true);
@@ -275,7 +285,12 @@ export const SuricataEventsView: React.FC = () => {
     typeof total === 'number' &&
     typeof responseOffset === 'number' &&
     Number.isSafeInteger(total) &&
-    Number.isSafeInteger(responseOffset);
+    Number.isSafeInteger(responseOffset) &&
+    total >= 0 &&
+    responseOffset >= 0 &&
+    Number.isSafeInteger(responseOffset + PAGE_LIMIT);
+  const losslessRangeStart = items.length > 0 ? offsetBigInt + 1n : 0n;
+  const losslessRangeEnd = items.length > 0 ? offsetBigInt + BigInt(items.length) : 0n;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
@@ -284,7 +299,9 @@ export const SuricataEventsView: React.FC = () => {
         <ShieldAlert size={16} aria-hidden="true" style={{ flexShrink: 0, marginTop: '0.1rem' }} />
         <div>
           <strong>V2 Suricata AlertEvents (Read-Only Triage):</strong> Lists discrete persisted
-          Suricata alert occurrences regardless of whether a persisted correlation edge exists.{' '}
+          Suricata alert occurrences regardless of whether a persisted correlation edge exists. A
+          persisted link indicates stored edge presence only (including{' '}
+          <code>unverified_incomplete</code> edges), not a currently verified match.{' '}
           <strong>
             The absence of a persisted relationship does not establish a correlation decision or a
             security verdict.
@@ -307,7 +324,7 @@ export const SuricataEventsView: React.FC = () => {
               gap: '0.85rem',
             }}
           >
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', minWidth: 0 }}>
               <label
                 htmlFor="v2-alerts-filter-domain"
                 style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-secondary)' }}
@@ -326,10 +343,11 @@ export const SuricataEventsView: React.FC = () => {
                     ? 'v2-alerts-validation-error'
                     : undefined
                 }
+                style={{ width: '100%' }}
               />
             </div>
 
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', minWidth: 0 }}>
               <label
                 htmlFor="v2-alerts-filter-severity"
                 style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-secondary)' }}
@@ -348,10 +366,11 @@ export const SuricataEventsView: React.FC = () => {
                 aria-describedby={
                   validationError?.field === 'severity' ? 'v2-alerts-validation-error' : undefined
                 }
+                style={{ width: '100%' }}
               />
             </div>
 
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', minWidth: 0 }}>
               <label
                 htmlFor="v2-alerts-filter-sid"
                 style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-secondary)' }}
@@ -370,10 +389,11 @@ export const SuricataEventsView: React.FC = () => {
                 aria-describedby={
                   validationError?.field === 'sid' ? 'v2-alerts-validation-error' : undefined
                 }
+                style={{ width: '100%' }}
               />
             </div>
 
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', minWidth: 0 }}>
               <label
                 htmlFor="v2-alerts-filter-sensor"
                 style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-secondary)' }}
@@ -391,10 +411,11 @@ export const SuricataEventsView: React.FC = () => {
                 aria-describedby={
                   validationError?.field === 'sensorId' ? 'v2-alerts-validation-error' : undefined
                 }
+                style={{ width: '100%' }}
               />
             </div>
 
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', minWidth: 0 }}>
               <label
                 htmlFor="v2-alerts-filter-start"
                 style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-secondary)' }}
@@ -411,13 +432,14 @@ export const SuricataEventsView: React.FC = () => {
                 aria-invalid={validationError?.field === 'startTime'}
                 aria-describedby={
                   validationError?.field === 'startTime'
-                    ? 'v2-alerts-validation-error'
+                    ? 'v2-alerts-validation-error v2-alerts-time-help'
                     : 'v2-alerts-time-help'
                 }
+                style={{ width: '100%' }}
               />
             </div>
 
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', minWidth: 0 }}>
               <label
                 htmlFor="v2-alerts-filter-end"
                 style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-secondary)' }}
@@ -434,9 +456,10 @@ export const SuricataEventsView: React.FC = () => {
                 aria-invalid={validationError?.field === 'endTime'}
                 aria-describedby={
                   validationError?.field === 'endTime'
-                    ? 'v2-alerts-validation-error'
+                    ? 'v2-alerts-validation-error v2-alerts-time-help'
                     : 'v2-alerts-time-help'
                 }
+                style={{ width: '100%' }}
               />
             </div>
           </div>
@@ -817,10 +840,44 @@ export const SuricataEventsView: React.FC = () => {
       {!loading && !error && totalBigInt > 0n && !canUseNumericPagination && (
         <div
           className="card"
-          style={{ padding: '0.65rem 0.9rem', fontSize: '0.8rem', color: 'var(--text-secondary)' }}
+          style={{
+            padding: '0.65rem 0.9rem',
+            fontSize: '0.8rem',
+            color: 'var(--text-secondary)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: '0.75rem',
+          }}
         >
-          Offset <span className="font-mono">{formatSafeCount(responseOffset)}</span> of{' '}
-          <span className="font-mono">{formatSafeCount(total)}</span> total Suricata alert events
+          <div>
+            {items.length > 0 ? (
+              <>
+                Showing <span className="font-mono">{losslessRangeStart.toString()}</span> to{' '}
+                <span className="font-mono">{losslessRangeEnd.toString()}</span> of{' '}
+                <span className="font-mono">{formatSafeCount(total)}</span> Suricata alert events
+                (offset <span className="font-mono">{formatSafeCount(responseOffset)}</span>;
+                numeric page controls disabled above safe integer range)
+              </>
+            ) : (
+              <>
+                Offset <span className="font-mono">{formatSafeCount(responseOffset)}</span> of{' '}
+                <span className="font-mono">{formatSafeCount(total)}</span> total Suricata alert
+                events (numeric page controls disabled above safe integer range)
+              </>
+            )}
+          </div>
+          {offsetBigInt > 0n && (
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => handlePageChange(0)}
+              style={{ padding: '0.25rem 0.65rem', fontSize: '0.75rem' }}
+            >
+              Return to Page 1
+            </button>
+          )}
         </div>
       )}
 

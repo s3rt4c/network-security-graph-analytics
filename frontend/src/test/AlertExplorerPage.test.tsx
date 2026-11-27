@@ -427,4 +427,270 @@ describe('AlertExplorerPage Component', () => {
       expect(screen.queryByText('STALE Domain A Result')).not.toBeInTheDocument();
     });
   });
+
+  it('recovers cleanly when Legacy Clear is clicked with empty filters and handles extreme safe-integer pagination without rounding', async () => {
+    const mockLegacyFact = {
+      fact_key: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+      source_ip: '192.168.1.100',
+      target_ip: '192.168.1.1',
+      sid: 2001219,
+      gid: 1,
+      rev: 1,
+      message: 'Legacy Stable Fact',
+      priority: 1,
+      protocol: 'TCP',
+      src_port: 54321,
+      dst_port: 22,
+    };
+
+    let triageMode: 'boundary-unsafe-add' | 'int64-oor' | 'normal' = 'boundary-unsafe-add';
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.startsWith('/api/v1/alerts')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ items: [mockLegacyFact], total: 1, limit: 50, offset: 0 }),
+        });
+      }
+      if (url.startsWith('/api/v1/alert-events')) {
+        const parsed = new URL(url, 'http://localhost');
+        if (triageMode === 'boundary-unsafe-add') {
+          // Both total and offset are safe JSON numbers, but offset + 50 > Number.MAX_SAFE_INTEGER
+          return Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                items: [
+                  makeTriageItem({ event_id: LINKED_EVENT_ID, signature: 'Boundary Page Item 1' }),
+                  makeTriageItem({ event_id: UNLINKED_EVENT_ID, signature: 'Boundary Page Item 2' }),
+                ],
+                total: 9007199254740991,
+                limit: 50,
+                offset: 9007199254740981,
+              }),
+          });
+        }
+        if (triageMode === 'int64-oor' && parsed.searchParams.get('offset') === '0') {
+          return Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                items: [makeTriageItem({ signature: 'Recovered Page 1 Event' })],
+                total: '9223372036854775807',
+                limit: 50,
+                offset: 0,
+              }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              items: [],
+              total: '9223372036854775807',
+              limit: 50,
+              offset: '9223372036854775807',
+            }),
+        });
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(<AlertExplorerPage />);
+    expect(await screen.findByText('Legacy Stable Fact')).toBeInTheDocument();
+
+    // Clicking Clear when legacy filters are already empty must NOT leave table stuck loading
+    fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
+    expect(await screen.findByText('Legacy Stable Fact')).toBeInTheDocument();
+
+    // Switch to Suricata Events -> boundary where offset + 50 > MAX_SAFE_INTEGER uses BigInt fallback
+    fireEvent.click(screen.getByRole('tab', { name: 'Suricata Events' }));
+    expect(await screen.findByText('Boundary Page Item 1')).toBeInTheDocument();
+    expect(screen.getByText('Boundary Page Item 2')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Next' })).not.toBeInTheDocument();
+    expect(screen.getByText('9007199254740982')).toBeInTheDocument();
+    expect(screen.getByText('9007199254740983')).toBeInTheDocument();
+    expect(screen.getAllByText('9007199254740991').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByRole('button', { name: 'Return to Page 1' })).toBeInTheDocument();
+
+    // Clicking Return to Page 1 requests offset=0 and displays exact int64 total losslessly
+    triageMode = 'int64-oor';
+    fireEvent.click(screen.getByRole('button', { name: 'Return to Page 1' }));
+    expect(await screen.findByText('Recovered Page 1 Event')).toBeInTheDocument();
+    expect(screen.getAllByText('9223372036854775807').length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByRole('button', { name: 'Return to Page 1' })).not.toBeInTheDocument();
+  });
+
+  it('suppresses late 503/422 errors, aborted ApiError(0), tab-switch aborts, and modal detail races', async () => {
+    let rejectStale503: (reason?: unknown) => void = () => {};
+    let rejectStale422: (reason?: unknown) => void = () => {};
+    let resolveSlowModalA: (val: unknown) => void = () => {};
+    let slowModalAAborted = false;
+    let tabSwitchAborted = false;
+    let modalFailOnce = true;
+
+    const eventA = makeTriageItem({
+      event_id: LINKED_EVENT_ID,
+      routing_domain_id: 'domain-a',
+      signature: 'Event A Row',
+    });
+    const eventBSameIdOtherDomain = makeTriageItem({
+      event_id: LINKED_EVENT_ID,
+      routing_domain_id: 'domain-b',
+      signature: 'Event A Domain B Row',
+    });
+
+    globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+      if (url.startsWith('/api/v1/alerts')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ items: [], total: 0, limit: 50, offset: 0 }),
+        });
+      }
+      const parsed = new URL(url, 'http://localhost');
+      const domain = parsed.searchParams.get('routing_domain_id');
+
+      if (parsed.pathname === `/api/v1/alert-events/${LINKED_EVENT_ID}`) {
+        if (domain === 'domain-a') {
+          init?.signal?.addEventListener('abort', () => {
+            slowModalAAborted = true;
+          });
+          return new Promise((resolve) => {
+            resolveSlowModalA = resolve;
+          });
+        }
+        if (domain === 'domain-b') {
+          if (modalFailOnce) {
+            modalFailOnce = false;
+            return Promise.resolve({
+              ok: false,
+              status: 503,
+              statusText: 'Service Unavailable',
+              json: () => Promise.resolve({ detail: 'Database service unavailable' }),
+            });
+          }
+          return Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve(
+                makeAlertDetail({
+                  event_id: LINKED_EVENT_ID,
+                  routing_domain_id: 'domain-b',
+                  src_scoped_id: 'domain-b#192.0.2.30',
+                  dst_scoped_id: 'domain-b#198.51.100.40',
+                  signature: 'Domain B Detail Loaded',
+                })
+              ),
+          });
+        }
+      }
+
+      if (domain === 'slow-503') {
+        return new Promise((_resolve, reject) => {
+          rejectStale503 = reject;
+          init?.signal?.addEventListener('abort', () => {
+            reject(new DOMException('Aborted', 'AbortError'));
+          });
+        });
+      }
+      if (domain === 'slow-422') {
+        return new Promise((_resolve, reject) => {
+          rejectStale422 = reject;
+        });
+      }
+      if (domain === 'pending-tab-switch') {
+        init?.signal?.addEventListener('abort', () => {
+          tabSwitchAborted = true;
+        });
+        return new Promise(() => {});
+      }
+      if (domain === 'domain-b') {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              items: [eventBSameIdOtherDomain],
+              total: 1,
+              limit: 50,
+              offset: 0,
+            }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            items: [eventA],
+            total: 1,
+            limit: 50,
+            offset: 0,
+          }),
+      });
+    }) as unknown as typeof fetch;
+
+    render(<AlertExplorerPage />);
+    fireEvent.click(screen.getByRole('tab', { name: 'Suricata Events' }));
+    expect(await screen.findByText('Event A Row')).toBeInTheDocument();
+
+    // Trigger slow-503 (rejects as aborted ApiError(0)), then slow-422, then supersede with domain-b (200)
+    fireEvent.change(screen.getByLabelText('RoutingDomain'), { target: { value: 'slow-503' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply Filters' }));
+
+    fireEvent.change(screen.getByLabelText('RoutingDomain'), { target: { value: 'slow-422' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply Filters' }));
+
+    fireEvent.change(screen.getByLabelText('RoutingDomain'), { target: { value: 'domain-b' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply Filters' }));
+
+    expect(await screen.findByText('Event A Domain B Row')).toBeInTheDocument();
+    expect(screen.queryByText('Network Connection Error')).not.toBeInTheDocument();
+
+    // Late rejection of stale queries must not overwrite active domain-b result
+    rejectStale503(new Error('late 503'));
+    rejectStale422(new Error('late 422'));
+    await waitFor(() => {
+      expect(screen.getByText('Event A Domain B Row')).toBeInTheDocument();
+      expect(screen.queryByText('Network Connection Error')).not.toBeInTheDocument();
+    });
+
+    // Open modal on domain-b -> initial 503 shows Retry -> Retry succeeds with Domain B detail
+    fireEvent.click(
+      screen.getByRole('button', { name: `Inspect Suricata AlertEvent ${LINKED_EVENT_ID}` })
+    );
+    const dialogB = await screen.findByRole('dialog');
+    expect(
+      await within(dialogB).findByText('Database Service Temporarily Unavailable (HTTP 503)')
+    ).toBeInTheDocument();
+    fireEvent.click(within(dialogB).getByRole('button', { name: 'Retry' }));
+    expect(await within(dialogB).findByText('Domain B Detail Loaded')).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+
+    // Reset to domain-a, open slow modal A, close while pending -> aborts A cleanly
+    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+    expect(await screen.findByText('Event A Row')).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole('button', { name: `Inspect Suricata AlertEvent ${LINKED_EVENT_ID}` })
+    );
+    await screen.findByRole('dialog');
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+    expect(slowModalAAborted).toBe(true);
+    resolveSlowModalA({ ok: true, json: () => Promise.resolve(makeAlertDetail()) });
+
+    // Switching back to Legacy Alert Facts while a Suricata fetch is pending aborts it
+    fireEvent.change(screen.getByLabelText('RoutingDomain'), {
+      target: { value: 'pending-tab-switch' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply Filters' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Legacy Alert Facts' }));
+    expect(tabSwitchAborted).toBe(true);
+    expect(
+      await screen.findByText('No alert facts found matching current filters.')
+    ).toBeInTheDocument();
+  });
 });

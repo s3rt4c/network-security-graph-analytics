@@ -58,6 +58,20 @@ def _sample_triage_row(**overrides):
     return base
 
 
+def _sample_cypher_triage_record(**overrides):
+    """Repository-internal Cypher record including self-consistency validation columns."""
+    base = _sample_triage_row()
+    base.update(
+        {
+            "src_scoped_id": "demo-v2-corp#192.0.2.10",
+            "dst_scoped_id": "demo-v2-corp#198.51.100.20",
+            "timestamp_epoch_ns": None,  # sub-nanosecond decimal -> null ns index
+        }
+    )
+    base.update(overrides)
+    return base
+
+
 def _client_with_mock_repo():
     app = create_app()
     mock_repo = MagicMock(spec=Neo4jReadRepository)
@@ -271,7 +285,7 @@ def test_j_p_r_s_t_x_y_repository_cypher_isolation_ordering_overflow_and_corrupt
     # 1. Verify Cypher clauses with active time bounds & exact filters
     count_res = MagicMock()
     count_res.single.return_value = {"total": 1}
-    page_rec = _sample_triage_row()
+    page_rec = _sample_cypher_triage_record()
     mock_tx.run.side_effect = [count_res, [page_rec]]
 
     items, total = repo.list_alert_events_for_triage(
@@ -286,6 +300,9 @@ def test_j_p_r_s_t_x_y_repository_cypher_isolation_ordering_overflow_and_corrupt
     )
     assert total == 1
     assert len(items) == 1
+    assert "timestamp_epoch_ns" not in items[0]
+    assert "src_scoped_id" not in items[0]
+    assert "dst_scoped_id" not in items[0]
     assert mock_session.execute_read.call_count == 1
     mock_session.execute_write.assert_not_called()
 
@@ -305,10 +322,13 @@ def test_j_p_r_s_t_x_y_repository_cypher_isolation_ordering_overflow_and_corrupt
     assert count_kwargs["routing_domain_id"] == "demo-v2-corp"
     assert count_kwargs["sensor_id"] == "suricata-demo-01"
 
-    return_clause = page_cypher.split("RETURN", 1)[1].split("ORDER BY", 1)[0]
     assert "elementId(" not in page_cypher
-    assert "timestamp_epoch_ns" not in return_clause
-    assert "EXISTS { MATCH (ae)-[:CORRELATED_WITH]->(:FlowObservation) } AS has_persisted_correlation" in return_clause
+    # EXISTS must evaluate AFTER WITH ae ORDER BY ... SKIP $offset LIMIT $limit
+    assert page_cypher.index("LIMIT $limit") < page_cypher.index("EXISTS {")
+    assert "MATCH (ae)-[r:CORRELATED_WITH]->(fo:FlowObservation)" in page_cypher
+    assert "fo.source_type = 'zeek'" in page_cypher
+    assert "fo.routing_domain_id = ae.routing_domain_id" in page_cypher
+    assert "(r.routing_domain_id IS NULL OR r.routing_domain_id = ae.routing_domain_id)" in page_cypher
     assert "ORDER BY CASE WHEN ae.timestamp_epoch_ns IS NULL THEN 1 ELSE 0 END ASC," in page_cypher
     assert "ae.timestamp_epoch_ns ASC," in page_cypher
     assert "ae.event_id ASC" in page_cypher
@@ -463,3 +483,92 @@ def test_w_x_js_safe_int_boundaries_and_safe_paginated_response_lossless():
         SafePaginatedResponse[AlertEventTriageItemResponse](
             items=[], total=0, limit=50, offset=True
         )
+
+
+def test_review_triage_repo_self_consistency_corrupt_properties_and_http_405():
+    """Review regression: corrupt node properties, mixed IP families, duplicate page IDs fail closed; mutation routes return 405."""
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_tx = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+    mock_session.execute_read.side_effect = lambda fn: fn(mock_tx)
+
+    repo = Neo4jReadRepository(mock_driver)
+
+    # Valid negative pre-1970 exact decimal & exact INT64 boundaries succeed cleanly
+    valid_boundary_records = [
+        _sample_cypher_triage_record(
+            timestamp_epoch_decimal="-0.876543211",
+            timestamp_epoch_ns=-876543211,
+        ),
+        _sample_cypher_triage_record(
+            timestamp_epoch_decimal="-9223372036.854775808",
+            timestamp_epoch_ns=_INT64_MIN,
+        ),
+        _sample_cypher_triage_record(
+            timestamp_epoch_decimal="9223372036.854775807",
+            timestamp_epoch_ns=_INT64_MAX,
+        ),
+        _sample_cypher_triage_record(
+            timestamp_epoch_decimal="1795428002.123456789000",
+            timestamp_epoch_ns=1795428002123456789,
+        ),
+        _sample_cypher_triage_record(
+            timestamp_epoch_decimal=None,
+            timestamp_epoch_ns=None,
+        ),
+    ]
+    for rec in valid_boundary_records:
+        count_res = MagicMock()
+        count_res.single.return_value = {"total": 1}
+        mock_tx.run.side_effect = [count_res, [rec]]
+        items, total = repo.list_alert_events_for_triage()
+        assert total == 1
+        assert len(items) == 1
+        assert "timestamp_epoch_ns" not in items[0]
+
+    # Contradictory node properties fail closed with ValueError (-> sanitized HTTP 500 via API)
+    corrupt_repo_records = [
+        {"src_scoped_id": "other-domain#192.0.2.10"},
+        {"src_scoped_id": "demo-v2-corp#192.0.2.99"},
+        {"src_scoped_id": None},
+        {"dst_scoped_id": "demo-v2-corp#198.51.100.99"},
+        {"src_ip": "192.0.2.10", "dst_ip": "2001:db8::1", "dst_scoped_id": "demo-v2-corp#2001:db8::1"},
+        {"timestamp_epoch_decimal": None, "timestamp_epoch_ns": 1795428000000000000},
+        {"timestamp_epoch_decimal": "1795428002.123456789123", "timestamp_epoch_ns": 1795428002123456789},
+        {"timestamp_epoch_decimal": "1795428002.000000000", "timestamp_epoch_ns": 1795429999000000000},
+        {"timestamp_epoch_decimal": "1795428002.000000000", "timestamp_epoch_ns": "1795428002000000000"},
+        {"timestamp_epoch_decimal": "1795428002.000000000", "timestamp_epoch_ns": True},
+        {"timestamp_epoch_decimal": "1795428002.000000000", "timestamp_epoch_ns": None},
+    ]
+    app = create_app()
+    app.dependency_overrides[get_read_repository] = lambda: repo
+    client = TestClient(app, raise_server_exceptions=False)
+
+    for override in corrupt_repo_records:
+        count_res = MagicMock()
+        count_res.single.return_value = {"total": 1}
+        mock_tx.run.side_effect = [count_res, [_sample_cypher_triage_record(**override)]]
+        res = client.get("/api/v1/alert-events")
+        assert res.status_code == 500, f"Expected 500 for corrupt repo record {override}, got {res.status_code}"
+        assert res.json() == {"detail": "Internal server error"}
+
+    # Duplicate event_id returned on the same page fails closed with sanitized HTTP 500
+    count_res_dup = MagicMock()
+    count_res_dup.single.return_value = {"total": 2}
+    mock_tx.run.side_effect = [
+        count_res_dup,
+        [_sample_cypher_triage_record(event_id=_EVENT_ID_1), _sample_cypher_triage_record(event_id=_EVENT_ID_1)],
+    ]
+    dup_res = client.get("/api/v1/alert-events")
+    assert dup_res.status_code == 500
+    assert dup_res.json() == {"detail": "Internal server error"}
+
+    # Pydantic AlertEventTriageItemResponse directly rejects mixed IPv4/IPv6 families
+    with pytest.raises(ValidationError):
+        AlertEventTriageItemResponse(**_sample_triage_row(src_ip="192.0.2.10", dst_ip="2001:db8::1"))
+
+    # Read-only HTTP 405 Method Not Allowed on mutation methods
+    assert client.post("/api/v1/alert-events", json={}).status_code == 405
+    assert client.put("/api/v1/alert-events", json={}).status_code == 405
+    assert client.delete("/api/v1/alert-events").status_code == 405

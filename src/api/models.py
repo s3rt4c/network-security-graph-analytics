@@ -589,8 +589,11 @@ class AlertEventTriageItemResponse(BaseModel):
     )
     has_persisted_correlation: bool = Field(
         description=(
-            "Whether at least one persisted CORRELATED_WITH relationship exists in the graph "
-            "(false means no persisted link is recorded; it does not imply REJECTED, AMBIGUOUS, INSUFFICIENT, or benign)"
+            "Whether at least one in-domain persisted CORRELATED_WITH relationship to a Zeek "
+            "FlowObservation exists in the graph (true includes verified and unverified_incomplete/"
+            "potentially stale links and is not proof of a currently verified match; false means "
+            "only that no persisted link is recorded and does not imply REJECTED, AMBIGUOUS, "
+            "INSUFFICIENT, or benign)"
         ),
     )
 
@@ -640,6 +643,16 @@ class AlertEventTriageItemResponse(BaseModel):
     @classmethod
     def _check_severity(cls, value: Optional[int]) -> Optional[int]:
         return _validate_strict_non_neg_int(value, "severity", allow_none=True)
+
+    @model_validator(mode="after")
+    def _check_matching_ip_families(self) -> "AlertEventTriageItemResponse":
+        src_ver = ipaddress.ip_address(self.src_ip).version
+        dst_ver = ipaddress.ip_address(self.dst_ip).version
+        if src_ver != dst_ver:
+            raise ValueError(
+                f"Mismatched src_ip/dst_ip address families: IPv{src_ver} vs IPv{dst_ver}"
+            )
+        return self
 
     @field_serializer("sid", when_used="json")
     def _serialize_safe_sid(self, value: int) -> Union[int, str]:

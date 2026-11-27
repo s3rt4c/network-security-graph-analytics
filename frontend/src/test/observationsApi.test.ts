@@ -266,4 +266,46 @@ describe('Observations Detail API Client (V2)', () => {
     expect(formatSafeCount(0)).toBe('0');
     expect(formatSafeCount(null)).toBe('Not recorded');
   });
+
+  it('validates leap years, month-end, midnight, negative epochs, 1..9 frac precision, and exact int64 UTC boundaries', () => {
+    // Leap years & non-leap centuries
+    expect(parseUtcTimestampToEpochNs('2024-02-29T00:00:00Z', 'Start Time').ns).toBe(
+      '1709164800000000000'
+    );
+    expect(parseUtcTimestampToEpochNs('2000-02-29T23:59:59.1Z', 'Start Time').ns).toBe(
+      '951868799100000000'
+    );
+    expect(parseUtcTimestampToEpochNs('2023-02-29T00:00:00Z', 'Start Time').error).toBeTruthy();
+    expect(parseUtcTimestampToEpochNs('1900-02-29T00:00:00Z', 'Start Time').error).toBeTruthy();
+
+    // Month-end & midnight & fractional digit bounds (1..9 valid, >9 rejected)
+    expect(parseUtcTimestampToEpochNs('2026-04-31T00:00:00Z', 'Start Time').error).toBeTruthy();
+    expect(parseUtcTimestampToEpochNs('2026-01-31T23:59:59.123456789Z', 'Start Time').ns).toBe(
+      '1769903999123456789'
+    );
+    expect(parseUtcTimestampToEpochNs('2026-11-23T00:00:00.5Z', 'Start Time').ns).toBe(
+      '1795392000500000000'
+    );
+    expect(parseUtcTimestampToEpochNs('2026-11-23T10:00:00.1234567890Z', 'Start Time').error).toBeTruthy();
+
+    // Negative Unix epochs & exact signed int64 boundaries
+    expect(parseUtcTimestampToEpochNs('1970-01-01T00:00:00Z', 'Start Time').ns).toBe('0');
+    expect(parseUtcTimestampToEpochNs('1969-12-31T23:59:59.123456789Z', 'Start Time').ns).toBe(
+      '-876543211'
+    );
+    expect(parseUtcTimestampToEpochNs('1969-12-31T23:59:59.999999999Z', 'Start Time').ns).toBe('-1');
+    expect(parseUtcTimestampToEpochNs('1677-09-21T00:12:43.145224192Z', 'Start Time').ns).toBe(
+      '-9223372036854775808'
+    );
+    expect(parseUtcTimestampToEpochNs('1677-09-21T00:12:43.145224191Z', 'Start Time').error).toBeTruthy();
+    expect(parseUtcTimestampToEpochNs('2262-04-11T23:47:16.854775807Z', 'End Time').ns).toBe(
+      '9223372036854775807'
+    );
+    expect(parseUtcTimestampToEpochNs('2262-04-11T23:47:16.854775808Z', 'End Time').error).toBeTruthy();
+
+    // Whitespace & non-UTC offsets fail closed
+    expect(parseUtcTimestampToEpochNs('   ', 'Start Time').error).toBeTruthy();
+    expect(parseUtcTimestampToEpochNs('2026-11-23T10:00:00-05:00', 'Start Time').error).toBeTruthy();
+    expect(parseUtcTimestampToEpochNs('2026-11-23T10:00:00+00:00', 'Start Time').error).toBeTruthy();
+  });
 });

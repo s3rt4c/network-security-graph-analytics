@@ -33,6 +33,7 @@ When the API server is running (`uvicorn src.api.app:app --port 8000`), interact
 | **Network** | `GET` | `/api/v1/network/communications` | Filterable and sortable Layer 3 communication aggregates | `source_ip`, `target_ip`, `protocol`, `src_port`, `dst_port`, `sort_by`, `limit`, `offset` |
 | **Alerts** | `GET` | `/api/v1/alerts` | Filterable legacy V1 normalized security alert facts (`AlertFact`) | `source_ip`, `target_ip`, `priority`, `sid`, `protocol`, `limit`, `offset` |
 | **Alerts** | `GET` | `/api/v1/alerts/{fact_key}` | Retrieve single legacy V1 alert fact (`AlertFact`) by SHA-256 key | `fact_key` (path) |
+| **Observations (V2)** | `GET` | `/api/v1/alert-events` | Read-only paginated triage listing of persisted V2 Suricata `AlertEvent` occurrences (linked & unlinked) | `routing_domain_id`, `severity`, `sid`, `sensor_id`, `start_epoch_ns`, `end_epoch_ns`, `limit`, `offset` |
 | **Observations (V2)** | `GET` | `/api/v1/alert-events/{event_id}` | Read-only forensic detail lookup for a V2 Suricata `AlertEvent` and linked `AlertDefinition` | `event_id` (path), `routing_domain_id` (optional query) |
 | **Observations (V2)** | `GET` | `/api/v1/flow-observations/{observation_id}` | Read-only forensic detail lookup for a V2 Zeek `FlowObservation` | `observation_id` (path), `routing_domain_id` (optional query) |
 | **Correlations** | `GET` | `/api/v1/correlations/traffic-alerts` | Legacy V1 communicating IP pairs with matching `AlertFact` records (with flow keys and transport ports) | `limit`, `offset` |
@@ -304,14 +305,44 @@ Zeek `FlowObservation` detail (`GET /api/v1/flow-observations/b0e9ea368ed1cbbab5
 - `start_epoch_ns`, `end_epoch_ns` *(optional signed int64 `[-9223372036854775808, 9223372036854775807]`)*: Inclusive bounds on `ae.timestamp_epoch_ns`. When neither is supplied, `AlertEvent` records with `timestamp_epoch_ns IS NULL` (e.g., timezone-naive timestamps) **are included**. When either time bound is active, events with `timestamp_epoch_ns IS NULL` **are excluded**. Reversed bounds (`start_epoch_ns > end_epoch_ns`) or out-of-range values return **HTTP 422**.
 - `limit` *(int `1..200`, default `50`)* and `offset` *(int `0..9223372036854775807`, default `0`)*: Bounded server-side pagination with int64 overflow short-circuiting.
 
-#### Ordering, Precision & Persisted-Link Semantics
+#### Ordering, Precision, Integrity & Persisted-Link Semantics
 - **Deterministic Ordering:** `timestamp_epoch_ns` ascending with `NULL` values ordered last (`NULLS LAST`), breaking ties deterministically by `event_id` ascending.
 - **Response Envelope (`SafePaginatedResponse[AlertEventTriageItemResponse]`):** `items`, `total`, `limit`, `offset`. Counts (`total`, `offset`, `sid`, `severity`) preserve exact JSON numbers up to `9007199254740991` (`2^53 - 1`) and lossless decimal strings above that threshold. `timestamp_epoch_decimal` preserves exact fixed-point strings verbatim (`null` when timezone-naive).
-- **`has_persisted_correlation` *(boolean)*:** Computed cleanly per row via `EXISTS { MATCH (ae)-[:CORRELATED_WITH]->(:FlowObservation) }` without multiplying result rows.
-  - `true` means at least one persisted `CORRELATED_WITH` relationship exists in Neo4j.
-  - `false` means **only** that no persisted relationship is recorded — it does **not** prove `REJECTED`, `AMBIGUOUS`, `INSUFFICIENT`, benign traffic, or lack of evaluation, and does not replace last stored `verification_status`.
-- **HTTP Status Semantics:** `200` (including empty filtered sets `items: [], total: 0` — never `404` for empty lists), `422` (invalid query filters/bounds/pagination), `503` (unavailable Neo4j driver/database), `500` (sanitized internal error or corrupt persisted node properties rejected by strict Pydantic `ConfigDict(strict=True, extra="forbid")` validation).
-- **Concurrency & Auth Limitations:** Count and page queries execute inside one `execute_read` transaction under Neo4j Read Committed isolation, which does not guarantee multi-query snapshot consistency under concurrent ingestion writes. Multi-user authentication/RBAC remain out of scope.
+- **Compact Projection Integrity:** Each returned page row verifies zero-traversal `AlertEvent` property self-consistency (valid `routing_domain_id`, matching IPv4/IPv6 address family, consistent `src_scoped_id`/`dst_scoped_id`, `timestamp_epoch_ns` agreement with `timestamp_epoch_decimal`, and unique `event_id` on page) and fails closed with sanitized **HTTP 500** on contradictory persisted node properties. Full graph-link integrity checks on `:HAS_SOURCE`, `:HAS_DESTINATION`, and `:TRIGGERED_RULE` remain enforced on `GET /api/v1/alert-events/{event_id}` to avoid per-row link traversals on paginated triage listings.
+- **`has_persisted_correlation` *(boolean)*:** Computed per page row (after `SKIP`/`LIMIT`) via domain-scoped `EXISTS { MATCH (ae)-[r:CORRELATED_WITH]->(fo:FlowObservation) WHERE fo.source_type = 'zeek' AND fo.routing_domain_id = ae.routing_domain_id AND (r.routing_domain_id IS NULL OR r.routing_domain_id = ae.routing_domain_id) }` without multiplying result rows or leaking cross-domain edges.
+  - `true` means at least one in-domain persisted `CORRELATED_WITH` relationship to a Zeek `FlowObservation` exists in Neo4j (including `verified`, `unverified_incomplete`, or potentially stale edges — it is **not** proof of a currently verified match; inspect `GET /api/v1/correlations/alert-flows/{event_id}` for `verification_status`).
+  - `false` means **only** that no matching in-domain persisted relationship is recorded — it does **not** prove `REJECTED`, `AMBIGUOUS`, `INSUFFICIENT`, benign traffic, or lack of evaluation.
+- **HTTP Status Semantics:** `200` (including empty filtered sets `items: [], total: 0` — never `404` for empty lists), `405` (unsupported mutation methods), `422` (invalid query filters/bounds/pagination), `503` (unavailable Neo4j driver/database), `500` (sanitized internal error or corrupt/contradictory persisted node properties rejected by repository checks or strict Pydantic `ConfigDict(strict=True, extra="forbid")` validation).
+- **Concurrency & Auth Limitations:** Count and page queries execute inside one `execute_read` transaction under Neo4j Read Committed isolation, which does not guarantee multi-query snapshot consistency under concurrent ingestion writes. Multi-user authentication/RBAC remain out of scope; this API is intended for trusted local/engineering evaluation deployments and is not production-hardened.
+
+#### Example Triage Listing Response (`GET /api/v1/alert-events?routing_domain_id=demo-v2-corp&severity=2&sid=9100002`)
+```json
+{
+  "items": [
+    {
+      "event_id": "449acc546fc3ac23895d9886b046cde921411f02fdef3db57fc27d404b06eec4",
+      "routing_domain_id": "demo-v2-corp",
+      "source_type": "suricata",
+      "sensor_id": "suricata-demo-01",
+      "sid": 9100002,
+      "signature": "SYNTHETIC Demo Ambiguous Dual Flow Probe",
+      "severity": 2,
+      "category": "Potentially Bad Traffic",
+      "src_ip": "192.0.2.30",
+      "dst_ip": "198.51.100.40",
+      "src_port": 55000,
+      "dst_port": 8080,
+      "protocol": "TCP",
+      "timestamp_source": "2026-11-23T10:01:05.000000+0000",
+      "timestamp_epoch_decimal": "1795428065",
+      "has_persisted_correlation": false
+    }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
 
 ---
 

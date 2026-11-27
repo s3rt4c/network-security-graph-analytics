@@ -10,6 +10,8 @@ Supports V2 scoped IP identities and explicit ambiguity detection across Routing
 
 import ipaddress
 import logging
+import re
+from decimal import Decimal, InvalidOperation
 from typing import List, Dict, Any, Optional, Tuple, Union
 
 from src.ingestion.v2_models import scoped_ip_id
@@ -18,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
+_FIXED_DECIMAL_RE = re.compile(r"^-?[0-9]+(?:\.[0-9]+)?$")
 
 
 class AmbiguousEndpointError(ValueError):
@@ -2200,6 +2203,127 @@ class Neo4jReadRepository:
             return session.execute_read(_work)
 
     @staticmethod
+    def _expected_int64_epoch_ns(raw_decimal: Any) -> Optional[int]:
+        """Compute exact signed 64-bit nanosecond index for a persisted fixed-point Decimal string.
+
+        Returns None when `raw_decimal` is None, has nonzero fractional digits past the
+        9th decimal place (sub-nanosecond precision), or falls outside signed int64 bounds.
+        Raises ValueError if `raw_decimal` is not a valid finite fixed-point decimal string.
+        """
+        if raw_decimal is None:
+            return None
+        if not isinstance(raw_decimal, str) or not _FIXED_DECIMAL_RE.fullmatch(raw_decimal):
+            raise ValueError(f"Invalid persisted timestamp_epoch_decimal: {raw_decimal!r}")
+        try:
+            dec = Decimal(raw_decimal)
+        except InvalidOperation as exc:
+            raise ValueError(f"Invalid persisted timestamp_epoch_decimal: {raw_decimal!r}") from exc
+        if not dec.is_finite():
+            raise ValueError(f"Non-finite persisted timestamp_epoch_decimal: {raw_decimal!r}")
+
+        sign, digits, exp = dec.as_tuple()
+        if not isinstance(exp, int):
+            raise ValueError(f"Non-finite persisted timestamp_epoch_decimal: {raw_decimal!r}")
+        if not digits or all(d == 0 for d in digits):
+            return 0
+
+        digit_str = "".join(str(d) for d in digits).lstrip("0")
+        stripped = digit_str.rstrip("0")
+        trailing_zeros = len(digit_str) - len(stripped)
+
+        eff_ns_exp = exp + trailing_zeros + 9
+        if eff_ns_exp < 0 or eff_ns_exp >= 19:
+            return None
+
+        ns_mag = int(stripped) * (10 ** eff_ns_exp)
+        ns_int = -ns_mag if sign else ns_mag
+        if ns_int < _INT64_MIN or ns_int > _INT64_MAX:
+            return None
+        return ns_int
+
+    @classmethod
+    def _validate_triage_record_integrity(cls, record: Any) -> None:
+        """Verify zero-traversal self-consistency of persisted AlertEvent properties.
+
+        Fails closed (ValueError -> sanitized HTTP 500 at API boundary) when persisted
+        node properties contradict each other (mismatched IP families, missing or
+        contradictory scoped endpoint IDs, or corrupt/mismatched timestamp_epoch_ns).
+        """
+        event_id = record["event_id"]
+        raw_domain = record["routing_domain_id"]
+        if (
+            not isinstance(raw_domain, str)
+            or not raw_domain.strip()
+            or raw_domain != raw_domain.strip()
+            or "#" in raw_domain
+        ):
+            raise ValueError(f"Corrupt AlertEvent routing_domain_id {raw_domain!r} for '{event_id}'")
+        norm_domain = raw_domain.lower()
+
+        raw_src_ip = record["src_ip"]
+        raw_dst_ip = record["dst_ip"]
+        if (
+            not isinstance(raw_src_ip, str)
+            or not raw_src_ip.strip()
+            or raw_src_ip != raw_src_ip.strip()
+            or not isinstance(raw_dst_ip, str)
+            or not raw_dst_ip.strip()
+            or raw_dst_ip != raw_dst_ip.strip()
+        ):
+            raise ValueError(f"Corrupt AlertEvent IP properties for '{event_id}'")
+
+        try:
+            src_ip_obj = ipaddress.ip_address(raw_src_ip)
+            dst_ip_obj = ipaddress.ip_address(raw_dst_ip)
+        except ValueError as exc:
+            raise ValueError(f"Invalid persisted AlertEvent IP address for '{event_id}'") from exc
+
+        if src_ip_obj.version != dst_ip_obj.version:
+            raise ValueError(
+                f"Mismatched AlertEvent IP address families (IPv{src_ip_obj.version} vs "
+                f"IPv{dst_ip_obj.version}) for '{event_id}'"
+            )
+
+        raw_src_scoped = record["src_scoped_id"]
+        raw_dst_scoped = record["dst_scoped_id"]
+        expected_src_scoped = scoped_ip_id(norm_domain, str(src_ip_obj))
+        expected_dst_scoped = scoped_ip_id(norm_domain, str(dst_ip_obj))
+        if not isinstance(raw_src_scoped, str) or raw_src_scoped != expected_src_scoped:
+            raise ValueError(
+                f"Contradictory AlertEvent src_scoped_id {raw_src_scoped!r} vs "
+                f"{expected_src_scoped!r} for '{event_id}'"
+            )
+        if not isinstance(raw_dst_scoped, str) or raw_dst_scoped != expected_dst_scoped:
+            raise ValueError(
+                f"Contradictory AlertEvent dst_scoped_id {raw_dst_scoped!r} vs "
+                f"{expected_dst_scoped!r} for '{event_id}'"
+            )
+
+        raw_ts_ns = record["timestamp_epoch_ns"]
+        if raw_ts_ns is not None:
+            if (
+                isinstance(raw_ts_ns, bool)
+                or not isinstance(raw_ts_ns, int)
+                or not (_INT64_MIN <= raw_ts_ns <= _INT64_MAX)
+            ):
+                raise ValueError(
+                    f"Corrupt AlertEvent timestamp_epoch_ns {raw_ts_ns!r} for '{event_id}'"
+                )
+
+        expected_ts_ns = cls._expected_int64_epoch_ns(record["timestamp_epoch_decimal"])
+        if raw_ts_ns != expected_ts_ns:
+            raise ValueError(
+                f"Contradictory AlertEvent timestamp_epoch_ns {raw_ts_ns!r} vs "
+                f"timestamp_epoch_decimal {record['timestamp_epoch_decimal']!r} for '{event_id}'"
+            )
+
+        if not isinstance(record["has_persisted_correlation"], bool):
+            raise ValueError(
+                f"Invalid has_persisted_correlation {record['has_persisted_correlation']!r} "
+                f"for '{event_id}'"
+            )
+
+    @staticmethod
     def _record_to_triage_alert_event(record) -> Dict[str, Any]:
         """Materialize a compact V2 Suricata AlertEvent triage record (never exposing ns index)."""
         return {
@@ -2239,8 +2363,9 @@ class Neo4jReadRepository:
         Enforces `source_type` (default 'suricata'), strict filter validation (explicit
         blank strings fail closed), bounded `limit` (1..200) and signed int64 `offset`,
         deterministic `timestamp_epoch_ns` ASC (NULLS LAST), `event_id` ASC ordering,
-        and non-multiplying `EXISTS { MATCH (ae)-[:CORRELATED_WITH]->(:FlowObservation) }`
-        presence detection.
+        self-consistency validation on persisted node properties (zero extra graph
+        traversals), and domain-scoped non-multiplying `EXISTS` presence detection for
+        persisted `(:AlertEvent)-[r:CORRELATED_WITH]->(fo:FlowObservation)` edges.
 
         Note on isolation: count and page queries run inside one `execute_read`
         transaction. Under Neo4j Read Committed isolation, `total` and `items` agree on
@@ -2322,6 +2447,12 @@ class Neo4jReadRepository:
         page_cypher = f"""
         MATCH (ae:AlertEvent)
         {where_clause}
+        WITH ae
+        ORDER BY CASE WHEN ae.timestamp_epoch_ns IS NULL THEN 1 ELSE 0 END ASC,
+                 ae.timestamp_epoch_ns ASC,
+                 ae.event_id ASC
+        SKIP $offset
+        LIMIT $limit
         RETURN ae.event_id AS event_id,
                ae.routing_domain_id AS routing_domain_id,
                ae.source_type AS source_type,
@@ -2332,17 +2463,20 @@ class Neo4jReadRepository:
                ae.category AS category,
                ae.src_ip AS src_ip,
                ae.dst_ip AS dst_ip,
+               ae.src_scoped_id AS src_scoped_id,
+               ae.dst_scoped_id AS dst_scoped_id,
                ae.src_port AS src_port,
                ae.dst_port AS dst_port,
                ae.protocol AS protocol,
                ae.timestamp_source AS timestamp_source,
                ae.timestamp_epoch_decimal AS timestamp_epoch_decimal,
-               EXISTS {{ MATCH (ae)-[:CORRELATED_WITH]->(:FlowObservation) }} AS has_persisted_correlation
-        ORDER BY CASE WHEN ae.timestamp_epoch_ns IS NULL THEN 1 ELSE 0 END ASC,
-                 ae.timestamp_epoch_ns ASC,
-                 ae.event_id ASC
-        SKIP $offset
-        LIMIT $limit
+               ae.timestamp_epoch_ns AS timestamp_epoch_ns,
+               EXISTS {{
+                   MATCH (ae)-[r:CORRELATED_WITH]->(fo:FlowObservation)
+                   WHERE fo.source_type = 'zeek'
+                     AND fo.routing_domain_id = ae.routing_domain_id
+                     AND (r.routing_domain_id IS NULL OR r.routing_domain_id = ae.routing_domain_id)
+               }} AS has_persisted_correlation
         """
 
         def _work(tx) -> Tuple[List[Dict[str, Any]], int]:
@@ -2356,7 +2490,15 @@ class Neo4jReadRepository:
                 offset=offset,
                 limit=limit,
             )
-            items = [self._record_to_triage_alert_event(r) for r in page_res]
+            items: List[Dict[str, Any]] = []
+            seen_event_ids = set()
+            for r in page_res:
+                self._validate_triage_record_integrity(r)
+                ev_id = r["event_id"]
+                if ev_id in seen_event_ids:
+                    raise ValueError(f"Duplicate AlertEvent identity '{ev_id}' returned on triage page")
+                seen_event_ids.add(ev_id)
+                items.append(self._record_to_triage_alert_event(r))
             return items, total
 
         with self.driver.session() as session:

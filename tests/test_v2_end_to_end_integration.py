@@ -21,6 +21,7 @@ Safety Guarantees (Fail-Closed):
 from __future__ import annotations
 
 from decimal import Decimal
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1620,5 +1621,205 @@ def test_e2e_06_v2_alert_event_triage_list_filters_pagination_and_unlinked_detai
             _snapshot_demo_graph(live_driver, [corp_domain, branch_domain], [ruleset_ns])
             == snapshot_before_reads
         )
+    finally:
+        _cleanup_owned_entities(live_driver, **owned)
+
+
+def test_e2e_07_v2_alert_triage_source_type_cross_domain_edge_and_corrupt_node_isolation(
+    live_driver,
+    neo4j_test_config: Dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Live Neo4j regression: source_type filtering, cross-domain/non-Zeek CORRELATED_WITH exclusion, unverified_incomplete presence, and corrupt node fail-closed 500."""
+    scope = _make_run_scope()
+    corp_domain = scope["corp_domain"]
+    branch_domain = scope["branch_domain"]
+    ruleset_ns = scope["ruleset_ns"]
+
+    _assert_domains_and_rulesets_clean(live_driver, [corp_domain, branch_domain], [ruleset_ns])
+    _configure_env_for_cli_and_app(monkeypatch, neo4j_test_config)
+
+    corp_flows, _ = parse_zeek_conn_file(
+        _DEMO_DIR / "corp_conn.log.jsonl",
+        sensor_id=_ZEEK_SENSOR,
+        routing_domain_id=corp_domain,
+        source_provenance="phase4f2-rev-corp-zeek",
+    )
+    rival_flows, _ = parse_zeek_conn_file(
+        _DEMO_DIR / "corp_stale_rival_conn.log.jsonl",
+        sensor_id=_ZEEK_SENSOR,
+        routing_domain_id=corp_domain,
+        source_provenance="phase4f2-rev-corp-rival",
+    )
+    branch_flows, _ = parse_zeek_conn_file(
+        _DEMO_DIR / "branch_conn.log.jsonl",
+        sensor_id="zeek-branch-01",
+        routing_domain_id=branch_domain,
+        source_provenance="phase4f2-rev-branch-zeek",
+    )
+    corp_alerts, _ = parse_suricata_eve_alert_file(
+        _DEMO_DIR / "corp_eve.jsonl",
+        sensor_id=_SURICATA_SENSOR,
+        ruleset_namespace=ruleset_ns,
+        log_source_id="corp-eve-rev-01",
+        routing_domain_id=corp_domain,
+        source_provenance="phase4f2-rev-corp-eve",
+    )
+    branch_alerts, _ = parse_suricata_eve_alert_file(
+        _DEMO_DIR / "branch_eve.jsonl",
+        sensor_id="suricata-branch-01",
+        ruleset_namespace=ruleset_ns,
+        log_source_id="branch-eve-rev-01",
+        routing_domain_id=branch_domain,
+        source_provenance="phase4f2-rev-branch-eve",
+    )
+
+    owned = _collect_owned_ids(
+        flows=corp_flows + rival_flows + branch_flows,
+        alerts=corp_alerts + branch_alerts,
+        domains=[corp_domain, branch_domain],
+    )
+    synthetic_snort_event_id = hashlib.sha256(f"snort:{scope['tag']}".encode("utf-8")).hexdigest()
+    synthetic_non_zeek_obs_id = hashlib.sha256(f"tshark:{scope['tag']}".encode("utf-8")).hexdigest()
+    owned["event_ids"] = sorted(set(owned["event_ids"] + [synthetic_snort_event_id]))
+    owned["obs_ids"] = sorted(set(owned["obs_ids"] + [synthetic_non_zeek_obs_id]))
+
+    alert_b = next(a for a in corp_alerts if a.sid == 9100002)  # unlinked AMBIGUOUS
+    alert_d = next(a for a in corp_alerts if a.sid == 9100004)  # unlinked REJECTED
+    alert_ef = next(a for a in corp_alerts if a.sid == 9100005)  # will become unverified_incomplete
+    branch_flow = branch_flows[0]
+
+    try:
+        ingest_zeek_conn_file(
+            _DEMO_DIR / "corp_conn.log.jsonl",
+            sensor_id=_ZEEK_SENSOR,
+            routing_domain_id=corp_domain,
+            source_provenance="phase4f2-rev-corp-zeek",
+            driver=live_driver,
+        )
+        ingest_zeek_conn_file(
+            _DEMO_DIR / "branch_conn.log.jsonl",
+            sensor_id="zeek-branch-01",
+            routing_domain_id=branch_domain,
+            source_provenance="phase4f2-rev-branch-zeek",
+            driver=live_driver,
+        )
+        ingest_suricata_eve_file(
+            _DEMO_DIR / "corp_eve.jsonl",
+            sensor_id=_SURICATA_SENSOR,
+            ruleset_namespace=ruleset_ns,
+            log_source_id="corp-eve-rev-01",
+            routing_domain_id=corp_domain,
+            source_provenance="phase4f2-rev-corp-eve",
+            driver=live_driver,
+        )
+        ingest_suricata_eve_file(
+            _DEMO_DIR / "branch_eve.jsonl",
+            sensor_id="suricata-branch-01",
+            ruleset_namespace=ruleset_ns,
+            log_source_id="branch-eve-rev-01",
+            routing_domain_id=branch_domain,
+            source_provenance="phase4f2-rev-branch-eve",
+            driver=live_driver,
+        )
+
+        # Create genuine verified links, then produce one genuine unverified_incomplete edge on alert_ef
+        run_alert_flow_correlation(routing_domain_id=corp_domain, driver=live_driver)
+        ingest_zeek_conn_file(
+            _DEMO_DIR / "corp_stale_rival_conn.log.jsonl",
+            sensor_id=_ZEEK_SENSOR,
+            routing_domain_id=corp_domain,
+            source_provenance="phase4f2-rev-corp-rival",
+            driver=live_driver,
+        )
+        inc_res = run_alert_flow_correlation(
+            policy=CorrelationPolicy(candidate_cap=1),
+            event_ids=[alert_ef.event_id],
+            driver=live_driver,
+        )
+        assert inc_res.incomplete_evaluations == 1
+
+        # Inject: (1) non-Suricata AlertEvent in corp_domain, (2) cross-domain CORRELATED_WITH on alert_b,
+        # (3) non-Zeek FlowObservation CORRELATED_WITH on alert_d
+        with live_driver.session() as session:
+            session.run(
+                """
+                CREATE (sn:AlertEvent {
+                    event_id: $snort_eid,
+                    routing_domain_id: $corp_dom,
+                    source_type: 'snort',
+                    sensor_id: 'snort-01',
+                    sid: 9999001,
+                    severity: 1,
+                    src_ip: '192.0.2.10',
+                    dst_ip: '198.51.100.20',
+                    src_scoped_id: $corp_dom + '#192.0.2.10',
+                    dst_scoped_id: $corp_dom + '#198.51.100.20',
+                    timestamp_source: '2026-11-23T10:00:00+0000',
+                    timestamp_epoch_decimal: '1795428000',
+                    timestamp_epoch_ns: 1795428000000000000
+                })
+                CREATE (tfo:FlowObservation {
+                    observation_id: $non_zeek_oid,
+                    routing_domain_id: $corp_dom,
+                    source_type: 'tshark'
+                })
+                WITH tfo
+                MATCH (ab:AlertEvent {event_id: $alert_b_eid}),
+                      (bf:FlowObservation {observation_id: $branch_oid}),
+                      (ad:AlertEvent {event_id: $alert_d_eid})
+                CREATE (ab)-[:CORRELATED_WITH {routing_domain_id: $branch_dom, verification_status: 'verified'}]->(bf)
+                CREATE (ad)-[:CORRELATED_WITH {routing_domain_id: $corp_dom, verification_status: 'verified'}]->(tfo)
+                """,
+                snort_eid=synthetic_snort_event_id,
+                non_zeek_oid=synthetic_non_zeek_obs_id,
+                corp_dom=corp_domain,
+                branch_dom=branch_domain,
+                alert_b_eid=alert_b.event_id,
+                branch_oid=branch_flow.observation_id,
+                alert_d_eid=alert_d.event_id,
+            ).consume()
+
+        with TestClient(create_app(), raise_server_exceptions=False) as client:
+            res = client.get("/api/v1/alert-events", params={"routing_domain_id": corp_domain})
+            assert res.status_code == 200
+            body = res.json()
+            # Must exclude the non-Suricata snort AlertEvent -> exactly 5 Suricata alerts
+            assert body["total"] == 5
+            by_id = {item["event_id"]: item for item in body["items"]}
+            assert synthetic_snort_event_id not in by_id
+            # Cross-domain CORRELATED_WITH on alert_b & non-Zeek edge on alert_d MUST report False
+            assert by_id[alert_b.event_id]["has_persisted_correlation"] is False
+            assert by_id[alert_d.event_id]["has_persisted_correlation"] is False
+            # Genuine in-domain unverified_incomplete edge on alert_ef reports True (persisted link exists)
+            assert by_id[alert_ef.event_id]["has_persisted_correlation"] is True
+
+            # Corrupt persisted src_scoped_id on alert_b -> list must fail closed with sanitized HTTP 500
+            with live_driver.session() as session:
+                session.run(
+                    "MATCH (ae:AlertEvent {event_id: $eid}) SET ae.src_scoped_id = 'wrong-domain#10.0.0.99'",
+                    eid=alert_b.event_id,
+                ).consume()
+            corrupt_scoped_res = client.get(
+                "/api/v1/alert-events",
+                params={"routing_domain_id": corp_domain, "sid": 9100002},
+            )
+            assert corrupt_scoped_res.status_code == 500
+            assert corrupt_scoped_res.json() == {"detail": "Internal server error"}
+
+            # Restore src_scoped_id, corrupt timestamp_epoch_ns vs timestamp_epoch_decimal -> HTTP 500
+            with live_driver.session() as session:
+                session.run(
+                    "MATCH (ae:AlertEvent {event_id: $eid}) "
+                    "SET ae.src_scoped_id = $good_scoped, ae.timestamp_epoch_ns = 1",
+                    eid=alert_b.event_id,
+                    good_scoped=alert_b.src_scoped_id,
+                ).consume()
+            corrupt_ts_res = client.get(
+                "/api/v1/alert-events",
+                params={"routing_domain_id": corp_domain, "sid": 9100002},
+            )
+            assert corrupt_ts_res.status_code == 500
+            assert corrupt_ts_res.json() == {"detail": "Internal server error"}
     finally:
         _cleanup_owned_entities(live_driver, **owned)
